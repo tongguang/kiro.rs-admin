@@ -58,7 +58,7 @@ use super::parse::{
 use crate::anthropic::handlers::post_messages;
 use crate::anthropic::middleware::{AppState, KeyContext};
 use crate::anthropic::types::{
-    Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
+    Message, MessagesRequest, Metadata, SystemMessage, Thinking, Tool,
 };
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
@@ -256,12 +256,20 @@ pub async fn get_response(Path(id): Path<String>) -> Response {
 /// DELETE /v1/responses/{id}
 pub async fn delete_response(Path(id): Path<String>) -> Response {
     let deleted = responses_store().write().pop(&id).is_some();
+    if !deleted {
+        // 与 OpenAI 契约及 get_response 一致：未命中返回 404 错误信封
+        return responses_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("response not found: {id}"),
+        );
+    }
     (
         StatusCode::OK,
         Json(json!({
             "id": id,
             "object": "response.deleted",
-            "deleted": deleted,
+            "deleted": true,
         })),
     )
         .into_response()
@@ -477,9 +485,13 @@ fn responses_to_anthropic(
         return Err("input must contain at least one user/assistant message".to_string());
     }
 
-    let hosted_web_search_declared = declared_entries
-        .iter()
-        .any(|entry| entry.get("type").and_then(Value::as_str) == Some("web_search"));
+    // 含 web_search_preview 等前缀变体（与 Chat 路径 is_openai_web_search_tool 同口径）
+    let hosted_web_search_declared = declared_entries.iter().any(|entry| {
+        entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(super::types::is_openai_web_search_tool)
+    });
 
     let tool_choice = req
         .tool_choice
@@ -541,21 +553,13 @@ fn responses_to_anthropic(
     } else {
         Some(tool_list)
     };
-    let output_config = req
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort.clone())
-        .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
-    let thinking = req.reasoning.and_then(|reasoning| {
-        reasoning
-            .effort
-            .filter(|effort| !effort.trim().is_empty())
-            .map(|_| Thinking {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: 20_000,
-            })
-    });
+    // effort 归一化与 Chat 路径逐字一致（types::openai_reasoning_to_anthropic）：
+    // none → 完全关推理（不下发 thinking/output_config）；minimal → low+4000；
+    // 未知值 → medium。原样透传会让 converter 兜底成 high（关推理变最高档推理）。
+    let (thinking, output_config) = super::types::openai_reasoning_to_anthropic(
+        req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+        None,
+    );
 
     Ok((
         MessagesRequest {
@@ -737,8 +741,9 @@ fn convert_responses_tools(
                     out.extend(converted);
                 }
             }
-            // 托管 web_search 声明：原生注入统一代答，无需单独转发。
-            "web_search" => {}
+            // 托管 web_search 声明（含 web_search_preview 等前缀变体）：
+            // 原生注入统一代答，无需单独转发。
+            ty if super::types::is_openai_web_search_tool(ty) => {}
             other => {
                 tracing::warn!(tool_type = %other, "responses: skipping unsupported tool type");
             }
@@ -896,10 +901,17 @@ fn collect_content_text(content: Option<&Value>) -> Vec<String> {
     }
 }
 
-/// Responses input_image（仅支持 data: URL）转 Anthropic image block
+/// Responses `input_image.image_url` 转 Anthropic block。
+/// data: URL 转 base64 image block；http(s) 等非 data URL 与 Chat 路径
+/// `types::image_part_to_anthropic` 同口径降级为文本引用，不静默丢弃用户输入。
 fn image_block(part: &Value) -> Option<Value> {
     let url = part.get("image_url").and_then(|v| v.as_str())?;
-    let rest = url.strip_prefix("data:")?;
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Some(json!({
+            "type": "text",
+            "text": format!("[image_url: {}]", url)
+        }));
+    };
     let (media_type, data) = rest.split_once(";base64,")?;
     Some(json!({
         "type": "image",
@@ -2747,6 +2759,78 @@ mod tests {
         .unwrap();
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
         assert!(anth.stream);
+    }
+
+    #[test]
+    fn reasoning_effort_none_disables_thinking_and_output_config() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "reasoning": {"effort": "none"},
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert!(anth.thinking.is_none(), "effort=none 必须完全关推理");
+        assert!(
+            anth.output_config.is_none(),
+            "effort=none 不得下发 output_config（否则 converter 兜底成 high）"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_minimal_maps_to_low_budget_like_chat() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "reasoning": {"effort": "minimal"},
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let thinking = anth.thinking.expect("minimal 应开 thinking");
+        assert_eq!(thinking.budget_tokens, 4_000);
+        assert_eq!(
+            anth.output_config.map(|c| c.effort).as_deref(),
+            Some("low"),
+            "minimal 降为 low，与 Chat 路径 openai_reasoning_to_anthropic 一致"
+        );
+    }
+
+    #[test]
+    fn web_search_preview_variant_triggers_hosted_injection() {
+        let req = req_with(json!([{ "type": "web_search_preview" }]), simple_input());
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let names: Vec<_> = anth
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["noop", "web_search"],
+            "web_search_preview 变体应注入原生 web_search"
+        );
+        assert!(anth.force_web_search_loop, "preview 变体应触发强制搜索循环");
+    }
+
+    #[test]
+    fn image_block_degrades_remote_url_to_text() {
+        // http(s) 等非 data URL 降级为文本引用（与 Chat 路径 image_part_to_anthropic 同口径）
+        let part = json!({"type": "input_image", "image_url": "https://example.com/pic.png"});
+        assert_eq!(
+            image_block(&part).unwrap(),
+            json!({"type": "text", "text": "[image_url: https://example.com/pic.png]"})
+        );
+        // data: URL 仍走 base64 image block
+        let part = json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"});
+        assert_eq!(image_block(&part).unwrap()["type"], json!("image"));
+    }
+
+    #[tokio::test]
+    async fn delete_response_returns_404_for_missing_id() {
+        let resp = delete_response(Path("resp_does_not_exist_000".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ---- 请求方向：input item 回放 ----

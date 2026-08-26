@@ -434,7 +434,9 @@ const DEFAULT_WEB_SEARCH_MAX_USES: i32 = 8;
 /// `web_search_preview` / `web_search_preview_2025_03_11`（早期预览）。统一识别后
 /// 归一化为 Anthropic 原生 `web_search_20250305`，否则会在 `tool_type != "function"`
 /// 处被直接丢弃，导致 Codex 的联网搜索能力在 OpenAI 兼容层彻底失效。
-fn is_openai_web_search_tool(tool_type: &str) -> bool {
+/// 识别 OpenAI web_search 工具声明（含 `web_search_preview` 等 `web_search_` 前缀变体）。
+/// Chat 与 Responses 两路径共用，保证变体声明在任一端点都被注入原生 web_search。
+pub(crate) fn is_openai_web_search_tool(tool_type: &str) -> bool {
     tool_type == "web_search" || tool_type.starts_with("web_search_")
 }
 
@@ -532,7 +534,8 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<Value> {
     Some(choice.clone())
 }
 
-fn openai_reasoning_to_anthropic(
+/// OpenAI effort 归一化（Chat 与 Responses 两路径共用）：返回 (thinking, output_config)。
+pub(crate) fn openai_reasoning_to_anthropic(
     reasoning_effort: Option<&str>,
     reasoning: Option<&Value>,
 ) -> (Option<Thinking>, Option<OutputConfig>) {
