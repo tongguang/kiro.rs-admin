@@ -43,6 +43,10 @@ pub struct TokenLimits {
     /// 最大输入 Token 数
     #[serde(default)]
     pub max_input_tokens: Option<i64>,
+
+    /// 最大输出 Token 数。部分上游响应不提供该字段。
+    #[serde(default)]
+    pub max_output_tokens: Option<i64>,
 }
 
 #[cfg(test)]

@@ -196,6 +196,8 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 启动后异步预热各凭据的可用模型缓存（/v1/models 动态聚合使用）
+    token_manager.start_model_cache_warmer();
     let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
     let proxy_pool = Arc::new(admin::proxy_pool::ProxyPoolManager::new(
         proxy_pool_path,

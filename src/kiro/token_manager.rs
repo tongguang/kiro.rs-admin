@@ -9,10 +9,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Semaphore;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -20,7 +22,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
-use crate::kiro::model::available_models::ListAvailableModelsResponse;
+use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -475,17 +477,46 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    match profile_arn {
+        Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
+        None => String::new(),
+    }
+}
+
+/// 用量类接口的 403 回退候选：每个区域端点先带真实 profileArn 试，再退回不带。
+///
+/// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
+/// to make this call.`）；BuilderID 占位符已由 `effective_profile_arn` 过滤，
+/// 这类账号只有「不带」一种形态，行为与加此参数前一致。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
 }
 
 /// 获取使用额度信息
@@ -517,10 +548,12 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -551,12 +584,12 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -610,10 +643,12 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
+
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -644,12 +679,12 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
+        if status.as_u16() == 403 && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -1024,6 +1059,20 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+#[derive(Clone)]
+struct ModelCacheEntry {
+    response: ListAvailableModelsResponse,
+    refreshed_at: Instant,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelDiscoveryError {
+    #[error("没有符合当前客户端分组的可用凭据")]
+    NoAvailableCredentials,
+    #[error("所有 {credential_count} 个凭据的模型列表首次加载均失败")]
+    ColdStartFailed { credential_count: usize },
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -1064,6 +1113,16 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 每个凭据最后一次成功加载的完整模型列表。
+    model_cache: Mutex<HashMap<u64, ModelCacheEntry>>,
+    /// 每凭据单飞锁，避免并发模型列表请求重复访问上游。
+    model_refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
+    /// 限制同时访问 ListAvailableModels 的凭据数。
+    model_refresh_semaphore: Semaphore,
+    /// 凭据级缓存代数；凭据信息变化时递增，阻止在途旧请求回填缓存。
+    model_cache_generations: Mutex<HashMap<u64, u64>>,
+    /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
+    model_cache_epoch: AtomicU64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1300,6 +1359,11 @@ impl MultiTokenManager {
             retry_policy: Mutex::new(retry_policy),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            model_cache: Mutex::new(HashMap::new()),
+            model_refresh_locks: Mutex::new(HashMap::new()),
+            model_refresh_semaphore: Semaphore::new(4),
+            model_cache_generations: Mutex::new(HashMap::new()),
+            model_cache_epoch: AtomicU64::new(0),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1346,6 +1410,209 @@ impl MultiTokenManager {
     /// 设置全局代理配置（运行时修改，可传 None 清除）
     pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
         *self.proxy.lock() = proxy;
+        self.invalidate_all_model_caches();
+    }
+
+    fn model_cache_ttl(&self) -> StdDuration {
+        StdDuration::from_secs(self.config.model_cache_ttl_secs)
+    }
+
+    fn cached_model_response(
+        &self,
+        id: u64,
+        require_fresh: bool,
+    ) -> Option<ListAvailableModelsResponse> {
+        self.model_cache.lock().get(&id).and_then(|entry| {
+            if require_fresh && entry.refreshed_at.elapsed() >= self.model_cache_ttl() {
+                None
+            } else {
+                Some(entry.response.clone())
+            }
+        })
+    }
+
+    fn model_cache_generation(&self, id: u64) -> u64 {
+        self.model_cache_generations
+            .lock()
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn invalidate_model_cache(&self, id: u64) {
+        let mut generations = self.model_cache_generations.lock();
+        *generations.entry(id).or_insert(0) += 1;
+        self.model_cache.lock().remove(&id);
+    }
+
+    fn remove_model_cache(&self, id: u64) {
+        self.invalidate_model_cache(id);
+        self.model_refresh_locks.lock().remove(&id);
+    }
+
+    pub fn invalidate_all_model_caches(&self) {
+        self.model_cache_epoch.fetch_add(1, Ordering::Relaxed);
+        self.model_cache.lock().clear();
+    }
+
+    fn model_refresh_lock(&self, id: u64) -> Arc<TokioMutex<()>> {
+        self.model_refresh_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    async fn refresh_model_cache_for(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        let refresh_requested_at = Instant::now();
+        if !force && let Some(response) = self.cached_model_response(id, true) {
+            return Ok(response);
+        }
+
+        let refresh_lock = self.model_refresh_lock(id);
+        let _refresh_guard = refresh_lock.lock().await;
+        if let Some(entry) = self.model_cache.lock().get(&id) {
+            let refreshed_by_concurrent_request =
+                force && entry.refreshed_at >= refresh_requested_at;
+            let fresh_ttl_hit = !force && entry.refreshed_at.elapsed() < self.model_cache_ttl();
+            if refreshed_by_concurrent_request || fresh_ttl_hit {
+                return Ok(entry.response.clone());
+            }
+        }
+
+        let generation = self.model_cache_generation(id);
+        let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
+        let _permit = self.model_refresh_semaphore.acquire().await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 模型列表查询前解析 profileArn 失败: {}", id, error)
+            }
+        }
+
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let response =
+            get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
+                .await?;
+
+        let generations = self.model_cache_generations.lock();
+        if generation == generations.get(&id).copied().unwrap_or(0) {
+            let mut cache = self.model_cache.lock();
+            if epoch == self.model_cache_epoch.load(Ordering::Relaxed) {
+                cache.insert(
+                    id,
+                    ModelCacheEntry {
+                        response: response.clone(),
+                        refreshed_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        Ok(response)
+    }
+
+    async fn cached_or_refresh_models_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        match self.refresh_model_cache_for(id, false).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if let Some(stale) = self.cached_model_response(id, false) {
+                    tracing::warn!(
+                        "凭据 #{} 模型列表刷新失败，继续使用最后一次成功缓存: {}",
+                        id,
+                        error
+                    );
+                    Ok(stale)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn available_model_credential_ids(&self, group: Option<&str>) -> Vec<u64> {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && !entry
+                        .throttled_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
+                    && group_matches(&entry.credentials.groups, group)
+            })
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// 返回当前客户端分组可访问凭据的动态模型并集原始项。
+    pub async fn discover_models_for_group(
+        &self,
+        group: Option<&str>,
+    ) -> Result<Vec<UpstreamModel>, ModelDiscoveryError> {
+        let ids = self.available_model_credential_ids(group);
+        if ids.is_empty() {
+            return Err(ModelDiscoveryError::NoAvailableCredentials);
+        }
+
+        let results = futures::future::join_all(
+            ids.iter()
+                .copied()
+                .map(|id| async move { (id, self.cached_or_refresh_models_for(id).await) }),
+        )
+        .await;
+
+        let mut models = Vec::new();
+        let mut successful_credentials = 0usize;
+        for (id, result) in results {
+            match result {
+                Ok(response) => {
+                    successful_credentials += 1;
+                    models.extend(response.models);
+                }
+                Err(error) => {
+                    tracing::warn!("凭据 #{} 首次加载模型列表失败: {}", id, error);
+                }
+            }
+        }
+
+        if successful_credentials == 0 {
+            Err(ModelDiscoveryError::ColdStartFailed {
+                credential_count: ids.len(),
+            })
+        } else {
+            Ok(models)
+        }
+    }
+
+    /// 服务启动后异步预热所有当前启用凭据的模型缓存。
+    pub fn start_model_cache_warmer(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            match manager.discover_models_for_group(None).await {
+                Ok(models) => {
+                    tracing::info!("模型缓存预热完成，共加载 {} 个模型条目", models.len())
+                }
+                Err(ModelDiscoveryError::NoAvailableCredentials) => {
+                    tracing::debug!("没有可用于模型缓存预热的凭据")
+                }
+                Err(error) => tracing::warn!("模型缓存预热失败: {}", error),
+            }
+        });
     }
 
     /// 获取凭据总数
@@ -1980,6 +2247,8 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
             }
         }
+
+        self.invalidate_model_cache(id);
 
         tracing::info!(
             "凭据 #{} 从文件检测到新 refreshToken（疑似 IDE token rotation），已自动恢复，将重试",
@@ -2893,7 +3162,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -2901,6 +3170,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 用量查询前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3052,7 +3331,18 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 模型列表查询前解析 profileArn 失败: {}", id, error)
+            }
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
@@ -3134,7 +3424,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3142,6 +3432,16 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号必须带真实 profileArn，先解析回填；
+        // 解析失败不阻断请求，保留无 ARN 的 BuilderID 兼容路径。
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 设置用户偏好前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3370,6 +3670,8 @@ impl MultiTokenManager {
         source_channel: Option<Option<String>>,
         rpm_limit: Option<u32>,
     ) -> anyhow::Result<()> {
+        let invalidate_models =
+            proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -3403,6 +3705,9 @@ impl MultiTokenManager {
             if let Some(v) = rpm_limit {
                 entry.credentials.rpm_limit = v; // 0 = 不限速
             }
+        }
+        if invalidate_models {
+            self.invalidate_model_cache(id);
         }
         self.persist_credentials()?;
         Ok(())
@@ -3544,6 +3849,8 @@ impl MultiTokenManager {
             }
         }
 
+        self.remove_model_cache(id);
+
         // 持久化更改
         self.persist_credentials()?;
 
@@ -3617,6 +3924,7 @@ impl MultiTokenManager {
             entry.credentials.expires_at = new_expires_at;
             entry.refresh_failure_count = 0;
         }
+        self.invalidate_model_cache(id);
         self.persist_credentials()?;
         tracing::info!("凭据 #{} refreshToken 已更新", id);
         Ok(())
@@ -3690,6 +3998,7 @@ impl MultiTokenManager {
             entry.credentials.scopes = Some(scopes);
             entry.refresh_failure_count = 0;
         }
+        self.invalidate_model_cache(id);
         self.persist_credentials()?;
         tracing::info!("凭据 #{} external_idp Token 已更新", id);
         Ok(())
@@ -5037,23 +5346,39 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_api_attempts_prefer_real_arn_with_plain_fallback() {
+        let host = "q.us-east-1.amazonaws.com";
+        let encoded =
+            "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
+
+        // 有真实 ARN：每个区域先带 ARN，再退回不带
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
             ),
             ..Default::default()
         };
-        let host = "q.us-east-1.amazonaws.com";
-
+        let attempts = usage_api_attempts(&credentials, &["us-east-1"]);
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].1.is_some());
+        assert!(attempts[1].1.is_none());
         assert_eq!(
-            usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            usage_limits_url(host, attempts[0].1),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={}",
+                encoded
+            )
         );
         assert_eq!(
-            available_models_url(host, &credentials),
+            available_models_url(host, attempts[1].1),
             "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
+
+        // 无 ARN（BuilderID）：只有「不带」一种形态
+        let plain = KiroCredentials::default();
+        let attempts = usage_api_attempts(&plain, &["us-east-1"]);
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].1.is_none());
     }
 
     #[test]

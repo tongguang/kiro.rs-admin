@@ -221,6 +221,11 @@ impl KiroProvider {
         }
     }
 
+    /// 获取内部的多凭据 Token 管理器（模型发现等只读场景使用）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     fn client_for_proxy(&self, proxy: Option<ProxyConfig>) -> anyhow::Result<Client> {
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&proxy) {

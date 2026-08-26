@@ -57,9 +57,12 @@ pub struct KiroRequest {
 /// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// Output configuration (including reasoning effort)
+    /// Claude reasoning effort (`output_config.effort`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    /// GPT reasoning effort (`reasoning.effort`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
 }
 
 /// The effort control field recognized by the AWS Q backend
@@ -73,6 +76,12 @@ pub struct AdditionalModelRequestFields {
 /// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroOutputConfig {
+    pub effort: String,
+}
+
+/// GPT effort control accepted by the Mantle-backed models in Kiro.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
     pub effort: String,
 }
 #[cfg(test)]
@@ -119,6 +128,7 @@ mod tests {
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),
+            reasoning: None,
         };
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");

@@ -338,6 +338,10 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 每凭据模型列表缓存的 TTL（秒，默认 3600）。过期后下一次使用时刷新。
+    #[serde(default = "default_model_cache_ttl_secs")]
+    pub model_cache_ttl_secs: u64,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -389,6 +393,10 @@ fn default_load_balancing_mode() -> String {
 
 fn default_proxy_balancing_mode() -> String {
     "sticky".to_string()
+}
+
+fn default_model_cache_ttl_secs() -> u64 {
+    3600
 }
 
 fn default_account_throttle_failover() -> bool {
@@ -469,6 +477,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            model_cache_ttl_secs: default_model_cache_ttl_secs(),
             endpoints: HashMap::new(),
             config_path: None,
         }
