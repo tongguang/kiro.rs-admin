@@ -484,6 +484,16 @@ fn profile_arn_query(profile_arn: Option<&str>) -> String {
     }
 }
 
+/// 用量类 REST 请求是否回退到下一候选（形态/区域）。
+///
+/// 403 恒回退（Enterprise / IdC 账号强制 profileArn 的已知拒绝形态）；带 ARN 的
+/// 请求被拒为 400/401 时同样回退——fork 的 Social 凭据全量带 SOCIAL_PROFILE_ARN，
+/// 该组合上游从未覆盖，malformed（400）类拒绝不能只认 403。429（限流）与 5xx
+/// （服务端错误）不回退，直接走各自错误路径。
+fn usage_api_should_fallback(status: u16, had_profile_arn: bool, has_next: bool) -> bool {
+    has_next && (status == 403 || (had_profile_arn && matches!(status, 400 | 401)))
+}
+
 /// 用量类接口的 403 回退候选：每个区域端点先带真实 profileArn 试，再退回不带。
 ///
 /// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
@@ -584,11 +594,14 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 依次回退：带 profileArn → 不带 → 备用区域端点
+        // （403 恒回退；带 ARN 的 400/401 形态拒绝同样回退，见 usage_api_should_fallback）
+        if usage_api_should_fallback(status.as_u16(), profile_arn.is_some(), idx + 1 < attempts.len())
+        {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "getUsageLimits 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -679,11 +692,14 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 依次回退：带 profileArn → 不带 → 备用区域端点
+        // （403 恒回退；带 ARN 的 400/401 形态拒绝同样回退，见 usage_api_should_fallback）
+        if usage_api_should_fallback(status.as_u16(), profile_arn.is_some(), idx + 1 < attempts.len())
+        {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "ListAvailableModels 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -1553,6 +1569,8 @@ impl MultiTokenManager {
     fn remove_model_cache(&self, id: u64) {
         self.invalidate_model_cache(id);
         self.model_refresh_locks.lock().remove(&id);
+        // id 单调不复用，generation 条目随凭据删除一并清理，避免 map 只增不减
+        self.model_cache_generations.lock().remove(&id);
     }
 
     pub fn invalidate_all_model_caches(&self) {
@@ -1590,23 +1608,17 @@ impl MultiTokenManager {
         }
     }
 
-    async fn refresh_model_cache_for(
-        &self,
-        id: u64,
-        force: bool,
-    ) -> anyhow::Result<ListAvailableModelsResponse> {
-        let refresh_requested_at = Instant::now();
-        if !force && let Some(response) = self.cached_model_response(id, true) {
+    async fn refresh_model_cache_for(&self, id: u64) -> anyhow::Result<ListAvailableModelsResponse> {
+        // TTL 内的新鲜缓存直接命中
+        if let Some(response) = self.cached_model_response(id, true) {
             return Ok(response);
         }
 
         let refresh_lock = self.model_refresh_lock(id);
         let _refresh_guard = refresh_lock.lock().await;
+        // 单飞锁内复查：等待期间可能已被并发请求刷新成 TTL 内的新鲜缓存
         if let Some(entry) = self.model_cache.lock().get(&id) {
-            let refreshed_by_concurrent_request =
-                force && entry.refreshed_at >= refresh_requested_at;
-            let fresh_ttl_hit = !force && entry.refreshed_at.elapsed() < self.model_cache_ttl();
-            if refreshed_by_concurrent_request || fresh_ttl_hit {
+            if entry.refreshed_at.elapsed() < self.model_cache_ttl() {
                 return Ok(entry.response.clone());
             }
         }
@@ -1652,7 +1664,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
-        match self.refresh_model_cache_for(id, false).await {
+        match self.refresh_model_cache_for(id).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 if let Some(stale) = self.cached_model_response(id, false) {
@@ -5998,6 +6010,42 @@ mod tests {
                 .rpm_retry_after_secs(&entries[..], None, None, now)
                 .is_none(),
             "RPM 未满时不应报 RPM 打满"
+        );
+    }
+
+    #[test]
+    fn test_usage_api_should_fallback_rules() {
+        // 403 恒回退（无论是否带 ARN）；带 ARN 的 400/401 形态拒绝同样回退
+        assert!(usage_api_should_fallback(403, false, true));
+        assert!(usage_api_should_fallback(403, true, true));
+        assert!(usage_api_should_fallback(400, true, true));
+        assert!(usage_api_should_fallback(401, true, true));
+        // 不带 ARN 的 400/401 不回退（没有可退的形态）
+        assert!(!usage_api_should_fallback(400, false, true));
+        assert!(!usage_api_should_fallback(401, false, true));
+        // 429/5xx 走各自错误路径
+        assert!(!usage_api_should_fallback(429, true, true));
+        assert!(!usage_api_should_fallback(500, true, true));
+        // 无下一候选时不回退
+        assert!(!usage_api_should_fallback(403, true, false));
+    }
+
+    #[test]
+    fn test_remove_model_cache_clears_generation_entry() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.invalidate_model_cache(1);
+        assert_eq!(manager.model_cache_generation(1), 1);
+        manager.remove_model_cache(1);
+        assert!(
+            manager.model_cache_generations.lock().get(&1).is_none(),
+            "删除凭据应清理 generation 条目，避免 map 只增不减"
         );
     }
 

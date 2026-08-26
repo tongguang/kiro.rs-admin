@@ -248,6 +248,11 @@ fn invalid_model_reason(model: &str) -> Option<&'static str> {
 
 fn canonical_version(parts: &[&str]) -> Option<String> {
     let first = *parts.first()?;
+    // 裸族名（如 claude-sonnet）strip 后版本段为空串：vacuous-true 会拼出
+    // 尾杠畸形 ID「claude-sonnet-」。判定无法规范化，让 ID 走原样透传。
+    if first.is_empty() {
+        return None;
+    }
     if parts.len() == 1
         && first.contains('.')
         && first
@@ -319,7 +324,9 @@ fn claude_context_window(model_lower: &str) -> Option<i32> {
     let parts: Vec<&str> = model_lower.split('-').collect();
     let claude_idx = parts.iter().position(|part| *part == "claude")?;
     let family = parts.get(claude_idx + 1)?;
-    if !matches!(*family, "opus" | "sonnet" | "haiku" | "fable") {
+    // 注意与 normalize_claude_model 的 FAMILIES 保持同步，漏配会让该模型
+    // 窗口回落 200K（usage 按更小窗口换算，上报虚高 5 倍）
+    if !matches!(*family, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
         return None;
     }
 
@@ -744,7 +751,10 @@ pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
+    // 1. 映射模型：非法 ID（空/超长/控制字符）本地拒绝，不透传给上游在重试链上放大
+    if invalid_model_reason(&req.model).is_some() {
+        return Err(ConversionError::UnsupportedModel(req.model.clone()));
+    }
     let model_id = normalize_model_id(&req.model);
     if model_id.is_empty() {
         return Err(ConversionError::UnsupportedModel(req.model.clone()));
@@ -2122,6 +2132,47 @@ mod tests {
         assert_eq!(map_model("   "), None);
         assert_eq!(map_model(&"x".repeat(300)), None);
         assert_eq!(map_model("bad\u{0007}model"), None);
+    }
+
+    #[test]
+    fn test_map_model_bare_family_name_passthrough() {
+        // 裸族名不含版本信息：无法规范化时原样透传，不拼出尾杠畸形 ID「claude-sonnet-」
+        assert_eq!(
+            map_model("claude-sonnet"),
+            Some("claude-sonnet".to_string())
+        );
+        assert_eq!(map_model("claude-opus"), Some("claude-opus".to_string()));
+        // 回归：旧式日期 ID 规范化路径不受影响
+        assert_eq!(
+            map_model("claude-3-5-sonnet-20241022"),
+            Some("claude-sonnet-3.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_context_window_mythos_matches_normalize_families() {
+        // claude_context_window 的 family 列表必须与 normalize_claude_model 的 FAMILIES
+        // 同步，否则 mythos-5（1M 窗口）按 200K 换算，usage 上报虚高 5 倍
+        assert_eq!(
+            map_model("claude-mythos-5-20261020"),
+            Some("claude-mythos-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-mythos-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_convert_request_rejects_invalid_model_id() {
+        // 非法 ID 校验接入生产链路：不再被 normalize_model_id 的 fallback 架空
+        let req = minimal_request_with_output_config(&"x".repeat(300));
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::UnsupportedModel(_))
+        ));
+        let req = minimal_request_with_output_config("bad\u{0007}model");
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::UnsupportedModel(_))
+        ));
     }
 
     #[test]
