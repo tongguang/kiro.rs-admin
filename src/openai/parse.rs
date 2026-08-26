@@ -1,0 +1,311 @@
+//! OpenAI 兼容层共享解析工具
+//!
+//! 由 Chat Completions 与 Responses 两条路径共用：Anthropic 响应体解析
+//! （[`parse_anthropic_message`]）、文本收集（[`collect_text_strings`]）、
+//! 会话亲和元数据（[`resolve_session_metadata`]）等。
+//! 移植自上游 v0.8.0 `anthropic/openai.rs` 的共享段。
+
+use axum::http::HeaderMap;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::anthropic::types::Metadata;
+
+/// 从 OpenAI 请求体或会话亲和请求头中提取并规范化 Kiro 会话 UUID。
+pub(crate) fn resolve_session_metadata(
+    prompt_cache_key: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers
+            .get("x-session-affinity")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok()),
+    ];
+
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        let uuid = Uuid::parse_str(raw_uuid).ok()?;
+        Some(Metadata {
+            user_id: Some(format!("session_{uuid}")),
+        })
+    })
+}
+
+/// 追加到 merged，若与上一轮 role 相同则合并 content blocks
+pub(crate) fn push_merged(merged: &mut Vec<(String, Vec<Value>)>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = merged.last_mut() {
+        if last.0 == role {
+            last.1.extend(blocks);
+            return;
+        }
+    }
+    merged.push((role.to_string(), blocks));
+}
+
+/// 仅收集纯文本（system / tool 内容用）
+pub(crate) fn collect_text_strings(content: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    match content {
+        Some(Value::String(s)) => {
+            if !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str())
+                    && !t.is_empty()
+                {
+                    out.push(t.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+// ============================ 响应翻译 ============================
+
+pub(crate) struct ParsedResponse {
+    pub(crate) model: String,
+    pub(crate) text: String,
+    pub(crate) tool_calls: Vec<Value>, // OpenAI tool_calls
+    pub(crate) finish_reason: String,
+    pub(crate) prompt_tokens: i64,
+    pub(crate) cached_tokens: i64,
+    pub(crate) completion_tokens: i64,
+    /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
+    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
+    /// Responses 路径渲染为 reasoning summary item。
+    pub(crate) thinking: String,
+    /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
+    /// Responses 路径渲染为 web_search_call item。
+    pub(crate) web_searches: Vec<(String, String)>,
+    /// 上游 meteringEvent 透传的 credit_usage，未下发时为 None。
+    /// 仅在拿到 meteringEvent 时才把 credit_usage / credit_unit /
+    /// credit_unit_plural 写入响应 usage。
+    pub(crate) credit_usage: Option<f64>,
+    pub(crate) credit_unit: Option<String>,
+    pub(crate) credit_unit_plural: Option<String>,
+}
+
+pub(crate) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedResponse {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut thinking = String::new();
+    let mut web_searches = Vec::new();
+
+    if let Some(blocks) = anthropic.get("content").and_then(|v| v.as_array()) {
+        for block in blocks {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                        thinking.push_str(t);
+                    }
+                }
+                Some("server_tool_use") => {
+                    // 内部代答的 web_search 展示块（websearch_loop Contract A）
+                    if block.get("name").and_then(|v| v.as_str()) == Some("web_search") {
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let query = block
+                            .pointer("/input/query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        web_searches.push((id, query));
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = block
+                        .get("input")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments },
+                    }));
+                }
+                _ => {} // web_search_tool_result / 其它块对 OpenAI 客户端无意义，忽略
+            }
+        }
+    }
+
+    // web_search loop 的带外思考文本（不进 content，避免 Anthropic 客户端回放）
+    if let Some(t) = anthropic.get("kiro_thinking").and_then(|v| v.as_str())
+        && !t.is_empty()
+    {
+        if !thinking.is_empty() {
+            thinking.push_str("\n\n");
+        }
+        thinking.push_str(t);
+    }
+
+    let stop_reason = anthropic
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("end_turn");
+    let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
+
+    let usage = anthropic.get("usage");
+    let uncached_input_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let cached_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let prompt_tokens = uncached_input_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cached_tokens);
+    let completion_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+
+    let credit_usage = usage
+        .and_then(|u| u.get("credit_usage"))
+        .and_then(|v| v.as_f64());
+    let credit_unit = usage
+        .and_then(|u| u.get("credit_unit"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let credit_unit_plural = usage
+        .and_then(|u| u.get("credit_unit_plural"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    ParsedResponse {
+        model: model.to_string(),
+        text,
+        tool_calls,
+        finish_reason,
+        prompt_tokens,
+        cached_tokens,
+        completion_tokens,
+        thinking,
+        web_searches,
+        credit_usage,
+        credit_unit,
+        credit_unit_plural,
+    }
+}
+
+fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
+    match stop_reason {
+        "tool_use" => "tool_calls",
+        "max_tokens" | "model_context_window_exceeded" => "length",
+        _ if has_tool_calls => "tool_calls",
+        _ => "stop",
+    }
+}
+
+pub(crate) fn now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_anthropic_message_extracts_credit_fields() {
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "credit_usage": 1.5,
+                "credit_unit": "credit",
+                "credit_unit_plural": "credits"
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "m");
+        assert_eq!(p.credit_usage, Some(1.5));
+        assert_eq!(p.credit_unit.as_deref(), Some("credit"));
+        assert_eq!(p.credit_unit_plural.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_combines_all_input_categories() {
+        let anthropic = json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 5,
+                "output_tokens": 6
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "m");
+        assert_eq!(p.prompt_tokens, 12);
+        assert_eq!(p.cached_tokens, 5);
+        assert_eq!(p.completion_tokens, 6);
+    }
+
+    #[test]
+    fn parse_anthropic_message_sanitizes_negative_and_missing_usage() {
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": -7, "output_tokens": -3 }
+        });
+        let p = parse_anthropic_message(&anthropic, "m");
+        assert_eq!(p.prompt_tokens, 0);
+        assert_eq!(p.completion_tokens, 0);
+    }
+
+    #[test]
+    fn parse_anthropic_message_without_credit_fields_leaves_them_none() {
+        let anthropic = json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        let p = parse_anthropic_message(&anthropic, "m");
+        assert!(p.credit_usage.is_none());
+        assert!(p.credit_unit.is_none());
+        assert!(p.credit_unit_plural.is_none());
+    }
+}

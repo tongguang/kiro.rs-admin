@@ -20,6 +20,12 @@ pub struct MeteringEvent {
     /// 本次请求消耗的 credit 数（与计费单位一致，浮点）
     #[serde(default)]
     pub usage: f64,
+    /// 计费单位（单数），如 "credit"；透传给客户端
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// 计费单位（复数），如 "credits"；透传给客户端
+    #[serde(default)]
+    pub unit_plural: Option<String>,
 }
 
 impl EventPayload for MeteringEvent {
@@ -40,6 +46,8 @@ mod tests {
         )
         .unwrap();
         assert!((v.usage - 0.0169543708291874).abs() < 1e-12);
+        assert_eq!(v.unit.as_deref(), Some("credit"));
+        assert_eq!(v.unit_plural.as_deref(), Some("credits"));
     }
 
     #[test]

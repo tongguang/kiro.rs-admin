@@ -1,15 +1,14 @@
-use std::{collections::HashMap, convert::Infallible, sync::OnceLock};
+use std::{collections::HashMap, convert::Infallible};
 
 use axum::{
     Json as JsonExtractor,
     body::{Body, to_bytes},
-    extract::{Extension, Path, State},
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
-use parking_lot::RwLock;
 use serde_json::{Value, json};
 
 use crate::anthropic::{
@@ -18,32 +17,18 @@ use crate::anthropic::{
 };
 
 use super::types::{
-    AssistantParts, ChatCompletionRequest, OpenAIConversionError, OpenAIFunctionCall,
-    OpenAIMessage, OpenAIToolCall, ResponsesRequest, assistant_message_for_history,
-    assistant_parts_from_anthropic, chat_message_from_parts, chat_to_anthropic,
-    finish_reason_from_anthropic, openai_error, response_output_from_parts, responses_to_chat_request,
-    responses_usage_json, usage_json,
+    ChatCompletionRequest, OpenAIConversionError, assistant_parts_from_anthropic,
+    chat_message_from_parts, chat_to_anthropic, finish_reason_from_anthropic, openai_error,
+    usage_json,
 };
 
 const MAX_COLLECT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_STORED_RESPONSES: usize = 512;
-
-#[derive(Clone)]
-struct StoredResponse {
-    response: Value,
-    messages: Vec<OpenAIMessage>,
-}
-
-static RESPONSES_STORE: OnceLock<RwLock<HashMap<String, StoredResponse>>> = OnceLock::new();
-
-fn responses_store() -> &'static RwLock<HashMap<String, StoredResponse>> {
-    RESPONSES_STORE.get_or_init(|| RwLock::new(HashMap::new()))
-}
 
 /// POST /v1/chat/completions
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ChatCompletionRequest>,
 ) -> Response {
     apply_model_mapping(&state, &mut req.model);
@@ -51,7 +36,9 @@ pub async fn post_chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    let converted = match chat_to_anthropic(&req) {
+    let metadata =
+        super::parse::resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
+    let converted = match chat_to_anthropic(&req, metadata) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
@@ -70,96 +57,6 @@ pub async fn post_chat_completions(
     } else {
         convert_chat_non_stream_response(anthropic_response).await
     }
-}
-
-/// POST /v1/responses
-pub async fn post_responses(
-    State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
-    JsonExtractor(mut req): JsonExtractor<ResponsesRequest>,
-) -> Response {
-    if let Some(model) = req.model.as_mut() {
-        apply_model_mapping(&state, model);
-    }
-    let previous_messages = match load_previous_messages(req.previous_response_id.as_deref()) {
-        Ok(messages) => messages,
-        Err(resp) => return resp,
-    };
-    let chat_req = match responses_to_chat_request(&req, previous_messages) {
-        Ok(req) => req,
-        Err(e) => return conversion_error(e),
-    };
-    let converted = match chat_to_anthropic(&chat_req) {
-        Ok(converted) => converted,
-        Err(e) => return conversion_error(e),
-    };
-
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-    let created_at = unix_ts();
-    let store_response = req.store.unwrap_or(true);
-    let stream = converted.anthropic.stream;
-    let model = converted.anthropic.model.clone();
-    let messages_for_history = converted.openai_messages.clone();
-
-    let anthropic_response = post_messages(
-        State(state),
-        Extension(key_ctx),
-        JsonExtractor(converted.anthropic),
-    )
-    .await;
-
-    if stream {
-        convert_responses_stream_response(
-            anthropic_response,
-            ResponsesStreamMeta {
-                response_id,
-                created_at,
-                model,
-                previous_response_id: req.previous_response_id.clone(),
-                metadata: req.metadata.clone(),
-                store_response,
-                messages_for_history,
-            },
-        )
-        .await
-    } else {
-        convert_responses_non_stream_response(
-            anthropic_response,
-            response_id,
-            created_at,
-            req.previous_response_id.clone(),
-            req.metadata.clone(),
-            store_response,
-            messages_for_history,
-        )
-        .await
-    }
-}
-
-/// GET /v1/responses/{id}
-pub async fn get_response(Path(id): Path<String>) -> Response {
-    if let Some(stored) = responses_store().read().get(&id).cloned() {
-        return (StatusCode::OK, Json(stored.response)).into_response();
-    }
-    openai_status_error(
-        StatusCode::NOT_FOUND,
-        "invalid_request_error",
-        format!("response not found: {}", id),
-    )
-}
-
-/// DELETE /v1/responses/{id}
-pub async fn delete_response(Path(id): Path<String>) -> Response {
-    let deleted = responses_store().write().remove(&id).is_some();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "id": id,
-            "object": "response.deleted",
-            "deleted": deleted,
-        })),
-    )
-        .into_response()
 }
 
 /// 请求时应用模型映射：命中配置的源模型名则原地改写为目标模型名。
@@ -188,23 +85,6 @@ fn openai_status_error(
     (status, Json(openai_error(message, error_type))).into_response()
 }
 
-fn load_previous_messages(previous_response_id: Option<&str>) -> Result<Vec<OpenAIMessage>, Response> {
-    let Some(id) = previous_response_id else {
-        return Ok(Vec::new());
-    };
-    responses_store()
-        .read()
-        .get(id)
-        .map(|stored| stored.messages.clone())
-        .ok_or_else(|| {
-            openai_status_error(
-                StatusCode::NOT_FOUND,
-                "invalid_request_error",
-                format!("previous_response_id not found: {}", id),
-            )
-        })
-}
-
 async fn convert_chat_non_stream_response(response: Response) -> Response {
     let status = response.status();
     let body = response.into_body();
@@ -228,48 +108,15 @@ async fn convert_chat_non_stream_response(response: Response) -> Response {
                 "index": 0,
                 "message": chat_message_from_parts(&parts),
                 "logprobs": null,
-                "finish_reason": finish_reason_from_anthropic(&parts.stop_reason),
+                "finish_reason": finish_reason_from_anthropic(
+                    &parts.stop_reason,
+                    !parts.tool_calls.is_empty(),
+                ),
             }],
             "usage": usage_json(&parts),
         })),
     )
         .into_response()
-}
-
-async fn convert_responses_non_stream_response(
-    response: Response,
-    response_id: String,
-    created_at: i64,
-    previous_response_id: Option<String>,
-    metadata: Option<Value>,
-    store_response: bool,
-    mut messages_for_history: Vec<OpenAIMessage>,
-) -> Response {
-    let status = response.status();
-    let body = response.into_body();
-    if !status.is_success() {
-        return convert_error_body(status, body).await;
-    }
-
-    let value = match collect_json_body(body).await {
-        Ok(value) => value,
-        Err(resp) => return resp,
-    };
-    let parts = assistant_parts_from_anthropic(&value);
-    let response_obj = build_responses_object(
-        &response_id,
-        created_at,
-        previous_response_id,
-        metadata,
-        &parts,
-    );
-
-    messages_for_history.push(assistant_message_for_history(&parts));
-    if store_response {
-        save_response(response_id, response_obj.clone(), messages_for_history);
-    }
-
-    (StatusCode::OK, Json(response_obj)).into_response()
 }
 
 async fn collect_json_body(body: Body) -> Result<Value, Response> {
@@ -323,32 +170,6 @@ async fn convert_chat_stream_response(
         response.into_body(),
         ChatStreamTranslator::new(model, include_usage),
     );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-struct ResponsesStreamMeta {
-    response_id: String,
-    created_at: i64,
-    model: String,
-    previous_response_id: Option<String>,
-    metadata: Option<Value>,
-    store_response: bool,
-    messages_for_history: Vec<OpenAIMessage>,
-}
-
-async fn convert_responses_stream_response(response: Response, meta: ResponsesStreamMeta) -> Response {
-    let status = response.status();
-    if !status.is_success() {
-        return convert_error_body(status, response.into_body()).await;
-    }
-
-    let stream = transform_anthropic_sse(response.into_body(), ResponsesStreamTranslator::new(meta));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -492,7 +313,9 @@ struct ChatStreamTranslator {
     include_usage: bool,
     sent_role: bool,
     done: bool,
-    finish_reason: Option<String>,
+    /// 上游 message_delta 的原始 stop_reason；finish 时结合是否发过工具调用再映射
+    stop_reason: Option<String>,
+    saw_tool_calls: bool,
     usage: Option<Value>,
     tools: HashMap<i64, ToolStreamAcc>,
     next_tool_index: usize,
@@ -507,7 +330,8 @@ impl ChatStreamTranslator {
             include_usage,
             sent_role: false,
             done: false,
-            finish_reason: None,
+            stop_reason: None,
+            saw_tool_calls: false,
             usage: None,
             tools: HashMap::new(),
             next_tool_index: 0,
@@ -576,6 +400,7 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
                         },
                     );
                     self.next_tool_index += 1;
+                    self.saw_tool_calls = true;
                 }
                 Vec::new()
             }
@@ -633,10 +458,9 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
                 out
             }
             "message_delta" => {
-                self.finish_reason = data
+                self.stop_reason = data
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
-                    .map(finish_reason_from_anthropic)
                     .map(str::to_string);
                 self.usage = Some(usage_from_anthropic_delta(&data));
                 Vec::new()
@@ -661,7 +485,10 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         }
         self.done = true;
         let mut out = self.ensure_role();
-        let finish_reason = self.finish_reason.as_deref().unwrap_or("stop");
+        let finish_reason = finish_reason_from_anthropic(
+            self.stop_reason.as_deref().unwrap_or("end_turn"),
+            self.saw_tool_calls,
+        );
         let usage = self.include_usage.then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
         out.push(self.chunk(json!({}), Some(finish_reason), usage));
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -669,439 +496,22 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
     }
 }
 
-struct ResponsesStreamTranslator {
-    meta: ResponsesStreamMeta,
-    done: bool,
-    created_sent: bool,
-    message_started: bool,
-    message_done: bool,
-    message_item_id: String,
-    output_index: usize,
-    text: String,
-    reasoning: String,
-    tool_calls: Vec<OpenAIToolCall>,
-    tools: HashMap<i64, ToolStreamAcc>,
-    usage: Option<Value>,
-    stop_reason: Option<String>,
-}
-
-impl ResponsesStreamTranslator {
-    fn new(meta: ResponsesStreamMeta) -> Self {
-        Self {
-            meta,
-            done: false,
-            created_sent: false,
-            message_started: false,
-            message_done: false,
-            message_item_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
-            output_index: 0,
-            text: String::new(),
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-            tools: HashMap::new(),
-            usage: None,
-            stop_reason: None,
-        }
-    }
-
-    fn created_response(&self, status: &str, output: Vec<Value>, output_text: &str) -> Value {
-        let mut response = json!({
-            "id": self.meta.response_id,
-            "object": "response",
-            "created_at": self.meta.created_at,
-            "status": status,
-            "model": self.meta.model,
-            "previous_response_id": self.meta.previous_response_id,
-            "output": output,
-            "output_text": output_text,
-        });
-        if let Some(metadata) = &self.meta.metadata {
-            response["metadata"] = metadata.clone();
-        }
-        response
-    }
-
-    fn ensure_created(&mut self) -> Vec<Bytes> {
-        if self.created_sent {
-            return Vec::new();
-        }
-        self.created_sent = true;
-        // 同时补发 response.in_progress：官方 Responses 流与 Kiro-Go 都在 created
-        // 之后紧跟一条 in_progress，部分 OpenAI SDK 以此判定流已正常开始。
-        vec![
-            responses_event_sse(
-                "response.created",
-                json!({
-                    "type": "response.created",
-                    "response": self.created_response("in_progress", Vec::new(), ""),
-                }),
-            ),
-            responses_event_sse(
-                "response.in_progress",
-                json!({
-                    "type": "response.in_progress",
-                    "response": self.created_response("in_progress", Vec::new(), ""),
-                }),
-            ),
-        ]
-    }
-
-    fn ensure_message_started(&mut self) -> Vec<Bytes> {
-        let mut out = self.ensure_created();
-        if self.message_started {
-            return out;
-        }
-        self.message_started = true;
-        out.push(responses_event_sse(
-            "response.output_item.added",
-            json!({
-                "type": "response.output_item.added",
-                "output_index": self.output_index,
-                "item": {
-                    "id": self.message_item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "in_progress",
-                    "content": [],
-                }
-            }),
-        ));
-        out.push(responses_event_sse(
-            "response.content_part.added",
-            json!({
-                "type": "response.content_part.added",
-                "item_id": self.message_item_id,
-                "output_index": self.output_index,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
-                    "text": "",
-                }
-            }),
-        ));
-        out
-    }
-
-    fn close_message(&mut self) -> Vec<Bytes> {
-        if !self.message_started || self.message_done {
-            return Vec::new();
-        }
-        self.message_done = true;
-        let item = json!({
-            "id": self.message_item_id,
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{
-                "type": "output_text",
-                "text": self.text,
-                "annotations": [],
-            }],
-        });
-        self.output_index += 1;
-        vec![
-            responses_event_sse(
-                "response.output_text.done",
-                json!({
-                    "type": "response.output_text.done",
-                    "item_id": self.message_item_id,
-                    "output_index": self.output_index - 1,
-                    "content_index": 0,
-                    "text": self.text,
-                }),
-            ),
-            responses_event_sse(
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": self.message_item_id,
-                    "output_index": self.output_index - 1,
-                    "content_index": 0,
-                    "part": {
-                        "type": "output_text",
-                        "text": self.text,
-                        "annotations": [],
-                    }
-                }),
-            ),
-            responses_event_sse(
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": self.output_index - 1,
-                    "item": item,
-                }),
-            ),
-        ]
-    }
-}
-
-impl AnthropicSseTranslator for ResponsesStreamTranslator {
-    fn handle_frame(&mut self, frame: SseFrame) -> Vec<Bytes> {
-        if self.done || frame.event == "ping" {
-            return Vec::new();
-        }
-        let data = match serde_json::from_str::<Value>(&frame.data) {
-            Ok(data) => data,
-            Err(_) => return Vec::new(),
-        };
-
-        match frame.event.as_str() {
-            "message_start" => self.ensure_created(),
-            "content_block_start" => {
-                if data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("tool_use")
-                {
-                    let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                    self.tools.insert(
-                        block_index,
-                        ToolStreamAcc {
-                            id: data
-                                .pointer("/content_block/id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: data
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            args: String::new(),
-                            index: self.output_index,
-                        },
-                    );
-                }
-                Vec::new()
-            }
-            "content_block_delta" => match data.pointer("/delta/type").and_then(Value::as_str) {
-                Some("text_delta") => {
-                    let mut out = self.ensure_message_started();
-                    if let Some(delta) = data.pointer("/delta/text").and_then(Value::as_str)
-                        && !delta.is_empty()
-                    {
-                        self.text.push_str(delta);
-                        out.push(responses_event_sse(
-                            "response.output_text.delta",
-                            json!({
-                                "type": "response.output_text.delta",
-                                "item_id": self.message_item_id,
-                                "output_index": self.output_index,
-                                "content_index": 0,
-                                "delta": delta,
-                            }),
-                        ));
-                    }
-                    out
-                }
-                Some("thinking_delta") => {
-                    if let Some(delta) = data.pointer("/delta/thinking").and_then(Value::as_str) {
-                        self.reasoning.push_str(delta);
-                    }
-                    Vec::new()
-                }
-                Some("input_json_delta") => {
-                    let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                    if let Some(tool) = self.tools.get_mut(&index)
-                        && let Some(delta) =
-                            data.pointer("/delta/partial_json").and_then(Value::as_str)
-                    {
-                        tool.args.push_str(delta);
-                    }
-                    Vec::new()
-                }
-                _ => Vec::new(),
-            },
-            "content_block_stop" => {
-                let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                let Some(tool) = self.tools.remove(&index) else {
-                    return Vec::new();
-                };
-                let mut out = self.close_message();
-                let call = OpenAIToolCall {
-                    id: Some(tool.id.clone()),
-                    tool_type: "function".to_string(),
-                    function: OpenAIFunctionCall {
-                        name: tool.name.clone(),
-                        arguments: tool.args.clone(),
-                    },
-                };
-                self.tool_calls.push(call);
-                let item = json!({
-                    "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": tool.id,
-                    "name": tool.name,
-                    "arguments": tool.args,
-                });
-                out.extend([
-                    responses_event_sse(
-                        "response.output_item.added",
-                        json!({
-                            "type": "response.output_item.added",
-                            "output_index": self.output_index,
-                            "item": {
-                                "id": item["id"],
-                                "type": "function_call",
-                                "status": "in_progress",
-                                "call_id": item["call_id"],
-                                "name": item["name"],
-                                "arguments": "",
-                            }
-                        }),
-                    ),
-                    responses_event_sse(
-                        "response.function_call_arguments.delta",
-                        json!({
-                            "type": "response.function_call_arguments.delta",
-                            "item_id": item["id"],
-                            "output_index": self.output_index,
-                            "delta": item["arguments"],
-                        }),
-                    ),
-                    responses_event_sse(
-                        "response.function_call_arguments.done",
-                        json!({
-                            "type": "response.function_call_arguments.done",
-                            "item_id": item["id"],
-                            "output_index": self.output_index,
-                            "arguments": item["arguments"],
-                        }),
-                    ),
-                    responses_event_sse(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": self.output_index,
-                            "item": item,
-                        }),
-                    ),
-                ]);
-                self.output_index += 1;
-                out
-            }
-            "message_delta" => {
-                self.stop_reason = data
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                // 保存 Anthropic 原始 usage（未汇总的 input/cache 分量），
-                // 供 finish() 组装 Responses 口径时避免与 cache 重复相加。
-                self.usage = data.get("usage").cloned();
-                Vec::new()
-            }
-            "message_stop" => self.finish(),
-            "error" => {
-                self.done = true;
-                let mut out = self.ensure_created();
-                out.push(responses_event_sse(
-                    "response.failed",
-                    json!({
-                        "type": "response.failed",
-                        "response": {
-                            "id": self.meta.response_id,
-                            "object": "response",
-                            "created_at": self.meta.created_at,
-                            "status": "failed",
-                            "model": self.meta.model,
-                            "error": data.get("error").cloned().unwrap_or(data),
-                        }
-                    }),
-                ));
-                out.push(Bytes::from_static(b"data: [DONE]\n\n"));
-                out
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    fn finish(&mut self) -> Vec<Bytes> {
-        if self.done {
-            return Vec::new();
-        }
-        self.done = true;
-        let mut out = self.ensure_created();
-        out.extend(self.close_message());
-
-        let parts = AssistantParts {
-            text: self.text.clone(),
-            reasoning: self.reasoning.clone(),
-            tool_calls: self.tool_calls.clone(),
-            stop_reason: self.stop_reason.clone().unwrap_or_else(|| "end_turn".to_string()),
-            input_tokens: self
-                .usage
-                .as_ref()
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-            output_tokens: self
-                .usage
-                .as_ref()
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-            cache_read_tokens: self
-                .usage
-                .as_ref()
-                .and_then(|u| u.get("cache_read_input_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-            cache_creation_tokens: self
-                .usage
-                .as_ref()
-                .and_then(|u| u.get("cache_creation_input_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-            model: self.meta.model.clone(),
-        };
-        let response = build_responses_object(
-            &self.meta.response_id,
-            self.meta.created_at,
-            self.meta.previous_response_id.clone(),
-            self.meta.metadata.clone(),
-            &parts,
-        );
-
-        if self.meta.store_response {
-            let mut history = self.meta.messages_for_history.clone();
-            history.push(assistant_message_for_history(&parts));
-            save_response(self.meta.response_id.clone(), response.clone(), history);
-        }
-
-        out.push(responses_event_sse(
-            "response.completed",
-            json!({
-                "type": "response.completed",
-                "response": response,
-            }),
-        ));
-        out.push(Bytes::from_static(b"data: [DONE]\n\n"));
-        out
-    }
-}
-
 fn usage_from_anthropic_delta(data: &Value) -> Value {
     let usage = data.get("usage").unwrap_or(&Value::Null);
-    let input = usage
-        .get("input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let cache_creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let cache_read = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
+    // usage 负数消毒：上游异常时可能下发负值，对外一律截断为 0
+    let token = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            .max(0)
+    };
+    let input = token("input_tokens");
+    let cache_creation = token("cache_creation_input_tokens");
+    let cache_read = token("cache_read_input_tokens");
     let prompt = input + cache_creation + cache_read;
-    let completion = usage
-        .get("output_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    json!({
+    let completion = token("output_tokens");
+    let mut out = json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
@@ -1111,55 +521,23 @@ fn usage_from_anthropic_delta(data: &Value) -> Value {
         "completion_tokens_details": {
             "reasoning_tokens": 0,
         }
-    })
-}
-
-fn build_responses_object(
-    id: &str,
-    created_at: i64,
-    previous_response_id: Option<String>,
-    metadata: Option<Value>,
-    parts: &AssistantParts,
-) -> Value {
-    let (output, output_text) = response_output_from_parts(parts);
-    let mut response = json!({
-        "id": id,
-        "object": "response",
-        "created_at": created_at,
-        "status": "completed",
-        "model": parts.model,
-        "previous_response_id": previous_response_id,
-        "output": output,
-        "output_text": output_text,
-        "usage": responses_usage_json(parts),
     });
-    if let Some(metadata) = metadata {
-        response["metadata"] = metadata;
+    // 仅在拿到上游 meteringEvent 时透传 credit_* 计费元数据
+    if let Some(credit_usage) = usage.get("credit_usage").and_then(Value::as_f64) {
+        out["credit_usage"] = json!(credit_usage);
+        if let Some(unit) = usage.get("credit_unit").and_then(Value::as_str) {
+            out["credit_unit"] = json!(unit);
+        }
+        if let Some(unit_plural) = usage.get("credit_unit_plural").and_then(Value::as_str) {
+            out["credit_unit_plural"] = json!(unit_plural);
+        }
     }
-    response
-}
-
-fn save_response(id: String, response: Value, messages: Vec<OpenAIMessage>) {
-    let mut store = responses_store().write();
-    if store.len() >= MAX_STORED_RESPONSES
-        && let Some(first_key) = store.keys().next().cloned()
-    {
-        store.remove(&first_key);
-    }
-    store.insert(id, StoredResponse { response, messages });
+    out
 }
 
 fn chat_data_sse(value: Value) -> Bytes {
     Bytes::from(format!(
         "data: {}\n\n",
-        serde_json::to_string(&value).unwrap_or_default()
-    ))
-}
-
-fn responses_event_sse(event: &str, value: Value) -> Bytes {
-    Bytes::from(format!(
-        "event: {}\ndata: {}\n\n",
-        event,
         serde_json::to_string(&value).unwrap_or_default()
     ))
 }
@@ -1176,14 +554,8 @@ mod tests {
     use bytes::Bytes;
     use serde_json::{Value, json};
 
-    use super::super::types::{
-        ChatCompletionRequest, OpenAIMessage, ResponsesRequest, assistant_parts_from_anthropic,
-        chat_to_anthropic, responses_input_to_messages, responses_to_chat_request,
-    };
-    use super::{
-        AnthropicSseTranslator, ChatStreamTranslator, ResponsesStreamMeta,
-        ResponsesStreamTranslator, SseFrameParser,
-    };
+    use super::super::types::{ChatCompletionRequest, chat_to_anthropic};
+    use super::{AnthropicSseTranslator, ChatStreamTranslator, SseFrameParser};
 
     /// 把一段 Anthropic SSE 原文喂给 ChatStreamTranslator，收集其产出的
     /// `data: {...}` 行并解析成 JSON 序列（chat completions 流不带 `event:` 行）。
@@ -1219,58 +591,6 @@ mod tests {
         chunks
     }
 
-    /// 把一段 Anthropic SSE 原文喂给 translator，收集其产出的所有 SSE 事件帧，
-    /// 解析成 (event_name, data_json) 序列。复刻 transform_anthropic_sse 的分帧逻辑，
-    /// 但同步执行，方便断言。`data: [DONE]` 单独作为 ("", DONE 标记) 返回。
-    fn run_responses_translator(anthropic_sse: &str) -> Vec<(String, Value)> {
-        let meta = ResponsesStreamMeta {
-            response_id: "resp_test".to_string(),
-            created_at: 42,
-            model: "claude-sonnet-4.5".to_string(),
-            previous_response_id: None,
-            metadata: None,
-            store_response: false,
-            messages_for_history: Vec::new(),
-        };
-        let mut translator = ResponsesStreamTranslator::new(meta);
-        let mut parser = SseFrameParser::default();
-        let mut raw_out: Vec<Bytes> = Vec::new();
-        for frame in parser.push(anthropic_sse.as_bytes()) {
-            raw_out.extend(translator.handle_frame(frame));
-        }
-        for frame in parser.finish() {
-            raw_out.extend(translator.handle_frame(frame));
-        }
-        raw_out.extend(translator.finish());
-
-        // 把产出的字节流重新按 SSE 帧解析
-        let joined = raw_out
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect::<String>();
-        let mut events = Vec::new();
-        for block in joined.split("\n\n") {
-            if block.trim().is_empty() {
-                continue;
-            }
-            let mut event_name = String::new();
-            let mut data = String::new();
-            for line in block.lines() {
-                if let Some(rest) = line.strip_prefix("event:") {
-                    event_name = rest.trim().to_string();
-                } else if let Some(rest) = line.strip_prefix("data:") {
-                    data = rest.trim_start().to_string();
-                }
-            }
-            if data == "[DONE]" {
-                events.push(("[DONE]".to_string(), Value::Null));
-            } else if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                events.push((event_name, v));
-            }
-        }
-        events
-    }
-
     #[test]
     fn chat_request_converts_tools_and_tool_results() {
         let req: ChatCompletionRequest = serde_json::from_value(json!({
@@ -1297,7 +617,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         assert_eq!(converted.anthropic.model, "claude-sonnet-4.5");
         assert_eq!(converted.anthropic.messages.len(), 4);
         assert_eq!(converted.anthropic.system.unwrap()[0].text, "be brief");
@@ -1318,7 +638,7 @@ mod tests {
                 "tools": [{"type": typ}]
             }))
             .unwrap();
-            let converted = chat_to_anthropic(&req).unwrap();
+            let converted = chat_to_anthropic(&req, None).unwrap();
             let tools = converted
                 .anthropic
                 .tools
@@ -1347,7 +667,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         let tools = converted.anthropic.tools.unwrap();
         assert_eq!(tools.len(), 2);
         assert!(tools.iter().any(|t| t.name == "web_search"
@@ -1376,7 +696,7 @@ mod tests {
         }))
         .unwrap();
 
-        let converted = chat_to_anthropic(&req).unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
         let msgs = &converted.anthropic.messages;
         // user / assistant(2×tool_use) / user(2×tool_result 合并) / user(总结)
         assert_eq!(msgs.len(), 4);
@@ -1399,226 +719,6 @@ mod tests {
         assert_eq!(msgs[3].role, "user"); // 这是"总结"，与上一条 tool_result user 相邻是允许的
     }
 
-    #[test]
-    fn responses_input_merges_parallel_function_calls() {
-        let messages = responses_input_to_messages(Some(&json!([
-            {"type": "function_call", "call_id": "call_a", "name": "a", "arguments": "{}"},
-            {"type": "function_call", "call_id": "call_b", "name": "b", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_a", "output": "ok"}
-        ])))
-        .unwrap();
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "assistant");
-        assert_eq!(messages[0].tool_calls.len(), 2);
-        assert_eq!(messages[1].role, "tool");
-    }
-
-    /// Codex 通过 responses 请求体 `reasoning:{effort}` 下发档位（none/minimal/low/
-    /// medium/high/xhigh）。验证：
-    /// - none → 不下发 thinking（关推理），否则后端 parse("none") 失败会 fallback 成 high；
-    /// - minimal → 归一化到后端认得的 low（后端 EffortTier 无 minimal）；
-    /// - xhigh 透传，high/medium 原样；
-    /// - 归一化后的 effort 必须是后端 EffortTier 认得的值。
-    #[test]
-    fn responses_reasoning_effort_is_recognized_and_normalized() {
-        let build = |effort: &str| -> ResponsesRequest {
-            serde_json::from_value(json!({
-                "model": "gpt-5.5",
-                "input": "hi",
-                "reasoning": { "effort": effort }
-            }))
-            .unwrap()
-        };
-
-        // none → 关推理：无 thinking、无 output_config
-        let chat = responses_to_chat_request(&build("none"), Vec::new()).unwrap();
-        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
-        assert!(anthropic.thinking.is_none(), "none 不应开启 thinking");
-        assert!(anthropic.output_config.is_none(), "none 不应下发 output_config");
-
-        // minimal → 归一化到 low（后端无 minimal 档）
-        let chat = responses_to_chat_request(&build("minimal"), Vec::new()).unwrap();
-        let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
-        assert_eq!(anthropic.output_config.as_ref().unwrap().effort, "low");
-        assert!(anthropic.thinking.is_some());
-
-        // 各档位归一化后必须是后端 EffortTier 认得的值
-        for (input, expected) in [
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-        ] {
-            let chat = responses_to_chat_request(&build(input), Vec::new()).unwrap();
-            let anthropic = chat_to_anthropic(&chat).unwrap().anthropic;
-            assert_eq!(
-                anthropic.output_config.as_ref().unwrap().effort,
-                expected,
-                "effort={input} 归一化错误"
-            );
-            assert!(anthropic.thinking.is_some(), "effort={input} 应开启 thinking");
-        }
-    }
-
-    #[test]
-    fn responses_request_expands_previous_messages() {
-        let previous = vec![OpenAIMessage {
-            role: "user".to_string(),
-            content: Some(json!("first")),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }];
-        let req: ResponsesRequest = serde_json::from_value(json!({
-            "model": "claude-sonnet-4.5",
-            "instructions": "stay terse",
-            "input": "second"
-        }))
-        .unwrap();
-        let chat = responses_to_chat_request(&req, previous).unwrap();
-        assert_eq!(chat.messages.len(), 3);
-        assert_eq!(chat.messages[1].role, "system");
-    }
-
-    #[test]
-    fn anthropic_response_becomes_openai_parts() {
-        let parts = assistant_parts_from_anthropic(&json!({
-            "model": "claude-sonnet-4.5",
-            "stop_reason": "tool_use",
-            "content": [
-                {"type": "text", "text": "hello"},
-                {"type": "tool_use", "id": "call_1", "name": "run", "input": {"cmd": "ls"}}
-            ],
-            "usage": {"input_tokens": 3, "output_tokens": 4, "cache_read_input_tokens": 2}
-        }));
-        assert_eq!(parts.text, "hello");
-        assert_eq!(parts.tool_calls.len(), 1);
-        assert_eq!(parts.cache_read_tokens, 2);
-    }
-
-    /// Codex 的 `ResponseCompletedUsage` 只认 Responses 口径的 usage 字段。
-    /// 若 `response.completed` / 非流式响应体里带 chat 口径（prompt_tokens…），
-    /// Codex 反序列化会失败并中断整条流。锁死字段名，防止回退到 usage_json。
-    #[test]
-    fn responses_object_uses_responses_usage_shape() {
-        let parts = assistant_parts_from_anthropic(&json!({
-            "model": "claude-sonnet-4.5",
-            "stop_reason": "end_turn",
-            "content": [{"type": "text", "text": "hi"}],
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_read_input_tokens": 2,
-                "cache_creation_input_tokens": 3
-            }
-        }));
-        let obj = super::build_responses_object("resp_1", 123, None, None, &parts);
-        let usage = &obj["usage"];
-        // Responses 口径字段必须存在
-        assert_eq!(usage["input_tokens"], json!(15)); // 10 + 3 + 2
-        assert_eq!(usage["output_tokens"], json!(5));
-        assert_eq!(usage["total_tokens"], json!(20));
-        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(2));
-        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], json!(0));
-        // chat 口径字段绝不能出现
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
-    }
-
-    /// 非流式 Responses 输出项必须符合 Codex 的 ResponseItem：
-    /// message -> {type,role,content:[{type:"output_text",text}]}；
-    /// function_call -> {type,name,arguments:<string>,call_id}。
-    #[test]
-    fn responses_object_output_items_match_codex_shape() {
-        let parts = assistant_parts_from_anthropic(&json!({
-            "model": "claude-sonnet-4.5",
-            "stop_reason": "tool_use",
-            "content": [
-                {"type": "text", "text": "done"},
-                {"type": "tool_use", "id": "call_x", "name": "shell", "input": {"cmd": "ls"}}
-            ],
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        }));
-        let obj = super::build_responses_object("resp_2", 1, None, None, &parts);
-        let output = obj["output"].as_array().unwrap();
-        let msg = output.iter().find(|i| i["type"] == "message").unwrap();
-        assert_eq!(msg["role"], "assistant");
-        assert_eq!(msg["content"][0]["type"], "output_text");
-        assert_eq!(msg["content"][0]["text"], "done");
-        let fc = output.iter().find(|i| i["type"] == "function_call").unwrap();
-        assert_eq!(fc["name"], "shell");
-        assert_eq!(fc["call_id"], "call_x");
-        // arguments 必须是 JSON 字符串，而非对象
-        assert!(fc["arguments"].is_string());
-        assert_eq!(fc["arguments"], "{\"cmd\":\"ls\"}");
-    }
-
-    /// 端到端流式：把 Anthropic 的 text + tool_use SSE 喂给 ResponsesStreamTranslator，
-    /// 验证输出的事件序列符合 Codex 解析器的要求：
-    /// - 以 response.created / response.in_progress 开场；
-    /// - message 的 output_item.done.item 可解析为 Codex ResponseItem::Message；
-    /// - function_call 的 item 带字符串 arguments 与 call_id；
-    /// - response.completed.response.usage 为 Responses 口径；
-    /// - 以 data: [DONE] 收尾。
-    #[test]
-    fn responses_stream_emits_codex_compatible_events() {
-        // 模拟 Kiro/Anthropic 上游发出的 SSE：先文本，再一个 tool_use，最后 usage。
-        let upstream = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":12,\"output_tokens\":7,\"cache_read_input_tokens\":3}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-        );
-
-        let events = run_responses_translator(upstream);
-        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
-
-        // 开场
-        assert_eq!(events[0].1["type"], "response.created");
-        assert!(names.contains(&"response.in_progress"));
-        // 文本增量存在
-        assert!(names.contains(&"response.output_text.delta"));
-        // 结尾是 [DONE]
-        assert_eq!(events.last().unwrap().0, "[DONE]");
-
-        // message item：能解析为 Codex ContentItem::OutputText 形状
-        let msg_done = events
-            .iter()
-            .find(|(n, v)| n == "response.output_item.done" && v["item"]["type"] == "message")
-            .expect("message output_item.done present");
-        let item = &msg_done.1["item"];
-        assert_eq!(item["role"], "assistant");
-        assert_eq!(item["content"][0]["type"], "output_text");
-        assert_eq!(item["content"][0]["text"], "Hello");
-
-        // function_call item：Codex ResponseItem::FunctionCall 形状
-        let fc_done = events
-            .iter()
-            .find(|(n, v)| n == "response.output_item.done" && v["item"]["type"] == "function_call")
-            .expect("function_call output_item.done present");
-        let fc = &fc_done.1["item"];
-        assert_eq!(fc["name"], "shell");
-        assert_eq!(fc["call_id"], "toolu_1");
-        assert!(fc["arguments"].is_string());
-        assert_eq!(fc["arguments"], "{\"cmd\":\"ls\"}");
-
-        // response.completed 的 usage 必须是 Responses 口径
-        let completed = events
-            .iter()
-            .find(|(n, _)| n == "response.completed")
-            .expect("response.completed present");
-        let usage = &completed.1["response"]["usage"];
-        assert_eq!(usage["input_tokens"], json!(15)); // 12 + 3
-        assert_eq!(usage["output_tokens"], json!(7));
-        assert_eq!(usage["total_tokens"], json!(22));
-        assert!(usage.get("prompt_tokens").is_none());
-    }
 
     /// chat completions 流式：纯文本。验证首个 chunk 带 role=assistant，
     /// 文本以 delta.content 增量下发，末尾 chunk 带 finish_reason=stop，

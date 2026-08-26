@@ -76,11 +76,11 @@ pub fn create_router(
             "/chat/completions",
             post(crate::openai::handlers::post_chat_completions),
         )
-        .route("/responses", post(crate::openai::handlers::post_responses))
+        .route("/responses", post(crate::openai::responses::post_responses))
         .route(
             "/responses/{id}",
-            get(crate::openai::handlers::get_response)
-                .delete(crate::openai::handlers::delete_response),
+            get(crate::openai::responses::get_response)
+                .delete(crate::openai::responses::delete_response),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

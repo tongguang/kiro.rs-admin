@@ -1273,6 +1273,7 @@ impl SseStateManager {
         output_tokens: i32,
         cache_creation_input_tokens: i32,
         cache_read_input_tokens: i32,
+        metering: Option<&crate::kiro::model::events::MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1293,6 +1294,23 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut usage_json = json!({
+                "input_tokens": input_tokens.max(0),
+                "output_tokens": output_tokens.max(0),
+                "cache_creation_input_tokens": cache_creation_input_tokens.max(0),
+                "cache_read_input_tokens": cache_read_input_tokens.max(0)
+            });
+            // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
+            // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
+            if let Some(m) = metering {
+                usage_json["credit_usage"] = json!(m.usage);
+                if let Some(unit) = &m.unit {
+                    usage_json["credit_unit"] = json!(unit);
+                }
+                if let Some(unit_plural) = &m.unit_plural {
+                    usage_json["credit_unit_plural"] = json!(unit_plural);
+                }
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -1301,12 +1319,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens
-                    }
+                    "usage": usage_json
                 }),
             ));
         }
@@ -1377,8 +1390,11 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
-    /// meteringEvent 上报的 credit 计费量（上游真实下发）
+    /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加）
     pub credits: f64,
+    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
+    /// 透传到 message_delta.usage 的 credit_* 字段；只在收到过 meteringEvent 时下发。
+    pub metering: Option<crate::kiro::model::events::MeteringEvent>,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
     /// 我们在文本出口处统计「同一短行连续重复了多少次」。
@@ -1444,6 +1460,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
+            metering: None,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1541,7 +1558,8 @@ impl StreamContext {
             Event::Metering(metering) => {
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
                 self.credits += metering.usage;
-                tracing::debug!("metering credits +{:.6}", metering.usage);
+                self.metering = Some(metering.clone());
+                tracing::debug!("metering credits +{:.6}", self.credits);
                 Vec::new()
             }
             Event::Error {
@@ -2468,6 +2486,7 @@ impl StreamContext {
             self.output_tokens,
             cache_creation,
             cache_read,
+            self.metering.as_ref(),
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知

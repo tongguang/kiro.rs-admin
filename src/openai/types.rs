@@ -8,7 +8,7 @@ use crate::anthropic::types::{
 };
 
 pub const DEFAULT_OPENAI_COMPAT_MODEL: &str = "claude-sonnet-4.5";
-const DEFAULT_MAX_TOKENS: i32 = 4096;
+const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -25,6 +25,8 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning: Option<Value>,
     pub stream_options: Option<StreamOptions>,
+    /// OpenAI 会话亲和键（Codex 等客户端下发），映射为 Kiro metadata 会话 UUID
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,28 +81,10 @@ pub struct OpenAIToolFunction {
     pub parameters: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResponsesRequest {
-    pub model: Option<String>,
-    #[serde(default)]
-    pub input: Option<Value>,
-    pub instructions: Option<Value>,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(default)]
-    pub tools: Vec<OpenAITool>,
-    pub tool_choice: Option<Value>,
-    pub previous_response_id: Option<String>,
-    pub store: Option<bool>,
-    pub max_output_tokens: Option<i32>,
-    pub max_tokens: Option<i32>,
-    pub reasoning: Option<Value>,
-    pub metadata: Option<Value>,
-}
-
 #[derive(Debug)]
 pub struct ConvertedOpenAIRequest {
     pub anthropic: MessagesRequest,
+    #[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
     pub openai_messages: Vec<OpenAIMessage>,
 }
 
@@ -148,6 +132,7 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
 
 pub fn chat_to_anthropic(
     req: &ChatCompletionRequest,
+    metadata: Option<crate::anthropic::types::Metadata>,
 ) -> Result<ConvertedOpenAIRequest, OpenAIConversionError> {
     if req.messages.is_empty() {
         return Err(err("messages must contain at least one message"));
@@ -186,185 +171,14 @@ pub fn chat_to_anthropic(
             tool_choice: convert_tool_choice(req.tool_choice.as_ref()),
             thinking,
             output_config,
-            metadata: None,
+            metadata,
             force_web_search_loop,
         },
         openai_messages: req.messages.clone(),
     })
 }
 
-pub fn responses_to_chat_request(
-    req: &ResponsesRequest,
-    previous_messages: Vec<OpenAIMessage>,
-) -> Result<ChatCompletionRequest, OpenAIConversionError> {
-    let mut messages = previous_messages;
-    if let Some(instructions) = &req.instructions {
-        let text = content_to_text(instructions);
-        if !text.trim().is_empty() {
-            messages.push(OpenAIMessage {
-                role: "system".to_string(),
-                content: Some(Value::String(text)),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: None,
-            });
-        }
-    }
-
-    let input_messages = responses_input_to_messages(req.input.as_ref())?;
-    messages = append_openai_messages(messages, input_messages);
-    if messages.is_empty() {
-        return Err(err("input must contain at least one message"));
-    }
-
-    Ok(ChatCompletionRequest {
-        model: req
-            .model
-            .as_deref()
-            .unwrap_or(DEFAULT_OPENAI_COMPAT_MODEL)
-            .to_string(),
-        messages,
-        stream: req.stream,
-        max_tokens: req.max_tokens,
-        max_completion_tokens: req.max_output_tokens,
-        tools: req.tools.clone(),
-        tool_choice: req.tool_choice.clone(),
-        reasoning_effort: None,
-        reasoning: req.reasoning.clone(),
-        stream_options: None,
-    })
-}
-
-pub fn responses_input_to_messages(
-    input: Option<&Value>,
-) -> Result<Vec<OpenAIMessage>, OpenAIConversionError> {
-    let Some(input) = input else {
-        return Ok(Vec::new());
-    };
-
-    match input {
-        Value::Null => Ok(Vec::new()),
-        Value::String(text) => {
-            if text.trim().is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![OpenAIMessage {
-                    role: "user".to_string(),
-                    content: Some(Value::String(text.clone())),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    name: None,
-                }])
-            }
-        }
-        Value::Array(items) => {
-            let mut out = Vec::new();
-            for item in items {
-                out = append_openai_messages(out, response_input_item_to_messages(item)?);
-            }
-            Ok(out)
-        }
-        Value::Object(_) => response_input_item_to_messages(input),
-        _ => Err(err("unsupported input shape")),
-    }
-}
-
-fn response_input_item_to_messages(
-    item: &Value,
-) -> Result<Vec<OpenAIMessage>, OpenAIConversionError> {
-    let Some(obj) = item.as_object() else {
-        return Ok(Vec::new());
-    };
-    let typ = obj.get("type").and_then(Value::as_str).unwrap_or_default();
-    let role = obj.get("role").and_then(Value::as_str).unwrap_or_default();
-
-    match typ {
-        "message" => {
-            let role = if role.is_empty() { "user" } else { role };
-            Ok(vec![OpenAIMessage {
-                role: role.to_string(),
-                content: obj.get("content").cloned(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                name: None,
-            }])
-        }
-        "input_text" | "text" => Ok(text_item_to_user_message(obj)),
-        "input_image" | "image" | "image_url" => Ok(vec![OpenAIMessage {
-            role: "user".to_string(),
-            content: Some(Value::Array(vec![item.clone()])),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }]),
-        "output_text" => Ok(vec![OpenAIMessage {
-            role: "assistant".to_string(),
-            content: Some(Value::String(
-                obj.get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            )),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }]),
-        "function_call" => {
-            let id = first_string(obj, &["call_id", "id"]);
-            let name = first_string(obj, &["name"]);
-            let arguments = stringify_value(obj.get("arguments"));
-            Ok(vec![OpenAIMessage {
-                role: "assistant".to_string(),
-                content: Some(Value::String(String::new())),
-                tool_calls: vec![OpenAIToolCall {
-                    id,
-                    tool_type: "function".to_string(),
-                    function: OpenAIFunctionCall {
-                        name: name.unwrap_or_default(),
-                        arguments,
-                    },
-                }],
-                tool_call_id: None,
-                name: None,
-            }])
-        }
-        "function_call_output" | "tool_result" => Ok(vec![OpenAIMessage {
-            role: "tool".to_string(),
-            content: obj.get("output").cloned().or_else(|| obj.get("content").cloned()),
-            tool_calls: Vec::new(),
-            tool_call_id: first_string(obj, &["call_id", "tool_call_id"]),
-            name: None,
-        }]),
-        _ if !role.is_empty() => Ok(vec![OpenAIMessage {
-            role: role.to_string(),
-            content: obj.get("content").cloned(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }]),
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn text_item_to_user_message(obj: &Map<String, Value>) -> Vec<OpenAIMessage> {
-    let text = obj
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if text.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![OpenAIMessage {
-            role: "user".to_string(),
-            content: Some(Value::String(text)),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }]
-    }
-}
-
+#[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
 pub fn append_openai_messages(
     mut out: Vec<OpenAIMessage>,
     messages: Vec<OpenAIMessage>,
@@ -795,21 +609,6 @@ pub fn content_to_text(content: &Value) -> String {
     }
 }
 
-fn stringify_value(value: Option<&Value>) -> String {
-    match value {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(v) => serde_json::to_string(v).unwrap_or_default(),
-    }
-}
-
-fn first_string(obj: &Map<String, Value>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| obj.get(*key).and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 #[derive(Debug, Clone)]
 pub struct AssistantParts {
     pub text: String,
@@ -821,6 +620,10 @@ pub struct AssistantParts {
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
     pub model: String,
+    /// 上游 meteringEvent 透传的 credit_* 计费元数据，未下发时为 None。
+    pub credit_usage: Option<f64>,
+    pub credit_unit: Option<String>,
+    pub credit_unit_plural: Option<String>,
 }
 
 pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
@@ -869,6 +672,14 @@ pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
     }
 
     let usage = value.get("usage").unwrap_or(&Value::Null);
+    // usage 负数消毒：上游异常时可能下发负值，对外一律截断为 0
+    let token = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            .max(0)
+    };
     AssistantParts {
         text,
         reasoning,
@@ -878,34 +689,32 @@ pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
             .and_then(Value::as_str)
             .unwrap_or("end_turn")
             .to_string(),
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        cache_read_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        cache_creation_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
+        input_tokens: token("input_tokens"),
+        output_tokens: token("output_tokens"),
+        cache_read_tokens: token("cache_read_input_tokens"),
+        cache_creation_tokens: token("cache_creation_input_tokens"),
         model: value
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_OPENAI_COMPAT_MODEL)
             .to_string(),
+        credit_usage: usage.get("credit_usage").and_then(Value::as_f64),
+        credit_unit: usage
+            .get("credit_unit")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        credit_unit_plural: usage
+            .get("credit_unit_plural")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
-pub fn finish_reason_from_anthropic(stop_reason: &str) -> &'static str {
+pub fn finish_reason_from_anthropic(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
+        _ if has_tool_calls => "tool_calls",
         _ => "stop",
     }
 }
@@ -931,7 +740,7 @@ pub fn chat_message_from_parts(parts: &AssistantParts) -> Value {
 
 pub fn usage_json(parts: &AssistantParts) -> Value {
     let prompt_tokens = parts.input_tokens + parts.cache_creation_tokens + parts.cache_read_tokens;
-    json!({
+    let mut usage = json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": parts.output_tokens,
         "total_tokens": prompt_tokens + parts.output_tokens,
@@ -941,41 +750,31 @@ pub fn usage_json(parts: &AssistantParts) -> Value {
         "completion_tokens_details": {
             "reasoning_tokens": 0,
         }
-    })
-}
-
-/// Responses API 口径的 usage。
-///
-/// 与 chat completions 的 `prompt_tokens` / `completion_tokens` 不同，Responses
-/// 用 `input_tokens` / `output_tokens` / `total_tokens`。Codex 的 SSE 解析器
-/// (`ResponseCompletedUsage`) 只认这套字段名，若 `response.completed` 里带了 chat
-/// 口径的 usage，反序列化会失败并中断整条流，所以必须单独构造。
-pub fn responses_usage_json(parts: &AssistantParts) -> Value {
-    let input_tokens = parts.input_tokens + parts.cache_creation_tokens + parts.cache_read_tokens;
-    json!({
-        "input_tokens": input_tokens,
-        "input_tokens_details": {
-            "cached_tokens": parts.cache_read_tokens,
-        },
-        "output_tokens": parts.output_tokens,
-        "output_tokens_details": {
-            "reasoning_tokens": 0,
-        },
-        "total_tokens": input_tokens + parts.output_tokens,
-    })
+    });
+    // 仅在拿到上游 meteringEvent 时透传 credit_* 计费元数据
+    if let Some(credit_usage) = parts.credit_usage {
+        usage["credit_usage"] = json!(credit_usage);
+        if let Some(unit) = &parts.credit_unit {
+            usage["credit_unit"] = json!(unit);
+        }
+        if let Some(unit_plural) = &parts.credit_unit_plural {
+            usage["credit_unit_plural"] = json!(unit_plural);
+        }
+    }
+    usage
 }
 
 pub fn openai_error(message: impl Into<String>, error_type: impl Into<String>) -> Value {
+    // 与上游 v0.8.0 对齐：仅 message + type，不再附带恒 null 的 param / code
     json!({
         "error": {
             "message": message.into(),
             "type": error_type.into(),
-            "param": null,
-            "code": null
         }
     })
 }
 
+#[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
 pub fn assistant_message_for_history(parts: &AssistantParts) -> OpenAIMessage {
     OpenAIMessage {
         role: "assistant".to_string(),
@@ -984,43 +783,4 @@ pub fn assistant_message_for_history(parts: &AssistantParts) -> OpenAIMessage {
         tool_call_id: None,
         name: None,
     }
-}
-
-pub fn response_output_from_parts(parts: &AssistantParts) -> (Vec<Value>, String) {
-    let mut output = Vec::new();
-    if !parts.text.is_empty() || parts.tool_calls.is_empty() {
-        output.push(json!({
-            "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": parts.text,
-                "annotations": []
-            }]
-        }));
-    }
-    if !parts.reasoning.is_empty() {
-        output.push(json!({
-            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
-            "type": "reasoning",
-            "summary": [],
-            "content": [{
-                "type": "reasoning_text",
-                "text": parts.reasoning,
-            }],
-        }));
-    }
-    for call in &parts.tool_calls {
-        output.push(json!({
-            "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call.id.clone().unwrap_or_default(),
-            "name": call.function.name,
-            "arguments": call.function.arguments,
-        }));
-    }
-    (output, parts.text.clone())
 }
