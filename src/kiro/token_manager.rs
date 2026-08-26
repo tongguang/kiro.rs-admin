@@ -1560,6 +1560,19 @@ impl MultiTokenManager {
             .unwrap_or(0)
     }
 
+    /// 模型缓存刷新完成后是否把结果写回。
+    /// 代际在刷新期间被 invalidate 改写（值变化）时不写回；
+    /// `credential_exists` 用于区分「从未 invalidate 的首次刷新」（键不存在、
+    /// started==0，应写回）与「刷新期间凭据被删除」（remove_model_cache 清掉代际
+    /// 条目后，0 == unwrap_or(0) 的纯数值比较会把死凭据的模型列表写回缓存）。
+    fn model_cache_write_back_ok(
+        current_generation: Option<u64>,
+        started_generation: u64,
+        credential_exists: bool,
+    ) -> bool {
+        credential_exists && current_generation.unwrap_or(0) == started_generation
+    }
+
     fn invalidate_model_cache(&self, id: u64) {
         let mut generations = self.model_cache_generations.lock();
         *generations.entry(id).or_insert(0) += 1;
@@ -1644,8 +1657,13 @@ impl MultiTokenManager {
             get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
                 .await?;
 
+        // 凭据在刷新期间被删除时不写回（删除后 generation 条目被清，
+        // 纯数值比较 0 == unwrap_or(0) 会把死凭据的模型列表写回缓存）。
+        // entries 锁临时取放，不与 generations/cache 锁嵌套。
+        let credential_exists = self.entries.lock().iter().any(|e| e.id == id);
         let generations = self.model_cache_generations.lock();
-        if generation == generations.get(&id).copied().unwrap_or(0) {
+        if Self::model_cache_write_back_ok(generations.get(&id).copied(), generation, credential_exists)
+        {
             let mut cache = self.model_cache.lock();
             if epoch == self.model_cache_epoch.load(Ordering::Relaxed) {
                 cache.insert(
@@ -6047,6 +6065,28 @@ mod tests {
             manager.model_cache_generations.lock().get(&1).is_none(),
             "删除凭据应清理 generation 条目，避免 map 只增不减"
         );
+    }
+
+    #[test]
+    fn test_model_cache_write_back_ok() {
+        // 代际未变且凭据仍在 → 写回
+        assert!(MultiTokenManager::model_cache_write_back_ok(
+            Some(2),
+            2,
+            true
+        ));
+        // 首刷（从未 invalidate，键不存在、started==0）→ 写回
+        assert!(MultiTokenManager::model_cache_write_back_ok(None, 0, true));
+        // 刷新期间被 invalidate（代际前进）→ 不写回
+        assert!(!MultiTokenManager::model_cache_write_back_ok(
+            Some(3),
+            2,
+            true
+        ));
+        // 刷新期间凭据被删除（代际条目被 remove）→ 不写回，即使数值 0 == 0
+        assert!(!MultiTokenManager::model_cache_write_back_ok(
+            None, 0, false
+        ));
     }
 
     #[tokio::test]

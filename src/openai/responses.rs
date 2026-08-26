@@ -2796,6 +2796,40 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_high_case_insensitive_maps_to_high_budget() {
+        // 大小写变体经归一化（trim+小写）后为 high+20000，与 Chat 路径一致
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "reasoning": {"effort": "High"},
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert_eq!(anth.thinking.unwrap().budget_tokens, 20_000);
+        assert_eq!(
+            anth.output_config.map(|c| c.effort).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_unknown_value_falls_back_to_medium() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "reasoning": {"effort": "ultra"},
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert_eq!(anth.thinking.unwrap().budget_tokens, 12_000);
+        assert_eq!(
+            anth.output_config.map(|c| c.effort).as_deref(),
+            Some("medium"),
+            "未知 effort 归一为 medium，与 Chat 路径一致"
+        );
+    }
+
+    #[test]
     fn web_search_preview_variant_triggers_hosted_injection() {
         let req = req_with(json!([{ "type": "web_search_preview" }]), simple_input());
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
