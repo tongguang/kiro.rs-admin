@@ -955,8 +955,12 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
+                            // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并补发
+                            // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
+                            let final_events = ctx.generate_error_events(
+                                "upstream_error",
+                                "Upstream response stream was interrupted",
+                            );
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
