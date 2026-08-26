@@ -1971,13 +1971,9 @@ impl MultiTokenManager {
                     let entries = self.entries.lock();
                     // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
                     // 让调用方知道这是限流而不是凭据耗尽。
-                    if let Some(retry_after) = self.rpm_retry_after_secs(
-                        &entries,
-                        model,
-                        group,
-                        excluded_ids,
-                        Instant::now(),
-                    ) {
+                    if let Some(retry_after) =
+                        self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                    {
                         return Err(
                             UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
                         );
@@ -2514,18 +2510,21 @@ impl MultiTokenManager {
     /// 当选择阶段无任何可用凭据时，计算「仅因 RPM 打满而不可用」的凭据中
     /// 最早恢复秒数（Retry-After 口径）。返回 `None` 表示不是 RPM 打满场景
     /// （例如全部禁用/冷却/模型分组不匹配），调用方按原有错误路径处理。
+    ///
+    /// 刻意不使用调用方的请求内排除集：被本请求抢占排除（`request_throttled_ids`）
+    /// 的凭据往往正是「仅 RPM 打满」的凭据，漏算会把限流误报成 502「所有凭据
+    /// 均已禁用」；普通 429 被排除但 RPM 未满的凭据由 `fresh.len() < limit → None`
+    /// 保护，行为不变。
     fn rpm_retry_after_secs(
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
         group: Option<&str>,
-        excluded_ids: &HashSet<u64>,
         now: Instant,
     ) -> Option<u64> {
         let mut earliest: Option<u64> = None;
         for e in entries {
-            if excluded_ids.contains(&e.id)
-                || e.disabled
+            if e.disabled
                 || e.throttled_until.map(|t| t > now).unwrap_or(false)
                 || e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 || !credential_matches_request(&e.credentials, model, group)
@@ -5936,6 +5935,70 @@ mod tests {
         // 决策 5：保留 #[derive(Default)]，default() 的 rpm_limit=0（不限速，仅内部/测试用）。
         // 用户可见的默认 10 由 serde default 与表单 default 保证。
         assert_eq!(KiroCredentials::default().rpm_limit, 0);
+    }
+
+    #[test]
+    fn test_rpm_retry_after_covers_preempted_excluded_credentials() {
+        // 并发预留被抢占的凭据会被放进请求内排除集（request_throttled_ids）；
+        // 选择落空时它正是「仅 RPM 打满」的凭据，必须参与 Retry-After 计算，
+        // 否则限流会被误报成「所有凭据均已禁用」的 502。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        // 单凭据限速 2 且窗口已满
+        {
+            let mut entries = manager.entries.lock();
+            let a = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            a.credentials.rpm_limit = 2;
+            a.recent_requests.push_back(now);
+            a.recent_requests.push_back(now);
+        }
+
+        let entries = manager.entries.lock();
+        let retry_after = manager.rpm_retry_after_secs(&entries[..], None, None, now);
+        assert!(
+            retry_after.is_some(),
+            "RPM 打满（即使凭据被本请求排除）也应给出 Retry-After"
+        );
+        assert!(retry_after.unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_rpm_retry_after_none_when_not_rpm_bound() {
+        // 对照：凭据 RPM 未满（例如只是普通 429 被请求内排除）时不算 RPM 打满
+        // 场景，返回 None 走原有错误路径。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        // 限速 2 但窗口内只有 1 条
+        {
+            let mut entries = manager.entries.lock();
+            let a = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            a.credentials.rpm_limit = 2;
+            a.recent_requests.push_back(now);
+        }
+
+        let entries = manager.entries.lock();
+        assert!(
+            manager
+                .rpm_retry_after_secs(&entries[..], None, None, now)
+                .is_none(),
+            "RPM 未满时不应报 RPM 打满"
+        );
     }
 
     #[tokio::test]
