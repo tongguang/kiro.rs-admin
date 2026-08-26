@@ -1,5 +1,6 @@
 name: Build and Push GHCR Images
 
+# Push to master → :beta and :beta-<sha>. Manual dispatch → :<version> and :latest.
 on:
   push:
     branches:
