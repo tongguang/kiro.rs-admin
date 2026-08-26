@@ -298,6 +298,39 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    ///
+    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
+    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
+    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    ///
+    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
+    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    #[serde(default = "default_suspended_detection_enabled")]
+    pub suspended_detection_enabled: bool,
+
+    /// 是否启用凭据自愈（默认 true）。
+    ///
+    /// 当前请求的 model/group 作用域没有可用凭据时，只恢复该作用域内因
+    /// `TooManyFailures` 被自动禁用且仍满足冷却/上限的凭据。
+    #[serde(default = "default_self_heal_enabled")]
+    pub self_heal_enabled: bool,
+
+    /// 同一凭据两次自愈之间的最小冷却间隔（秒，默认 300 = 5 分钟）。
+    ///
+    /// 冷却窗口内即使再次全灭也不触发自愈。这是打断 issue #51「全禁 → 自愈 →
+    /// 403 → 再禁」死循环的关键：持续故障时自愈频率被限到每 5 分钟一次，
+    /// 而非每个请求都重置刷屏并无效打上游。
+    #[serde(default = "default_self_heal_min_interval_secs")]
+    pub self_heal_min_interval_secs: u64,
+
+    /// 连续自愈的最大轮数（默认 5，`0` 表示不限）。
+    ///
+    /// 同一凭据连续自愈达到此值且同一模型期间没有成功调用时，停止自愈并记录
+    /// 错误日志提示人工介入。其它凭据、分组或模型的成功不会清零该计数。
+    #[serde(default = "default_self_heal_max_consecutive_rounds")]
+    pub self_heal_max_consecutive_rounds: u32,
+
     /// 普通 429 重试策略模式。默认 `failover` 保持当前项目行为。
     #[serde(default = "default_retry_mode")]
     pub retry_mode: RetryMode,
@@ -407,6 +440,22 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_suspended_detection_enabled() -> bool {
+    true
+}
+
+fn default_self_heal_enabled() -> bool {
+    true
+}
+
+fn default_self_heal_min_interval_secs() -> u64 {
+    5 * 60
+}
+
+fn default_self_heal_max_consecutive_rounds() -> u32 {
+    5
+}
+
 fn default_retry_mode() -> RetryMode {
     RetryMode::Failover
 }
@@ -469,6 +518,10 @@ impl Default for Config {
             proxy_balancing_mode: default_proxy_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            suspended_detection_enabled: default_suspended_detection_enabled(),
+            self_heal_enabled: default_self_heal_enabled(),
+            self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
+            self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             retry_mode: default_retry_mode(),
             retry_policy: None,
             extract_thinking: default_extract_thinking(),
@@ -542,5 +595,42 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_heal_config_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.suspended_detection_enabled);
+        assert!(config.self_heal_enabled);
+        assert_eq!(config.self_heal_min_interval_secs, 300);
+        assert_eq!(config.self_heal_max_consecutive_rounds, 5);
+
+        let default = Config::default();
+        assert!(default.suspended_detection_enabled);
+        assert!(default.self_heal_enabled);
+        assert_eq!(default.self_heal_min_interval_secs, 300);
+        assert_eq!(default.self_heal_max_consecutive_rounds, 5);
+    }
+
+    #[test]
+    fn self_heal_config_accepts_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "suspendedDetectionEnabled": false,
+                "selfHealEnabled": false,
+                "selfHealMinIntervalSecs": 60,
+                "selfHealMaxConsecutiveRounds": 0
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.suspended_detection_enabled);
+        assert!(!config.self_heal_enabled);
+        assert_eq!(config.self_heal_min_interval_secs, 60);
+        assert_eq!(config.self_heal_max_consecutive_rounds, 0);
     }
 }

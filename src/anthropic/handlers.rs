@@ -256,6 +256,7 @@ pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static st
     Some(match last.as_str() {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
         outcome::ACCOUNT_THROTTLED => outcome::ACCOUNT_THROTTLED,
+        outcome::ACCOUNT_SUSPENDED => outcome::ACCOUNT_SUSPENDED,
         outcome::AUTH_FAILED => outcome::AUTH_FAILED,
         outcome::TRANSIENT => outcome::TRANSIENT,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,

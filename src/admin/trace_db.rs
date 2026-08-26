@@ -152,6 +152,7 @@ pub mod outcome {
     pub const SUCCESS: &str = "success";
     pub const QUOTA_EXHAUSTED: &str = "quota_exhausted";
     pub const ACCOUNT_THROTTLED: &str = "account_throttled";
+    pub const ACCOUNT_SUSPENDED: &str = "account_suspended";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const TRANSIENT: &str = "transient";
     pub const NETWORK_ERROR: &str = "network_error";

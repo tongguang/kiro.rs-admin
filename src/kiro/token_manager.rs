@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -948,6 +948,14 @@ struct CredentialEntry {
     /// 最近 60 秒内「对该账号上游发起请求」的时间戳队列（RPM 滑动窗口计数）。
     /// record_request 时 push 队尾并剔除过期项；不持久化，进程重启清空。
     recent_requests: VecDeque<Instant>,
+    /// 当前凭据连续执行自愈的轮数。同一凭据同一模型成功后清零。
+    self_heal_consecutive_rounds: u32,
+    /// 当前凭据累计被自愈恢复的次数。
+    self_heal_total_count: u64,
+    /// 最近一次自愈时间。使用绝对时间以支持跨进程重启的冷却判断。
+    last_self_heal_at: Option<DateTime<Utc>>,
+    /// 当前连续自愈轮次对应的模型；None 表示 MCP/无模型请求。
+    self_heal_model: Option<String>,
 }
 
 /// 禁用原因
@@ -957,6 +965,9 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 上游明确返回账号封禁/停用（403 + 封禁文案）后立即禁用。
+    /// 不可自动恢复、**不参与自愈**，需人工联系客服核实后手动重置。
+    Suspended,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -965,6 +976,41 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+}
+
+impl DisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::TooManyFailures => "TooManyFailures",
+            Self::Suspended => "Suspended",
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::InvalidRefreshToken => "InvalidRefreshToken",
+            Self::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "Manual" => Some(Self::Manual),
+            "TooManyFailures" => Some(Self::TooManyFailures),
+            "Suspended" => Some(Self::Suspended),
+            "TooManyRefreshFailures" => Some(Self::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(Self::QuotaExceeded),
+            "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
+            "InvalidConfig" => Some(Self::InvalidConfig),
+            _ => None,
+        }
+    }
+}
+
+impl CredentialEntry {
+    fn clear_self_heal_streak(&mut self) {
+        self.self_heal_consecutive_rounds = 0;
+        self.last_self_heal_at = None;
+        self.self_heal_model = None;
+    }
 }
 
 /// 统计数据持久化条目
@@ -1073,6 +1119,13 @@ pub enum ModelDiscoveryError {
     ColdStartFailed { credential_count: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedModelSupport {
+    Confirmed,
+    Unknown,
+    Unsupported,
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -1109,6 +1162,16 @@ pub struct MultiTokenManager {
     retry_mode: Mutex<RetryMode>,
     /// 普通 429 自定义策略（运行时可修改）
     retry_policy: Mutex<Option<RetryPolicy>>,
+    /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
+    suspended_detection_enabled: AtomicBool,
+    /// 全账号自愈总开关（运行时可修改）
+    self_heal_enabled: AtomicBool,
+    /// 两次自愈的最小冷却间隔（秒，运行时可修改）
+    self_heal_min_interval_secs: AtomicU64,
+    /// 连续自愈最大轮数（0=不限，运行时可修改）
+    self_heal_max_consecutive_rounds: AtomicU32,
+    /// 自愈治理配置的更新锁，保证“读取旧值 → 合并 → 应用 → 持久化”原子化
+    self_heal_config_update_lock: Mutex<()>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1197,6 +1260,13 @@ fn credential_matches_request(
     group_matches(&credentials.groups, group)
 }
 
+fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
 /// RPM 滑动窗口长度：60 秒。
 const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
 
@@ -1273,6 +1343,32 @@ impl MultiTokenManager {
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
                 }
+                let disabled_reason = if cred.disabled {
+                    match cred
+                        .disabled_reason
+                        .as_deref()
+                        .and_then(DisabledReason::from_str)
+                    {
+                        Some(reason) => Some(reason),
+                        None => {
+                            if let Some(reason) = cred.disabled_reason.as_deref() {
+                                tracing::warn!(
+                                    "凭据 #{} 的禁用原因 `{}` 无法识别，按 Manual 处理",
+                                    id,
+                                    reason
+                                );
+                            }
+                            Some(DisabledReason::Manual)
+                        }
+                    }
+                } else {
+                    None
+                };
+                let last_self_heal_at = cred
+                    .last_self_heal_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc));
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -1280,17 +1376,17 @@ impl MultiTokenManager {
                     total_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
-                    } else {
-                        None
-                    },
+                    disabled_reason,
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
                     rate_limited_until: None,
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
+                    self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
+                    self_heal_total_count: cred.self_heal_total_count,
+                    last_self_heal_at,
+                    self_heal_model: cred.self_heal_model.clone(),
                 }
             })
             .collect();
@@ -1341,6 +1437,10 @@ impl MultiTokenManager {
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
+        let suspended_detection_enabled = config.suspended_detection_enabled;
+        let self_heal_enabled = config.self_heal_enabled;
+        let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
+        let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1357,6 +1457,11 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
+            suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
+            self_heal_enabled: AtomicBool::new(self_heal_enabled),
+            self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
+            self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
+            self_heal_config_update_lock: Mutex::new(()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
@@ -1461,6 +1566,28 @@ impl MultiTokenManager {
             .entry(id)
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
+    }
+
+    /// 按凭据缓存的模型列表判断某凭据是否支持指定模型。
+    /// 无缓存或模型为 None 时返回 Unknown（不阻断调度/自愈）。
+    fn cached_model_support(&self, id: u64, model: Option<&str>) -> CachedModelSupport {
+        let Some(model) = model else {
+            return CachedModelSupport::Unknown;
+        };
+        let cache = self.model_cache.lock();
+        let Some(entry) = cache.get(&id) else {
+            return CachedModelSupport::Unknown;
+        };
+        if entry
+            .response
+            .models
+            .iter()
+            .any(|available| available.model_id.eq_ignore_ascii_case(model))
+        {
+            CachedModelSupport::Confirmed
+        } else {
+            CachedModelSupport::Unsupported
+        }
     }
 
     async fn refresh_model_cache_for(
@@ -1825,73 +1952,41 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                // priority 模式固定 current_id；balanced / least_conn 每次重新选择
-                let re_select_each_request = self.load_balancing_mode.lock().as_str() != "priority";
+                // 所有模式（含 priority）都按当前请求重新选择。priority 模式不能复用
+                // current_id，否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
+                let mut best = self.select_next_credential_excluding(model, group, excluded_ids);
 
-                // 非 priority 模式：每次请求都重新选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if re_select_each_request {
-                    None
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
+                // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环；排除集合原样生效）。
+                if best.is_none() && self.try_self_heal(model, group) {
+                    best = self.select_next_credential_excluding(model, group, excluded_ids);
+                }
+
+                if let Some((new_id, new_creds)) = best {
+                    // 更新 current_id（仅作展示/Admin 语义，选择不再依赖它）
+                    let mut current_id = self.current_id.lock();
+                    *current_id = new_id;
+                    (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.id == current_id
-                                && !excluded_ids.contains(&e.id)
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
-                                && !is_rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best =
-                        self.select_next_credential_excluding(model, group, excluded_ids);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best =
-                                self.select_next_credential_excluding(model, group, excluded_ids);
-                        }
+                    // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
+                    // 让调用方知道这是限流而不是凭据耗尽。
+                    if let Some(retry_after) = self.rpm_retry_after_secs(
+                        &entries,
+                        model,
+                        group,
+                        excluded_ids,
+                        Instant::now(),
+                    ) {
+                        return Err(
+                            UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
+                        );
                     }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
+                    // 注意：必须在 bail! 之前计算 available_count，
+                    // 因为 available_count() 会尝试获取 entries 锁，
+                    // 而此时我们已经持有该锁，会导致死锁
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 }
             };
 
@@ -2122,6 +2217,11 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_str().to_string());
+                    cred.self_heal_consecutive_rounds = e.self_heal_consecutive_rounds;
+                    cred.self_heal_total_count = e.self_heal_total_count;
+                    cred.last_self_heal_at = e.last_self_heal_at.map(|v| v.to_rfc3339());
+                    cred.self_heal_model = e.self_heal_model.clone();
                     cred
                 })
                 .collect()
@@ -2381,22 +2481,85 @@ impl MultiTokenManager {
     /// push now 到队尾，并从队首剔除所有超过 60s 的过期时间戳。
     /// 由 provider 在「会话级首次用到该凭据」时调用一次（同凭据重试不重复记，
     /// 故障转移到新凭据时各记一次）。必须在未持有 entries 锁时调用。
-    pub(crate) fn record_request(&self, id: u64) {
+    /// 尝试为一次真实业务请求预留 RPM 额度（原子预留）。
+    ///
+    /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求
+    /// 在选择阶段同时通过 `is_rpm_exceeded` 检查后全部写入窗口导致超发。
+    /// 返回 `false` 表示额度已被其它请求抢先占用，调用方应排除该凭据重新选择。
+    /// `rpm_limit == 0` 视为不限速，始终返回 true（仍会清理过期窗口）。
+    pub(crate) fn record_request(&self, id: u64) -> bool {
         let now = Instant::now();
         let cutoff = now.checked_sub(RPM_WINDOW);
         let mut entries = self.entries.lock();
-        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-            if let Some(c) = cutoff {
-                while let Some(&front) = e.recent_requests.front() {
-                    if front <= c {
-                        e.recent_requests.pop_front();
-                    } else {
-                        break;
-                    }
+        let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if let Some(c) = cutoff {
+            while let Some(&front) = e.recent_requests.front() {
+                if front <= c {
+                    e.recent_requests.pop_front();
+                } else {
+                    break;
                 }
             }
-            e.recent_requests.push_back(now);
         }
+        let limit = e.credentials.rpm_limit;
+        if limit != 0 && e.recent_requests.len() >= limit as usize {
+            return false;
+        }
+        e.recent_requests.push_back(now);
+        true
+    }
+
+    /// 当选择阶段无任何可用凭据时，计算「仅因 RPM 打满而不可用」的凭据中
+    /// 最早恢复秒数（Retry-After 口径）。返回 `None` 表示不是 RPM 打满场景
+    /// （例如全部禁用/冷却/模型分组不匹配），调用方按原有错误路径处理。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        now: Instant,
+    ) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
+        for e in entries {
+            if excluded_ids.contains(&e.id)
+                || e.disabled
+                || e.throttled_until.map(|t| t > now).unwrap_or(false)
+                || e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                || !credential_matches_request(&e.credentials, model, group)
+            {
+                continue;
+            }
+            let limit = e.credentials.rpm_limit;
+            if limit == 0 {
+                // 不限速的凭据未被选中说明另有原因，非 RPM 场景
+                return None;
+            }
+            let cutoff = now.checked_sub(RPM_WINDOW);
+            let fresh: Vec<Instant> = e
+                .recent_requests
+                .iter()
+                .copied()
+                .filter(|&t| cutoff.map(|c| t > c).unwrap_or(true))
+                .collect();
+            if (fresh.len() as u32) < limit {
+                // 该凭据其实有额度却没被选中（并发竞争外的异常），不算 RPM 打满
+                return None;
+            }
+            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh.len() - limit as usize;
+            let release_at = fresh[release_index] + RPM_WINDOW;
+            let remaining = release_at.saturating_duration_since(now);
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest = Some(earliest.map(|cur: u64| cur.min(retry_after)).unwrap_or(retry_after));
+        }
+        earliest
     }
 
     /// 为指定凭据构造 in-flight RAII 守卫（provider 用其持有的 Arc 调用）。
@@ -2416,7 +2579,13 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        {
+        self.report_success_for_request(id, None);
+    }
+
+    /// 报告指定请求模型上的成功。只清零同一凭据、同一模型的连续自愈轮数。
+    pub fn report_success_for_request(&self, id: u64, model: Option<&str>) {
+        let requested_model = normalize_self_heal_model(model);
+        let reset_persisted_self_heal = {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
@@ -2431,6 +2600,21 @@ impl MultiTokenManager {
                     id,
                     entry.success_count
                 );
+                if entry.self_heal_consecutive_rounds > 0
+                    && entry.self_heal_model == requested_model
+                {
+                    entry.clear_self_heal_streak();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if reset_persisted_self_heal {
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 成功后持久化自愈状态失败: {}", id, error);
             }
         }
         self.save_stats_debounced();
@@ -2444,9 +2628,10 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, newly_disabled) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
+            let mut disabled_now = false;
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
@@ -2472,6 +2657,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                disabled_now = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -2491,10 +2677,188 @@ impl MultiTokenManager {
                 }
             }
 
-            entries.iter().any(|e| !e.disabled)
+            (entries.iter().any(|e| !e.disabled), disabled_now)
         };
+        if newly_disabled {
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 自动禁用状态持久化失败: {}", id, error);
+            }
+        }
         self.save_stats_debounced();
         result
+    }
+
+    /// 报告指定凭据被上游封禁/停用（403 + 明确封禁文案）。
+    ///
+    /// 立即禁用并标记 [`DisabledReason::Suspended`]，**不累计、不参与自愈**——
+    /// 账号封禁是不可自动恢复的终态，无脑自愈复活只会立刻再次 403 形成死循环
+    /// （issue #51）。误判可经 Admin API 手动重置。切换到下一个可用凭据。
+    /// 返回是否还有可用凭据可以重试。
+    #[cfg(test)]
+    pub fn report_suspended(&self, id: u64) -> bool {
+        self.report_suspended_for_request(id, None, None)
+    }
+
+    pub fn report_suspended_for_request(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
+                return entries.iter().any(|e| !e.disabled);
+            };
+
+            if entries[entry_index].disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            let entry = &mut entries[entry_index];
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Suspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.clear_self_heal_streak();
+            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            entry.total_failure_count += 1;
+
+            tracing::error!(
+                "凭据 #{} 被上游封禁/停用（账号 suspended），已禁用且不参与自愈，请人工联系客服核实后在管理面板手动重置",
+                id
+            );
+
+            let now = Instant::now();
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| {
+                    !entry.disabled
+                        && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&entry.credentials, model, group)
+                        && !is_rpm_exceeded(entry, now)
+                })
+                .min_by_key(|e| (e.credentials.priority, e.id))
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("凭据 #{} 封禁状态持久化失败: {}", id, error);
+        }
+        self.save_stats_debounced();
+        result
+    }
+
+    /// 是否启用 403 封禁文案识别（provider 调用，决定 403 是否走 report_suspended）。
+    pub fn get_suspended_detection_enabled(&self) -> bool {
+        self.suspended_detection_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 受控的凭据自愈。
+    ///
+    /// 当前请求的 model/group 作用域没有可用凭据时，在以下约束下恢复该作用域内因
+    /// [`DisabledReason::TooManyFailures`] 被禁用的凭据：
+    /// - `self_heal_enabled` 关闭时不自愈；
+    /// - 每个凭据独立计算连续轮数和冷却，状态跨重启持久化；
+    /// - 只有同一凭据、同一模型的成功才清零连续轮数；
+    /// - 不存在的分组、明确不支持的模型和无关 429 冷却不会触碰其它凭据。
+    ///
+    /// 仅复活 [`DisabledReason::TooManyFailures`]；手动禁用、Suspended、额度用尽、
+    /// token 失效等其它原因禁用的凭据不受影响。
+    /// 返回本次是否实际执行了自愈（调用方据此决定是否重新选取凭据）。
+    fn try_self_heal(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        if !self.self_heal_enabled.load(Ordering::Relaxed) {
+            tracing::debug!("当前请求没有可用凭据，但自愈已关闭");
+            return false;
+        }
+
+        let max_rounds = self
+            .self_heal_max_consecutive_rounds
+            .load(Ordering::Relaxed);
+        let min_interval = self.self_heal_min_interval_secs.load(Ordering::Relaxed);
+        let requested_model = normalize_self_heal_model(model);
+        let now = Utc::now();
+        let mut recovered = Vec::new();
+        let mut max_blocked = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if !entry.disabled
+                    || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
+                    || !credential_matches_request(&entry.credentials, model, group)
+                    || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
+                {
+                    continue;
+                }
+
+                if entry.self_heal_consecutive_rounds > 0
+                    && entry.self_heal_model != requested_model
+                {
+                    continue;
+                }
+
+                if max_rounds > 0 && entry.self_heal_consecutive_rounds >= max_rounds {
+                    max_blocked.push((entry.id, entry.self_heal_consecutive_rounds));
+                    continue;
+                }
+
+                if let Some(previous) = entry.last_self_heal_at {
+                    let elapsed = now.signed_duration_since(previous).num_seconds();
+                    if elapsed < min_interval as i64 {
+                        continue;
+                    }
+                }
+
+                entry.self_heal_consecutive_rounds =
+                    entry.self_heal_consecutive_rounds.saturating_add(1);
+                entry.self_heal_total_count = entry.self_heal_total_count.saturating_add(1);
+                entry.last_self_heal_at = Some(now);
+                entry.self_heal_model = requested_model.clone();
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+                recovered.push((entry.id, entry.self_heal_consecutive_rounds));
+            }
+        }
+
+        for (id, rounds) in max_blocked {
+            tracing::error!(
+                "凭据 #{} 已连续自愈 {} 轮仍无成功调用（上限 {}），保持禁用并等待人工处理",
+                id,
+                rounds,
+                max_rounds
+            );
+        }
+
+        if recovered.is_empty() {
+            return false;
+        }
+
+        tracing::warn!(
+            model = model.unwrap_or("<none>"),
+            group = group.unwrap_or("<all>"),
+            recovered_count = recovered.len(),
+            recovered = ?recovered,
+            "当前请求作用域无可用凭据，执行受控自愈"
+        );
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("自愈状态持久化失败: {}", error);
+        }
+        true
     }
 
     /// 报告指定凭据额度已用尽
@@ -2520,6 +2884,7 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.clear_self_heal_streak();
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             entry.total_failure_count += 1;
@@ -2586,6 +2951,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            entry.clear_self_heal_streak();
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -2635,6 +3001,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.clear_self_heal_streak();
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -2779,17 +3146,9 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                        }
-                        .to_string()
-                    }),
+                    disabled_reason: e
+                        .disabled_reason
+                        .map(|r| r.as_str().to_string()),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
@@ -2823,6 +3182,7 @@ impl MultiTokenManager {
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
                 entry.rate_limited_until = None;
+                entry.clear_self_heal_streak();
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -3001,6 +3361,7 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
             entry.throttled_until = None;
             entry.rate_limited_until = None;
+            entry.clear_self_heal_streak();
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -3644,6 +4005,10 @@ impl MultiTokenManager {
                 rate_limited_until: None,
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
+                self_heal_consecutive_rounds: 0,
+                self_heal_total_count: 0,
+                last_self_heal_at: None,
+                self_heal_model: None,
             });
         }
 
@@ -4291,6 +4656,140 @@ impl MultiTokenManager {
 
         Ok(())
     }
+
+    /// 获取自愈治理配置（Admin API）。
+    ///
+    /// 返回：(封禁识别开关, 自愈开关, 自愈冷却秒, 连续自愈上限, 当前连续自愈轮数,
+    /// 累计自愈次数)。后两项为只读观测值。
+    pub fn get_self_heal_config(&self) -> (bool, bool, u64, u32, u32, u64) {
+        let (consecutive_rounds, total_count) = {
+            let entries = self.entries.lock();
+            (
+                entries
+                    .iter()
+                    .map(|entry| entry.self_heal_consecutive_rounds)
+                    .max()
+                    .unwrap_or(0),
+                entries
+                    .iter()
+                    .map(|entry| entry.self_heal_total_count)
+                    .fold(0_u64, u64::saturating_add),
+            )
+        };
+        (
+            self.suspended_detection_enabled.load(Ordering::Relaxed),
+            self.self_heal_enabled.load(Ordering::Relaxed),
+            self.self_heal_min_interval_secs.load(Ordering::Relaxed),
+            self.self_heal_max_consecutive_rounds
+                .load(Ordering::Relaxed),
+            consecutive_rounds,
+            total_count,
+        )
+    }
+
+    /// 更新自愈治理配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    ///
+    /// 运行时立即生效并持久化到 config.json。持久化失败时回滚内存值。
+    pub fn set_self_heal_config(
+        &self,
+        suspended_detection_enabled: Option<bool>,
+        self_heal_enabled: Option<bool>,
+        self_heal_min_interval_secs: Option<u64>,
+        self_heal_max_consecutive_rounds: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(secs) = self_heal_min_interval_secs {
+            // 0 秒到 24 小时
+            if secs > 86_400 {
+                anyhow::bail!("自愈冷却间隔必须在 0..=86400 秒内: {}", secs);
+            }
+        }
+        if let Some(r) = self_heal_max_consecutive_rounds {
+            // 0 表示不限，上限 1000 防误配
+            if r > 1000 {
+                anyhow::bail!("连续自愈上限必须在 0..=1000 内（0=不限）: {}", r);
+            }
+        }
+
+        let _update_guard = self.self_heal_config_update_lock.lock();
+
+        let prev = self.get_self_heal_config();
+        let new_suspend_detect = suspended_detection_enabled.unwrap_or(prev.0);
+        let new_enabled = self_heal_enabled.unwrap_or(prev.1);
+        let new_interval = self_heal_min_interval_secs.unwrap_or(prev.2);
+        let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.3);
+
+        if new_suspend_detect == prev.0
+            && new_enabled == prev.1
+            && new_interval == prev.2
+            && new_max_rounds == prev.3
+        {
+            return Ok(());
+        }
+
+        self.suspended_detection_enabled
+            .store(new_suspend_detect, Ordering::Relaxed);
+        self.self_heal_enabled.store(new_enabled, Ordering::Relaxed);
+        self.self_heal_min_interval_secs
+            .store(new_interval, Ordering::Relaxed);
+        self.self_heal_max_consecutive_rounds
+            .store(new_max_rounds, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_self_heal_config(
+            new_suspend_detect,
+            new_enabled,
+            new_interval,
+            new_max_rounds,
+        ) {
+            // 回滚内存值
+            self.suspended_detection_enabled
+                .store(prev.0, Ordering::Relaxed);
+            self.self_heal_enabled.store(prev.1, Ordering::Relaxed);
+            self.self_heal_min_interval_secs
+                .store(prev.2, Ordering::Relaxed);
+            self.self_heal_max_consecutive_rounds
+                .store(prev.3, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "自愈治理配置已更新: suspended_detection_enabled={}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
+            new_suspend_detect,
+            new_enabled,
+            new_interval,
+            new_max_rounds
+        );
+        Ok(())
+    }
+
+    fn persist_self_heal_config(
+        &self,
+        suspended_detection_enabled: bool,
+        self_heal_enabled: bool,
+        self_heal_min_interval_secs: u64,
+        self_heal_max_consecutive_rounds: u32,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，自愈治理配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.suspended_detection_enabled = suspended_detection_enabled;
+        config.self_heal_enabled = self_heal_enabled;
+        config.self_heal_min_interval_secs = self_heal_min_interval_secs;
+        config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
+        config
+            .save()
+            .with_context(|| format!("持久化自愈治理配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
 }
 
 impl Drop for MultiTokenManager {
@@ -4632,6 +5131,512 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    // ========================================================================
+    // 403 封禁识别 + 受控自愈（issue #51）
+    // ========================================================================
+
+    /// 把所有凭据打到 TooManyFailures 禁用（全灭）
+    fn disable_all_via_failures(manager: &MultiTokenManager, ids: &[u64]) {
+        for &id in ids {
+            for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+                manager.report_failure(id);
+            }
+        }
+        assert_eq!(manager.available_count(), 0, "预期全部凭据已禁用");
+    }
+
+    fn model_response(ids: &[&str]) -> ListAvailableModelsResponse {
+        ListAvailableModelsResponse {
+            models: ids
+                .iter()
+                .map(|id| UpstreamModel {
+                    model_id: (*id).to_string(),
+                    model_name: None,
+                    description: None,
+                    token_limits: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn seed_model_cache(manager: &MultiTokenManager, id: u64, models: &[&str]) {
+        manager.model_cache.lock().insert(
+            id,
+            ModelCacheEntry {
+                response: model_response(models),
+                refreshed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn issue51_credentials_path(name: &str) -> (PathBuf, PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_issue51_{}_{}_{}",
+            name,
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn self_heal_recovers_disabled_credentials() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        disable_all_via_failures(&manager, &[1, 2]);
+        assert!(manager.try_self_heal(None, None), "全灭且启用时应执行自愈");
+        assert_eq!(manager.available_count(), 2, "自愈后应恢复全部凭据");
+
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
+        assert_eq!(consecutive, 1);
+        assert_eq!(total, 2, "累计值按恢复的凭据次数统计");
+    }
+
+    #[test]
+    fn self_heal_respects_cooldown() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 3600; // 1 小时冷却，测试内不会到期
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        disable_all_via_failures(&manager, &[1, 2]);
+        assert!(manager.try_self_heal(None, None), "首次自愈应成功");
+
+        // 再次全灭，但仍在冷却窗口内 → 不应再次自愈
+        disable_all_via_failures(&manager, &[1, 2]);
+        assert!(!manager.try_self_heal(None, None), "冷却窗口内不应再次自愈");
+        assert_eq!(manager.available_count(), 0);
+
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
+        assert_eq!(consecutive, 1, "冷却拦截不增加轮数");
+        assert_eq!(total, 2, "首次恢复了两个凭据");
+    }
+
+    #[test]
+    fn self_heal_stops_after_max_rounds() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0; // 无冷却，专注测上限
+        config.self_heal_max_consecutive_rounds = 2;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 无任何成功，连续自愈到达上限后停止
+        disable_all_via_failures(&manager, &[1]);
+        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        disable_all_via_failures(&manager, &[1]);
+        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+        disable_all_via_failures(&manager, &[1]);
+        assert!(!manager.try_self_heal(None, None), "达上限后应停止自愈");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn self_heal_resets_consecutive_rounds_on_success() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        config.self_heal_max_consecutive_rounds = 2;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        disable_all_via_failures(&manager, &[1]);
+        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        disable_all_via_failures(&manager, &[1]);
+        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+
+        // 一次成功清零连续计数
+        manager.report_success(1);
+        let (_, _, _, _, consecutive, _) = manager.get_self_heal_config();
+        assert_eq!(consecutive, 0, "成功后连续轮数应清零");
+
+        // 清零后应能重新自愈（不受之前上限影响）
+        disable_all_via_failures(&manager, &[1]);
+        assert!(manager.try_self_heal(None, None), "成功清零后应可再次自愈");
+    }
+
+    #[test]
+    fn report_suspended_disables_immediately_and_excluded_from_self_heal() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 凭据 #1 被封禁：立即禁用（无需累计），切换到 #2 仍可用
+        assert!(manager.report_suspended(1), "封禁 #1 后 #2 仍可用");
+        assert_eq!(manager.available_count(), 1);
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert!(e1.disabled);
+            assert_eq!(e1.disabled_reason.as_deref(), Some("Suspended"));
+        }
+
+        // 凭据 #2 也被封禁 → 全灭
+        assert!(!manager.report_suspended(2), "封禁 #2 后应全灭");
+        assert_eq!(manager.available_count(), 0);
+
+        // 自愈不应复活 Suspended 凭据
+        assert!(
+            !manager.try_self_heal(None, None),
+            "Suspended 凭据不参与自愈"
+        );
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn suspended_credential_recovers_via_manual_reset() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_suspended(1);
+        assert_eq!(manager.available_count(), 0);
+
+        // 手动重置可恢复（误判逃生途径）
+        manager.reset_and_enable(1).unwrap();
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn self_heal_disabled_does_not_recover() {
+        let mut config = Config::default();
+        config.self_heal_enabled = false;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        disable_all_via_failures(&manager, &[1]);
+        assert!(!manager.try_self_heal(None, None), "自愈关闭时不应恢复");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn self_heal_counters_saturate_at_numeric_limits() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        config.self_heal_max_consecutive_rounds = 0;
+        let mut first = grouped_cred("max-counter-1", &[]);
+        first.disabled = true;
+        first.disabled_reason = Some("TooManyFailures".to_string());
+        first.self_heal_consecutive_rounds = u32::MAX;
+        first.self_heal_total_count = u64::MAX;
+        let mut second = grouped_cred("max-counter-2", &[]);
+        second.self_heal_total_count = 1;
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        assert!(manager.try_self_heal(None, None));
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
+        assert_eq!(consecutive, u32::MAX);
+        assert_eq!(total, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn self_heal_only_recovers_credentials_in_request_group() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("g1-token", &["g1"]),
+                grouped_cred("g2-token", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        disable_all_via_failures(&manager, &[1, 2]);
+        let context = manager
+            .acquire_context(None, Some("g1"))
+            .await
+            .expect("g1 应恢复自己的凭据");
+        assert_eq!(context.id, 1);
+
+        let snapshot = manager.snapshot();
+        let g2 = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert!(g2.disabled, "g1 的自愈不得复活 g2 凭据");
+    }
+
+    #[tokio::test]
+    async fn success_in_other_group_does_not_reset_recovery_limit() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        config.self_heal_max_consecutive_rounds = 1;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("g1-token", &["g1"]),
+                grouped_cred("g2-token", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        manager
+            .acquire_context(None, Some("g1"))
+            .await
+            .expect("g1 首轮自愈应成功");
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        manager.report_success(2);
+        assert!(
+            manager.acquire_context(None, Some("g1")).await.is_err(),
+            "g2 成功不能解除 g1 已达到的自愈上限"
+        );
+        let g1 = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert!(g1.disabled);
+    }
+
+    #[tokio::test]
+    async fn success_on_other_model_does_not_reset_recovery_limit() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        config.self_heal_max_consecutive_rounds = 1;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("model-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["model-a", "model-b"]);
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        manager
+            .acquire_context(Some("model-a"), None)
+            .await
+            .expect("model-a 首轮自愈应成功");
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        manager.report_success_for_request(1, Some("model-b"));
+        assert!(
+            manager
+                .acquire_context(Some("model-a"), None)
+                .await
+                .is_err(),
+            "model-b 成功不能解除 model-a 已达到的自愈上限"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_group_does_not_mutate_self_heal_state() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("g1-token", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        disable_all_via_failures(&manager, &[1]);
+
+        assert!(
+            manager
+                .acquire_context(None, Some("missing"))
+                .await
+                .is_err()
+        );
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
+        assert_eq!(consecutive, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_model_does_not_mutate_self_heal_state() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("model-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        seed_model_cache(&manager, 1, &["glm-5"]);
+        disable_all_via_failures(&manager, &[1]);
+
+        assert!(
+            manager
+                .acquire_context(Some("deepseek-3.2"), None)
+                .await
+                .is_err()
+        );
+        let snapshot = manager.snapshot();
+        assert!(snapshot.entries[0].disabled);
+        let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
+        assert_eq!(consecutive, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn suspended_reason_survives_restart() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+
+        let (dir, path) = issue51_credentials_path("suspended_restart");
+        let mut credential = grouped_cred("suspended-token", &[]);
+        credential.id = Some(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credential]).unwrap()).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.report_suspended(1);
+        drop(manager);
+
+        let loaded = CredentialsConfig::load(&path)
+            .unwrap()
+            .into_sorted_credentials();
+        let restarted =
+            MultiTokenManager::new(Config::default(), loaded, None, Some(path.clone()), true)
+                .unwrap();
+        let entry = &restarted.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("Suspended"));
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_limit_survives_restart() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+
+        let (dir, path) = issue51_credentials_path("recovery_restart");
+        let mut credential = grouped_cred("recovery-token", &[]);
+        credential.id = Some(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credential]).unwrap()).unwrap();
+
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        config.self_heal_max_consecutive_rounds = 1;
+        let manager = MultiTokenManager::new(
+            config.clone(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        disable_all_via_failures(&manager, &[1]);
+        manager
+            .acquire_context(None, None)
+            .await
+            .expect("首轮自愈应成功");
+        disable_all_via_failures(&manager, &[1]);
+        drop(manager);
+
+        let loaded = CredentialsConfig::load(&path)
+            .unwrap()
+            .into_sorted_credentials();
+        let restarted =
+            MultiTokenManager::new(config, loaded, None, Some(path.clone()), true).unwrap();
+        assert!(restarted.acquire_context(None, None).await.is_err());
+        let entry = &restarted.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("TooManyFailures"));
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_self_heal_partial_updates_preserve_all_fields() {
+        let (dir, config_path) = issue51_credentials_path("concurrent_config");
+        let config = Config::default();
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let manager = Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let enabled_manager = Arc::clone(&manager);
+        let enabled_barrier = Arc::clone(&barrier);
+        let enabled = std::thread::spawn(move || {
+            enabled_barrier.wait();
+            enabled_manager
+                .set_self_heal_config(None, Some(false), None, None)
+                .unwrap();
+        });
+        let interval_manager = Arc::clone(&manager);
+        let interval_barrier = Arc::clone(&barrier);
+        let interval = std::thread::spawn(move || {
+            interval_barrier.wait();
+            interval_manager
+                .set_self_heal_config(None, None, Some(123), None)
+                .unwrap();
+        });
+        barrier.wait();
+        enabled.join().unwrap();
+        interval.join().unwrap();
+
+        let (_, runtime_enabled, runtime_interval, _, _, _) = manager.get_self_heal_config();
+        assert!(!runtime_enabled);
+        assert_eq!(runtime_interval, 123);
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(!persisted.self_heal_enabled);
+        assert_eq!(persisted.self_heal_min_interval_secs, 123);
+
+        drop(manager);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

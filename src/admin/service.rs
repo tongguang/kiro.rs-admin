@@ -34,8 +34,9 @@ use super::types::{
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    SelfHealConfigResponse, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -1212,6 +1213,11 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -2026,6 +2032,54 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取自愈治理配置
+    pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
+        let (
+            suspended_detection_enabled,
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        ) = self.token_manager.get_self_heal_config();
+        SelfHealConfigResponse {
+            suspended_detection_enabled,
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        }
+    }
+
+    /// 更新自愈治理配置
+    pub fn set_self_heal_config(
+        &self,
+        req: SetSelfHealConfigRequest,
+    ) -> Result<SelfHealConfigResponse, AdminServiceError> {
+        if req.suspended_detection_enabled.is_none()
+            && req.enabled.is_none()
+            && req.min_interval_secs.is_none()
+            && req.max_consecutive_rounds.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
+                    .to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_self_heal_config(
+                req.suspended_detection_enabled,
+                req.enabled,
+                req.min_interval_secs,
+                req.max_consecutive_rounds,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_self_heal_config())
     }
 
     /// 获取普通 429 重试策略

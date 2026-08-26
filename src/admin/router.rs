@@ -16,7 +16,8 @@ use super::{
         enable_overage_all, export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_balancing_mode,
-        delete_model_mapping, get_proxy_pool, get_retry_policy, get_update_config, list_client_keys,
+        delete_model_mapping, get_proxy_pool, get_retry_policy, get_self_heal_config,
+        get_update_config, list_client_keys,
         list_groups, list_model_mappings, list_traces, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, replace_model_mappings, upsert_model_mapping,
         pull_update_image, reset_all_success_count, reset_client_key_stats, reset_failure_count,
@@ -24,6 +25,7 @@ use super::{
         set_client_key_disabled, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_balancing_mode, set_proxy_enabled, set_retry_policy,
+        set_self_heal_config,
         set_update_config, start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
         stats_timeseries, test_credential_response, trace_failure_stats, update_admin_key,
@@ -115,6 +117,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/retry-policy",
             get(get_retry_policy).put(set_retry_policy),
+        )
+        .route(
+            "/config/self-heal",
+            get(get_self_heal_config).put(set_self_heal_config),
         )
         .route(
             "/config/log-governance",

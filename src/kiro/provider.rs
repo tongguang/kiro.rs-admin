@@ -751,7 +751,8 @@ impl KiroProvider {
             .acquire_context_for_id(credential_id)
             .await?;
         let _in_flight = self.token_manager.in_flight_guard(ctx.id);
-        self.token_manager.record_request(ctx.id);
+        // Admin 显式测试：尽力预留 RPM 额度，打满不阻断（只读诊断语义）
+        let _ = self.token_manager.record_request(ctx.id);
         self.ensure_profile_arn(&mut ctx).await?;
 
         let config = self.token_manager.config();
@@ -867,9 +868,13 @@ impl KiroProvider {
             // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1（具名绑定，勿用裸 `_`）。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
+            // RPM 记账：本会话首次用到该凭据才记 1 次；原子预留失败（额度被并发
+            // 请求抢先占用）则排除该凭据重新选择。
+            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
+                rpm_recorded.remove(&ctx.id);
+                request_throttled_ids.insert(ctx.id);
+                tracing::debug!("凭据 #{} RPM 额度被并发请求抢占，重新选择", ctx.id);
+                continue;
             }
 
             let config = self.token_manager.config();
@@ -988,6 +993,32 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
+                if status.as_u16() == 403
+                    && self.token_manager.get_suspended_detection_enabled()
+                    && endpoint.is_account_suspended(&body)
+                {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::ACCOUNT_SUSPENDED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    let has_available = self
+                        .token_manager
+                        .report_suspended_for_request(ctx.id, None, group);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error =
+                        Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                    continue;
+                }
+
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -1209,9 +1240,13 @@ impl KiroProvider {
             // （return/continue/bail!/? 早退）。必须具名绑定，裸 `_` 会立即 Drop。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
-            // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）。
-            if rpm_recorded.insert(ctx.id) {
-                self.token_manager.record_request(ctx.id);
+            // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）；
+            // 原子预留失败（额度被并发请求抢先占用）则排除该凭据重新选择。
+            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
+                rpm_recorded.remove(&ctx.id);
+                request_throttled_ids.insert(ctx.id);
+                tracing::debug!("凭据 #{} RPM 额度被并发请求抢占，重新选择", ctx.id);
+                continue;
             }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
@@ -1314,7 +1349,8 @@ impl KiroProvider {
                     None,
                     attempt_start,
                 );
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_for_request(ctx.id, model.as_deref());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -1380,6 +1416,50 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
+                if status.as_u16() == 403
+                    && self.token_manager.get_suspended_detection_enabled()
+                    && endpoint.is_account_suspended(&body)
+                {
+                    tracing::warn!(
+                        "API 请求失败（账号封禁，禁用并切换，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::ACCOUNT_SUSPENDED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    let has_available = self.token_manager.report_suspended_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    );
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（账号封禁）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1523,7 +1603,8 @@ impl KiroProvider {
                                 sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
                                 outcome::SUCCESS, None, fb_start,
                             );
-                            self.token_manager.report_success(ctx.id);
+                            self.token_manager
+                                .report_success_for_request(ctx.id, model.as_deref());
                             tracing::info!(
                                 "凭据 #{} 在备用端点 [{}] 成功（主端点 [{}] 此前 429）",
                                 ctx.id,
