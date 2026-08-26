@@ -1032,11 +1032,13 @@ fn record_stream_usage(
     status: &str,
 ) {
     // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
+    // output 用 resolved_output_tokens（metadataEvent 精确值优先），与下发给客户端的
+    // message_delta 及 /cc 缓冲路径的 final_usage 同口径。
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     hook.record(
         credential_id,
         input,
-        ctx.output_tokens,
+        ctx.resolved_output_tokens(),
         cache_creation,
         cache_read,
         ctx.credits,
@@ -1049,7 +1051,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
-        output_tokens: ctx.output_tokens.max(0) as u64,
+        output_tokens: ctx.resolved_output_tokens().max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
@@ -1845,8 +1847,12 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 上游中途断流：以 error 终态收尾，不回放正常 message_stop，
+                                // 避免客户端把截断内容误判为 completed（与 /v1 实时路径一致）
+                                let all_events = ctx.finish_with_error_events(
+                                    "upstream_error",
+                                    "Upstream response stream was interrupted",
+                                );
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流

@@ -2691,6 +2691,43 @@ impl BufferedStreamContext {
         std::mem::take(&mut self.event_buffer)
     }
 
+    /// 以错误终态完成流处理并返回所有事件
+    ///
+    /// 用于上游中途断流的缓冲流路径：与 [`Self::finish_and_get_all_events`] 同样
+    /// 兜底生成初始事件并更正 message_start 用量，但终态改用 error 事件——
+    /// 不发 message_delta / message_stop 的「正常完成」帧，避免客户端把截断的
+    /// 内容误判为 completed。
+    pub fn finish_with_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        // 如果从未处理过事件，也要生成初始事件
+        if !self.initial_events_generated {
+            let initial_events = self.inner.generate_initial_events();
+            self.event_buffer.extend(initial_events);
+            self.initial_events_generated = true;
+        }
+
+        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
+        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+
+        // 断流终态：关闭未收尾的块（含 thinking 签名）后追加 error 事件
+        let error_events = self.inner.generate_error_events(error_type, message);
+        self.event_buffer.extend(error_events);
+
+        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
+        for event in &mut self.event_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                    }
+                }
+            }
+        }
+
+        std::mem::take(&mut self.event_buffer)
+    }
+
     /// 取出最终用量（在 finish_and_get_all_events 之后调用）
     ///
     /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
@@ -5506,5 +5543,50 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    #[test]
+    fn buffered_stream_interrupted_emits_error_terminal_without_message_stop() {
+        use crate::kiro::model::events::MetadataEvent;
+
+        let usage = TokenUsage {
+            uncached_input_tokens: 3,
+            output_tokens: 11,
+            cache_read_input_tokens: 7,
+            cache_write_input_tokens: 4,
+        };
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+            token_usage: Some(usage),
+        }));
+        // 上游中途断流：必须以 error 终态收尾，不能回放 message_stop
+        // 让客户端把截断内容误判为 completed
+        let events = ctx.finish_with_error_events(
+            "upstream_error",
+            "Upstream response stream was interrupted",
+        );
+
+        let error_event = events
+            .iter()
+            .find(|event| event.event == "error")
+            .expect("断流必须补发 error 终态");
+        assert_eq!(error_event.data["error"]["type"], json!("upstream_error"));
+        assert!(
+            !events.iter().any(|event| event.event == "message_stop"),
+            "断流不得发送 message_stop 正常终态"
+        );
+        // message_start 的用量更正仍然生效
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], json!(3));
     }
 }
