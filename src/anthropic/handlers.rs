@@ -251,7 +251,7 @@ impl TraceSink for RequestTracer {
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(match last.as_str() {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
@@ -649,10 +649,19 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1532,10 +1541,19 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,

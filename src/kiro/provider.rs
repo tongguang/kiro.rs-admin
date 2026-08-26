@@ -101,6 +101,15 @@ pub struct KiroCallResult {
     pub credential_id: u64,
 }
 
+/// A successful MCP HTTP response whose trace attempt is finalized after body validation.
+struct McpCallResult {
+    response: reqwest::Response,
+    credential_id: u64,
+    endpoint: &'static str,
+    attempt: usize,
+    started_at: Instant,
+}
+
 /// Admin 手动响应测试结果。
 pub struct CredentialTestResult {
     pub credential_id: u64,
@@ -645,7 +654,73 @@ impl KiroProvider {
         request_body: &str,
         group: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body, group).await
+        let result = self.call_mcp_with_retry(request_body, None, group).await?;
+        self.token_manager.report_success(result.credential_id);
+        Ok(result.response)
+    }
+
+    /// 发送 MCP API 请求，并在响应正文通过调用方校验后提交最终 trace attempt。
+    pub(crate) async fn call_mcp_with_trace<T>(
+        &self,
+        request_body: &str,
+        sink: &dyn TraceSink,
+        group: Option<&str>,
+        validate: fn(&str) -> anyhow::Result<T>,
+        is_benign_error: fn(&anyhow::Error) -> bool,
+    ) -> anyhow::Result<T> {
+        let result = self
+            .call_mcp_with_retry(request_body, Some(sink), group)
+            .await?;
+        let status = result.response.status().as_u16();
+        let body = match result.response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                Self::emit_attempt(
+                    Some(sink),
+                    result.attempt,
+                    result.credential_id,
+                    result.endpoint,
+                    Some(status),
+                    outcome::NETWORK_ERROR,
+                    Some(&e.to_string()),
+                    result.started_at,
+                );
+                return Err(e.into());
+            }
+        };
+
+        let validation = validate(&body);
+        let validation_outcome = Self::mcp_validation_outcome(&validation, is_benign_error);
+        let error = validation
+            .as_ref()
+            .err()
+            .filter(|_| validation_outcome != outcome::SUCCESS)
+            .map(|e| format!("{}: {}", e, body));
+        Self::emit_attempt(
+            Some(sink),
+            result.attempt,
+            result.credential_id,
+            result.endpoint,
+            Some(status),
+            validation_outcome,
+            error.as_deref(),
+            result.started_at,
+        );
+        if validation_outcome == outcome::SUCCESS {
+            self.token_manager.report_success(result.credential_id);
+        }
+        validation
+    }
+
+    fn mcp_validation_outcome<T>(
+        validation: &anyhow::Result<T>,
+        is_benign_error: fn(&anyhow::Error) -> bool,
+    ) -> &'static str {
+        match validation {
+            Ok(_) => outcome::SUCCESS,
+            Err(error) if is_benign_error(error) => outcome::SUCCESS,
+            Err(_) => outcome::UNKNOWN,
+        }
     }
 
     /// 使用指定凭据发送一次 `hello` 响应测试，不参与凭据故障转移。
@@ -734,8 +809,9 @@ impl KiroProvider {
     async fn call_mcp_with_retry(
         &self,
         request_body: &str,
+        sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.available_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
         let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
@@ -746,6 +822,7 @@ impl KiroProvider {
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
+            let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
             let ctx_result = if request_throttled_ids.is_empty() {
                 self.token_manager.acquire_context(None, group).await
@@ -758,11 +835,31 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            0,
+                            "",
+                            None,
+                            outcome::TRANSIENT,
+                            Some(&e.to_string()),
+                            attempt_start,
+                        );
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        0,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     continue;
                 }
@@ -781,12 +878,23 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager.report_failure(ctx.id);
                     continue;
                 }
             };
+            let endpoint_name = endpoint.name();
 
             let response = match self
                 .execute_mcp_request_with_proxy_failover(
@@ -806,6 +914,16 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -821,8 +939,13 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(McpCallResult {
+                    response,
+                    credential_id: ctx.id,
+                    endpoint: endpoint_name,
+                    attempt,
+                    started_at: attempt_start,
+                });
             }
 
             // 失败响应
@@ -830,6 +953,16 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::QUOTA_EXHAUSTED,
+                    Some(&body),
+                    attempt_start,
+                );
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -840,11 +973,32 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::AUTH_FAILED,
+                    Some(&body),
+                    attempt_start,
+                );
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -868,6 +1022,16 @@ impl KiroProvider {
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
+                );
                 if status.as_u16() == 429 {
                     if let Some(rate_limit) = rate_limit_error
                         .as_ref()
@@ -945,10 +1109,30 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 兜底
+            Self::emit_attempt(
+                sink,
+                attempt,
+                ctx.id,
+                endpoint_name,
+                Some(status.as_u16()),
+                outcome::UNKNOWN,
+                Some(&body),
+                attempt_start,
+            );
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;

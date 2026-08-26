@@ -1884,6 +1884,7 @@ struct StreamStorePlan {
 }
 
 impl StreamStorePlan {
+    #[cfg(test)]
     fn disabled() -> Self {
         Self {
             enabled: false,
