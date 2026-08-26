@@ -7,6 +7,8 @@ use crate::anthropic::types::{
     CacheControl, Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
+/// 仅用于响应解析缺 `model` 字段时的回落（不再用于请求侧改写——
+/// gpt-*/o1/o3/codex 启发式已删除，请求模型名原样透传）。
 pub const DEFAULT_OPENAI_COMPAT_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_MAX_TOKENS: i32 = 32000;
 
@@ -111,25 +113,6 @@ fn err(message: impl Into<String>) -> OpenAIConversionError {
     }
 }
 
-pub fn openai_model_to_kiro_model(model: &str) -> String {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return DEFAULT_OPENAI_COMPAT_MODEL.to_string();
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let looks_openai_native = lower.starts_with("gpt-")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4")
-        || lower.starts_with("codex");
-    if looks_openai_native {
-        DEFAULT_OPENAI_COMPAT_MODEL.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 pub fn chat_to_anthropic(
     req: &ChatCompletionRequest,
     metadata: Option<crate::anthropic::types::Metadata>,
@@ -138,7 +121,10 @@ pub fn chat_to_anthropic(
         return Err(err("messages must contain at least one message"));
     }
 
-    let model = openai_model_to_kiro_model(&req.model);
+    // 模型名原样透传（别名在 handler 层 apply_model_mapping 已先行改写，
+    // 与上游 Chat 及本仓库 Responses 一致）；非法 ID 由下游 converter 的
+    // invalid_model_reason 拦截为本地 400。
+    let model = req.model.trim().to_string();
     let (system, messages) = split_chat_messages(&req.messages)?;
     if messages.is_empty() {
         return Err(err("messages must contain at least one non-system message"));

@@ -61,9 +61,9 @@ pub async fn post_chat_completions(
 
 /// 请求时应用模型映射：命中配置的源模型名则原地改写为目标模型名。
 ///
-/// 在 `chat_to_anthropic` 的启发式映射（gpt-*/o1/o3/codex → 默认兼容模型）之前执行，
-/// 因此显式映射优先级更高；改写后的目标名（如 claude-opus-4.8）不匹配启发式前缀，
-/// 会被透传，不会被二次改写。
+/// 映射是唯一的别名层：改写后（或未命中时）模型名原样透传给 converter，
+/// 不再有任何启发式二次改写（gpt-*/o1/o3/codex 启发式已删除，与上游对齐）。
+/// 默认 seed 含 gpt-5.5/gpt-5.4 → claude-opus-4.8，Codex 开箱即用。
 fn apply_model_mapping(state: &AppState, model: &mut String) {
     if let Some(mappings) = &state.model_mappings
         && let Some(target) = mappings.resolve(model)
@@ -618,7 +618,7 @@ mod tests {
         .unwrap();
 
         let converted = chat_to_anthropic(&req, None).unwrap();
-        assert_eq!(converted.anthropic.model, "claude-sonnet-4.5");
+        assert_eq!(converted.anthropic.model, "gpt-4o");
         assert_eq!(converted.anthropic.messages.len(), 4);
         assert_eq!(converted.anthropic.system.unwrap()[0].text, "be brief");
         assert_eq!(converted.anthropic.tools.unwrap()[0].name, "get_weather");

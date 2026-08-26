@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+> 本阶段包含上游 v0.8.0 分阶段合并（阶段一~三）及 review 修复：动态模型发现与 profileArn 回退、Responses API 全量移植、web_search loop 与 stream.rs 换上游、RPM 原子预留与受控自愈、断流 error 终态、Responses 协议契约对齐等。以下为用户可感知的行为变更。
+
+### ⚠️ 行为变更 — Chat 模型名不再启发式改写（对齐上游 v0.8.0）
+
+- **删除 `gpt-*` / `o1` / `o3` / `o4` / `codex` → `claude-sonnet-4.5` 隐式改写**：Chat Completions 的请求模型名原样透传给 Kiro 后端（Kiro 已有真实 gpt-5.6 系列可用）。需要别名时用 Admin UI / `model_mappings.json` 配置显式映射（首次启动默认 seed `gpt-5.5` / `gpt-5.4` → `claude-opus-4.8`，Codex 开箱即用）。**迁移提示**：此前依赖隐式改写使用 `o1` / `o3` / `gpt-4o` 等名字的请求现在会透传给 Kiro，Kiro 不认识的模型名将返回错误，请配置别名映射。
+- **空/非法模型名本地拒绝**：空串、超长、含控制字符的模型 ID 由 converter 拦截为 `UnsupportedModel`（HTTP 400），不再静默换成默认模型或透传上游。
+
+### 🔧 修复 — 非流式响应用量对齐 `metadataEvent` 精确计量
+
+- **非流式 `/v1/messages` 接入 `metadataEvent.tokenUsage`**：上游下发精确用量快照时，成功响应的 usage JSON、服务端记账（usage_log）与 trace 行统一改用精确四字段（input / output / cache_creation / cache_read），不再纯靠本地字符估算；与流式路径 `resolved_usage` / `resolved_output_tokens` 口径一致。
+- **无快照时行为不变**：仍按 contextUsage / 输入估算 + 本地 CacheMeter 互斥分摊；`tool_json_error` 早退在已有快照时改用精确用量记账。
+
 ## [0.6.11] - 2026-07-12
 
 主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
