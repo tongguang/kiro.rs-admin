@@ -632,10 +632,6 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
-    /// 特殊值：显式不使用代理（生产路径走 effective_proxy_candidates，仅测试保留）
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub const PROXY_DIRECT: &'static str = "direct";
-
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -656,26 +652,6 @@ impl KiroCredentials {
         self.api_region
             .as_deref()
             .unwrap_or(config.effective_api_region())
-    }
-
-    /// 获取有效的代理配置
-    /// 优先级：凭据代理 > 全局代理 > 无代理
-    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
-        match self.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
-            Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
-                if let (Some(username), Some(password)) =
-                    (&self.proxy_username, &self.proxy_password)
-                {
-                    proxy = proxy.with_auth(username, password);
-                }
-                Some(proxy)
-            }
-            None => global_proxy.cloned(),
-        }
     }
 
     /// 获取有效代理候选列表。
@@ -1593,55 +1569,55 @@ mod tests {
     // ============ 凭据级代理优先级测试 ============
 
     #[test]
-    fn test_effective_proxy_credential_overrides_global() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_effective_proxy_candidates_credential_overrides_global() {
+        let global = vec![Some(ProxyConfig::new("http://global:8080"))];
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("socks5://cred:1080".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
+        let result = creds.effective_proxy_candidates(&global);
+        assert_eq!(result, vec![Some(ProxyConfig::new("socks5://cred:1080"))]);
     }
 
     #[test]
-    fn test_effective_proxy_credential_with_auth() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_effective_proxy_candidates_credential_with_auth() {
+        let global = vec![Some(ProxyConfig::new("http://global:8080"))];
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("http://proxy:3128".to_string());
         creds.proxy_username = Some("user".to_string());
         creds.proxy_password = Some("pass".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy_candidates(&global);
         let expected = ProxyConfig::new("http://proxy:3128").with_auth("user", "pass");
-        assert_eq!(result, Some(expected));
+        assert_eq!(result, vec![Some(expected)]);
     }
 
     #[test]
-    fn test_effective_proxy_direct_bypasses_global() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_effective_proxy_candidates_direct_bypasses_global() {
+        let global = vec![Some(ProxyConfig::new("http://global:8080"))];
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("direct".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, None);
+        let result = creds.effective_proxy_candidates(&global);
+        assert_eq!(result, vec![None]);
     }
 
     #[test]
-    fn test_effective_proxy_direct_case_insensitive() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_effective_proxy_candidates_direct_case_insensitive() {
+        let global = vec![Some(ProxyConfig::new("http://global:8080"))];
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("DIRECT".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, None);
+        let result = creds.effective_proxy_candidates(&global);
+        assert_eq!(result, vec![None]);
     }
 
     #[test]
-    fn test_effective_proxy_fallback_to_global() {
-        let global = ProxyConfig::new("http://global:8080");
+    fn test_effective_proxy_candidates_fallback_to_global() {
+        let global = vec![Some(ProxyConfig::new("http://global:8080"))];
         let creds = KiroCredentials::default();
 
-        let result = creds.effective_proxy(Some(&global));
-        assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
+        let result = creds.effective_proxy_candidates(&global);
+        assert_eq!(result, global);
     }
 
     #[test]
@@ -1667,10 +1643,10 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_proxy_none_when_no_proxy() {
+    fn test_effective_proxy_candidates_none_when_no_proxy() {
         let creds = KiroCredentials::default();
-        let result = creds.effective_proxy(None);
-        assert_eq!(result, None);
+        let result = creds.effective_proxy_candidates(&[]);
+        assert_eq!(result, vec![None]);
     }
 
     // ============ 企业 SSO (external_idp) 测试 ============

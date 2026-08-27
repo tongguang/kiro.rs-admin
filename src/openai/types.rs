@@ -7,7 +7,7 @@ use crate::anthropic::types::{
     CacheControl, Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
-const DEFAULT_MAX_TOKENS: i32 = 32000;
+pub(crate) const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {

@@ -475,14 +475,17 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 /// 解析普通非流式响应的最终 Anthropic usage。
 ///
 /// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照
-/// （`metadataEvent.tokenUsage`）优先；缺失时才使用 contextUsage/输入估算和本地
-/// CacheMeter 分摊。与流式路径 `resolved_usage`/`resolved_output_tokens` 同口径。
+/// （`metadataEvent.tokenUsage`）优先；缺失时：
+/// - `bare_on_missing=true`：裸 input + 0 output/cache（错误早退口径）
+/// - 否则：contextUsage/输入估算 + 本地 CacheMeter 分摊
+/// 与流式路径 `resolved_usage`/`resolved_output_tokens` 同口径。
 fn resolve_non_stream_usage(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
     fallback_output_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     provider_usage: Option<TokenUsage>,
+    bare_on_missing: bool,
 ) -> (i32, i32, i32, i32) {
     if let Some(usage) = provider_usage {
         let usage = usage.sanitized();
@@ -492,6 +495,10 @@ fn resolve_non_stream_usage(
             usage.cache_write_input_tokens,
             usage.cache_read_input_tokens,
         );
+    }
+
+    if bare_on_missing {
+        return (fallback_total_input_tokens.max(0), 0, 0, 0);
     }
 
     let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
@@ -1447,46 +1454,40 @@ async fn handle_non_stream_request(
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
     if let Some(err) = tool_json_error {
         let message = err.message();
-        // 已有 metadataEvent 快照时按精确用量记账；没有则保持 input + 0 output（与上游一致）
-        if let Some(usage) = provider_token_usage {
-            let usage = usage.sanitized();
-            let trace_usage = TraceUsage {
-                input_tokens: usage.uncached_input_tokens.max(0) as u64,
-                output_tokens: usage.output_tokens.max(0) as u64,
-                cache_creation_tokens: usage.cache_write_input_tokens.max(0) as u64,
-                cache_read_tokens: usage.cache_read_input_tokens.max(0) as u64,
+        // 已有 metadataEvent 快照时按精确用量记账；没有则保持裸 input + 0 output
+        let had_provider = provider_token_usage.is_some();
+        let (in_t, out_t, cw, cr) = resolve_non_stream_usage(
+            input_tokens,
+            None,
+            0,
+            Default::default(),
+            provider_token_usage,
+            true,
+        );
+        let credits_for_hook = if had_provider { credits } else { 0.0 };
+        let trace_usage = if had_provider {
+            TraceUsage {
+                input_tokens: in_t.max(0) as u64,
+                output_tokens: out_t.max(0) as u64,
+                cache_creation_tokens: cw.max(0) as u64,
+                cache_read_tokens: cr.max(0) as u64,
                 credits: if credits.is_finite() && credits > 0.0 {
                     credits
                 } else {
                     0.0
                 },
-            };
-            hook.record(
-                credential_id,
-                usage.uncached_input_tokens,
-                usage.output_tokens,
-                usage.cache_write_input_tokens,
-                usage.cache_read_input_tokens,
-                credits,
-                "error",
-            );
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                trace_usage,
-            );
+            }
         } else {
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                TraceUsage::zero(),
-            );
-        }
+            TraceUsage::zero()
+        };
+        hook.record(credential_id, in_t, out_t, cw, cr, credits_for_hook, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            trace_usage,
+        );
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
@@ -1524,6 +1525,7 @@ async fn handle_non_stream_request(
             estimated_output_tokens,
             cache_usage,
             provider_token_usage,
+            false,
         );
 
     // 构建 Anthropic 响应
@@ -2436,7 +2438,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_non_stream_usage(100, Some(80), 9, fallback_cache, Some(provider)),
+            resolve_non_stream_usage(100, Some(80), 9, fallback_cache, Some(provider), false),
             (3, 11, 4, 7)
         );
     }
@@ -2450,12 +2452,16 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None, false),
             (40, 9, 20, 20)
         );
         assert_eq!(
-            resolve_non_stream_usage(100, None, -9, Default::default(), None),
+            resolve_non_stream_usage(100, None, -9, Default::default(), None, false),
             (100, 0, 0, 0)
+        );
+        assert_eq!(
+            resolve_non_stream_usage(42, Some(80), 9, Default::default(), None, true),
+            (42, 0, 0, 0)
         );
     }
 

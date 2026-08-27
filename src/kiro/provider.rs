@@ -252,7 +252,7 @@ impl CredentialRetryState {
             return Ordinary429Outcome::Switched;
         }
 
-        if retry_mode == RetryMode::Failover && !self.throttled_ids.is_empty() {
+        if retry_mode == RetryMode::Failover {
             self.throttled_ids.clear();
             self.throttled_ids.insert(credential_id);
             return Ordinary429Outcome::FailoverKeepCurrent;

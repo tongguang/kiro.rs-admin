@@ -692,15 +692,16 @@ mod tests {
             handle.join().unwrap();
         }
 
-        // 后写者基于先写者的落盘结果继续修改：两个字段都必须来自最后一次写入，
-        // 关键是任何一次写入都不能丢失另一线程已保存的字段。
+        // 写锁串行化整个 load-modify-save：无锁时两线程会争抢同一 config.json.tmp，
+        // rename 后源文件消失导致另一线程 unwrap panic。有锁时最终文件必须是某一次
+        // 完整写入（两字段同源），且不得残留临时文件。
         let persisted = Config::load(&path).unwrap();
         assert!(
             (persisted.self_heal_min_interval_secs == 123
                 && persisted.self_heal_max_consecutive_rounds == 7)
                 || (persisted.self_heal_min_interval_secs == 456
                     && persisted.self_heal_max_consecutive_rounds == 9),
-            "并发更新不得出现字段混杂: interval={} rounds={}",
+            "并发更新不得撕裂读写结果: interval={} rounds={}",
             persisted.self_heal_min_interval_secs,
             persisted.self_heal_max_consecutive_rounds
         );

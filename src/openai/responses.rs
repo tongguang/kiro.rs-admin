@@ -55,15 +55,13 @@ use super::parse::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, parse_data_url,
     parse_sse_frame, push_merged, resolve_session_metadata, take_sse_frames,
 };
+use super::types::DEFAULT_MAX_TOKENS;
 use crate::anthropic::handlers::post_messages;
 use crate::anthropic::middleware::{AppState, KeyContext};
 use crate::anthropic::types::{Message, MessagesRequest, Metadata, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
-
-/// 未显式给出 max_output_tokens 时的默认输出上限
-const DEFAULT_MAX_TOKENS: i32 = 32000;
 
 /// 无 codex 工具时的严格提示（保持既有已验证的纯聊天/搜索行为）
 const NUDGE_STRICT: &str = "You have a web_search tool that returns live results. For anything \
@@ -224,14 +222,11 @@ fn responses_store() -> &'static RwLock<LruCache<String, StoredResponse>> {
 
 fn stored_response_size(response: &Value, items: &[Value]) -> usize {
     serde_json::to_vec(&json!({ "response": response, "items": items }))
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+        .expect("serde_json::Value serialization cannot fail")
+        .len()
 }
 
 fn save_response(id: String, owner_key_id: u64, response: Value, items: Vec<Value>) {
-    if id.is_empty() {
-        return;
-    }
     let size = stored_response_size(&response, &items);
     if size > MAX_STORED_RESPONSE_BYTES {
         tracing::warn!(
@@ -1310,7 +1305,6 @@ struct ResponsesStreamContext {
     cache_creation_tokens: i64,
     cached_tokens: i64,
     output_tokens: i64,
-    reasoning_tokens: i64,
     credit_usage: Option<f64>,
     credit_unit: Option<String>,
     credit_unit_plural: Option<String>,
@@ -1340,7 +1334,6 @@ impl ResponsesStreamContext {
             cache_creation_tokens: 0,
             cached_tokens: 0,
             output_tokens: 0,
-            reasoning_tokens: 0,
             credit_usage: None,
             credit_unit: None,
             credit_unit_plural: None,
@@ -1881,9 +1874,6 @@ impl ResponsesStreamContext {
         if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
             self.cached_tokens = value.max(0);
         }
-        if let Some(value) = usage.get("reasoning_tokens").and_then(Value::as_i64) {
-            self.reasoning_tokens = value.max(0);
-        }
         if let Some(value) = usage.get("credit_usage").and_then(Value::as_f64) {
             self.credit_usage = Some(value);
         }
@@ -1904,7 +1894,7 @@ impl ResponsesStreamContext {
             "input_tokens": total_input_tokens,
             "input_tokens_details": { "cached_tokens": self.cached_tokens },
             "output_tokens": self.output_tokens,
-            "output_tokens_details": { "reasoning_tokens": self.reasoning_tokens },
+            "output_tokens_details": { "reasoning_tokens": 0 },
             "total_tokens": total_input_tokens.saturating_add(self.output_tokens),
         });
         if let Some(value) = self.credit_usage {

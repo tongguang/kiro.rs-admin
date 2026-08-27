@@ -743,7 +743,6 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
 
     let attempts = usage_api_attempts(credentials, &candidates);
 
-    let mut last_error: Option<String> = None;
     for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
         let url = build_url(&host, *profile_arn);
@@ -797,7 +796,6 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
                 status,
                 profile_arn.is_some()
             );
-            last_error = Some(format!("{} {}", status, body_text));
             continue;
         }
 
@@ -814,12 +812,7 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取{}: {}",
-        cn_label,
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    unreachable!("usage API attempt loop always returns before exhausting candidates");
 }
 
 /// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
@@ -1438,6 +1431,35 @@ fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
     rpm_window_count(entry, now) >= limit
 }
 
+/// 单凭据 RPM 窗口已满时的 Retry-After 秒数；不限速或窗口未满返回 None。
+fn rpm_window_retry_after(entry: &CredentialEntry, now: Instant) -> Option<u64> {
+    let limit = entry.credentials.rpm_limit;
+    if limit == 0 {
+        return None;
+    }
+    let cutoff = now.checked_sub(RPM_WINDOW);
+    let fresh: Vec<Instant> = entry
+        .recent_requests
+        .iter()
+        .copied()
+        .filter(|&t| cutoff.map(|c| t > c).unwrap_or(true))
+        .collect();
+    if (fresh.len() as u32) < limit {
+        return None;
+    }
+    // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
+    // fresh_count - limit + 1 个时间戳过期后才重新有额度。
+    let release_index = fresh.len() - limit as usize;
+    let release_at = fresh[release_index] + RPM_WINDOW;
+    let remaining = release_at.saturating_duration_since(now);
+    Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+            .max(1),
+    )
+}
+
 fn cooldown_remaining_ms(until: Option<Instant>, now: Instant) -> Option<u64> {
     until
         .and_then(|t| t.checked_duration_since(now))
@@ -2045,7 +2067,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn select_next_credential(
         &self,
         model: Option<&str>,
@@ -2159,7 +2181,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
@@ -2817,36 +2839,17 @@ impl MultiTokenManager {
             {
                 continue;
             }
-            let limit = e.credentials.rpm_limit;
-            if limit == 0 {
-                // 不限速的凭据未被选中说明另有原因，非 RPM 场景
-                return None;
+            match rpm_window_retry_after(e, now) {
+                Some(retry_after) => {
+                    earliest = Some(
+                        earliest
+                            .map(|cur: u64| cur.min(retry_after))
+                            .unwrap_or(retry_after),
+                    );
+                }
+                // 不限速或窗口未满却未被选中：不是纯 RPM 打满场景
+                None => return None,
             }
-            let cutoff = now.checked_sub(RPM_WINDOW);
-            let fresh: Vec<Instant> = e
-                .recent_requests
-                .iter()
-                .copied()
-                .filter(|&t| cutoff.map(|c| t > c).unwrap_or(true))
-                .collect();
-            if (fresh.len() as u32) < limit {
-                // 该凭据其实有额度却没被选中（并发竞争外的异常），不算 RPM 打满
-                return None;
-            }
-            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
-            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
-            let release_index = fresh.len() - limit as usize;
-            let release_at = fresh[release_index] + RPM_WINDOW;
-            let remaining = release_at.saturating_duration_since(now);
-            let retry_after = remaining
-                .as_secs()
-                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
-                .max(1);
-            earliest = Some(
-                earliest
-                    .map(|cur: u64| cur.min(retry_after))
-                    .unwrap_or(retry_after),
-            );
         }
         earliest
     }
@@ -2859,29 +2862,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let now = Instant::now();
         let entry = entries.iter().find(|e| e.id == id)?;
-        let limit = entry.credentials.rpm_limit;
-        if limit == 0 {
-            return None;
-        }
-        let cutoff = now.checked_sub(RPM_WINDOW);
-        let fresh: Vec<Instant> = entry
-            .recent_requests
-            .iter()
-            .copied()
-            .filter(|&t| cutoff.map(|c| t > c).unwrap_or(true))
-            .collect();
-        if (fresh.len() as u32) < limit {
-            return None;
-        }
-        let release_index = fresh.len() - limit as usize;
-        let release_at = fresh[release_index] + RPM_WINDOW;
-        let remaining = release_at.saturating_duration_since(now);
-        Some(
-            remaining
-                .as_secs()
-                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
-                .max(1),
-        )
+        rpm_window_retry_after(entry, now)
     }
 
     /// 为指定凭据构造 in-flight RAII 守卫（provider 用其持有的 Arc 调用）。

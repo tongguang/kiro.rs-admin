@@ -391,7 +391,7 @@ struct RoundFailure {
     error_type: &'static str,
     error_message: String,
     credential_id: u64,
-    token_usage: Option<TokenUsage>,
+    token_usage: TokenUsage,
     credits: f64,
 }
 
@@ -430,7 +430,7 @@ async fn start_round(
                 error_type: outcome::BAD_REQUEST,
                 error_message,
                 credential_id: 0,
-                token_usage: None,
+                token_usage: TokenUsage::default(),
                 credits: 0.0,
             });
         }
@@ -454,7 +454,7 @@ async fn start_round(
                 error_type: outcome::UNKNOWN,
                 error_message,
                 credential_id: 0,
-                token_usage: None,
+                token_usage: TokenUsage::default(),
                 credits: 0.0,
             });
         }
@@ -473,10 +473,10 @@ async fn start_round(
                 error_type,
                 error_message,
                 credential_id: 0,
-                token_usage: Some(TokenUsage {
+                token_usage: TokenUsage {
                     uncached_input_tokens: fallback_input_tokens.max(0),
                     ..TokenUsage::default()
-                }),
+                },
                 credits: 0.0,
             });
         }
@@ -519,7 +519,7 @@ async fn finish_round(
             error_type: outcome::STREAM_INTERRUPTED,
             error_message,
             credential_id,
-            token_usage: Some(token_usage),
+            token_usage,
             credits: outcome.credits,
         });
     }
@@ -1121,16 +1121,15 @@ impl WebSearchSseEmitter {
 }
 
 /// Run a streamed web-search task only while its response receiver is alive.
-/// Dropping the future cancels an in-flight provider or MCP await, preventing
-/// detached work and additional metering after the client disconnects.
+/// Cancelling via `sender.closed()` drops the pinned future and stops further
+/// provider/MCP work after the client disconnects.
 async fn while_receiver_open<F>(sender: &mpsc::Sender<Bytes>, future: F) -> Option<F::Output>
 where
     F: Future,
 {
-    // Keep the future in an owned pin so the cancellation branch can explicitly
-    // drop it before returning. This is important for cancellation-safe usage
-    // settlement: callers may inspect accounting immediately after this helper
-    // resolves.
+    // Pin so either select arm can complete without moving the future; the
+    // explicit drop below is redundant with scope exit but keeps the cancel
+    // path obvious next to the select.
     let mut future = Box::pin(future);
     let result = tokio::select! {
         biased;
@@ -1333,7 +1332,7 @@ fn settle_round_failure(
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer);
     settlement.add(
         failure.credential_id,
-        failure.token_usage.unwrap_or_default(),
+        failure.token_usage,
         failure.credits,
     );
     settlement.finish(
@@ -1487,15 +1486,11 @@ async fn run_web_search_loop_inner(
             } {
                 Ok(v) => v,
                 Err(failure) => {
-                    if let Some(usage) = failure.token_usage {
-                        settlement.add(failure.credential_id, usage, failure.credits);
-                    } else {
-                        settlement.add(
-                            failure.credential_id,
-                            TokenUsage::default(),
-                            failure.credits,
-                        );
-                    }
+                    settlement.add(
+                        failure.credential_id,
+                        failure.token_usage,
+                        failure.credits,
+                    );
                     settlement.finish(
                         "error",
                         "error",
@@ -1820,16 +1815,10 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
     let mut next_index = start_index;
     for block in content {
         let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(
-            btype,
-            "text" | "tool_use" | "server_tool_use" | "web_search_tool_result"
-        ) {
-            continue;
-        }
         let index = next_index;
-        next_index += 1;
         match btype {
             "text" => {
+                next_index += 1;
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 events.push(SseEvent::new(
                     "content_block_start",
@@ -1853,6 +1842,7 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
                 ));
             }
             "tool_use" => {
+                next_index += 1;
                 let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
@@ -1879,6 +1869,7 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
                 ));
             }
             "server_tool_use" | "web_search_tool_result" => {
+                next_index += 1;
                 events.push(SseEvent::new(
                     "content_block_start",
                     json!({
