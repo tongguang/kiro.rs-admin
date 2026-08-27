@@ -18,6 +18,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **非流式 `/v1/messages` 接入 `metadataEvent.tokenUsage`**：上游下发精确用量快照时，成功响应的 usage JSON、服务端记账（usage_log）与 trace 行统一改用精确四字段（input / output / cache_creation / cache_read），不再纯靠本地字符估算；与流式路径 `resolved_usage` / `resolved_output_tokens` 口径一致。
 - **无快照时行为不变**：仍按 contextUsage / 输入估算 + 本地 CacheMeter 互斥分摊；`tool_json_error` 早退在已有快照时改用精确用量记账。
 
+### 🔧 修复 — Review 合并收尾（调度 / 协议 / 持久化）
+
+- **Admin JSON 原子落盘**：`model_mappings.json` / `groups.json` / `client_api_keys.json` 统一 tmp+rename；映射文件损坏时隔离为 `.bak` 并 seed 默认映射，后续修改仍可落盘。
+- **凭据落盘按 id 精确匹配**：同 email 多条凭据不再串写 token；email 回退命中多条时拒绝匹配并告警。
+- **模型不支持回 400**：凭据池均不支持请求模型时返回明确 400，不再误报 502「所有凭据均已禁用」。
+- **Social 用量接口单形态**：不再先发注定失败的带 ARN 请求再回退。
+- **Responses 错误体归一化**：非 2xx 与 Chat 共用 OpenAI `{"error":{...}}` 形状。
+- **禁用状态落盘对称**：额度用尽 / Token 刷新失败 / refreshToken 失效禁用后写回凭据文件，避免重启复活。
+- **流式 web_search 首轮失败保留 HTTP 状态码**：首轮上游失败原样返回（含 429+Retry-After），成功后再切 200+SSE。
+- **主流式断连落账**：客户端中途断开时按 interrupted/error 结算 usage 与 trace（与 web_search loop 口径对齐）。
+- **代理 failover / 模型发现过滤**：JSON decode 失败不再换代理重放；`rate_limited_until` 冷却中的凭据不进模型发现与分组可用计数。
+
+### 📚 说明 — 自愈 streak 现状口径
+
+- 自愈按**凭据单槽 + 单模型标签**维护连续轮数；同模型成功才清零，换模型不会重置也不会继续自愈。
+- `failure_count` 按凭据全局累计；达上限后保持禁用，需在 Admin 手动启用（不按模型分桶自动恢复）。
+
 ## [0.6.11] - 2026-07-12
 
 主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。

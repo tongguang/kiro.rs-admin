@@ -326,8 +326,9 @@ pub struct Config {
 
     /// 连续自愈的最大轮数（默认 5，`0` 表示不限）。
     ///
-    /// 同一凭据连续自愈达到此值且同一模型期间没有成功调用时，停止自愈并记录
-    /// 错误日志提示人工介入。其它凭据、分组或模型的成功不会清零该计数。
+    /// 现状口径（单凭据单槽）：每条凭据只维护一个自愈 streak，并打上触发时的模型标签。
+    /// 同模型成功才会清零；换模型请求不会重置该计数，也不会换模型继续自愈。
+    /// `failure_count` 仍按凭据全局累计；达上限后保持禁用，需人工在 Admin 启用。
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
