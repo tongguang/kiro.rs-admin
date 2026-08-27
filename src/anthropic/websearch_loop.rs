@@ -38,7 +38,7 @@ use super::converter::{ConversionError, convert_request_with_mode, get_context_w
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent};
+use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
@@ -238,6 +238,35 @@ fn empty_tool_result_disposition(
     }
 }
 
+/// 工具调用分片装配：逐一喂给 [`ToolJsonAccumulator`]（`stop=true` 时整体解析），
+/// 流结束检查未 `stop` 的截断缓冲。
+///
+/// 非法 / 半截 JSON 返回错误信息（记作 `stream_error`），**不**把 `{}` 当成功工具调用——
+/// 与 messages 路径同口径；空 input 按 `{}` 处理（上游合法空参数）。
+/// 返回的 `tool_uses` 按 `stop` 完成序排列。
+fn accumulate_tool_usages(
+    events: &[crate::kiro::model::events::ToolUseEvent],
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> (Vec<CompletedToolUse>, Option<String>) {
+    let mut acc = ToolJsonAccumulator::new();
+    let mut out = Vec::new();
+    for tu in events {
+        match acc.push(tu, tool_name_map) {
+            Ok(Some(completed)) => out.push(completed),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("failed to parse tool input JSON: {}", e);
+                return (out, Some(e.message()));
+            }
+        }
+    }
+    if let Err(e) = acc.finish() {
+        tracing::warn!("tool input JSON incomplete at stream end: {}", e);
+        return (out, Some(e.message()));
+    }
+    (out, None)
+}
+
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
@@ -250,11 +279,8 @@ async fn decode_round(
 
     let mut text = String::new();
     let mut thinking = String::new();
-    // id -> (name, json_buffer), preserving the order of appearance
-    let mut buffers: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
+    // 工具调用分片原样收齐，流结束后交 ToolJsonAccumulator 统一装配/校验。
+    let mut tool_use_events: Vec<crate::kiro::model::events::ToolUseEvent> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut provider_token_usage: Option<TokenUsage> = None;
     let mut credits = 0.0;
@@ -296,16 +322,7 @@ async fn decode_round(
                         thinking.push_str(t);
                     }
                 }
-                Event::ToolUse(tu) => {
-                    let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
-                        order.push(tu.tool_use_id.clone());
-                        (String::new(), String::new())
-                    });
-                    if entry.0.is_empty() {
-                        entry.0 = tu.name.clone();
-                    }
-                    entry.1.push_str(&tu.input);
-                }
+                Event::ToolUse(tu) => tool_use_events.push(tu),
                 Event::Metadata(metadata) => {
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
@@ -334,20 +351,11 @@ async fn decode_round(
         }
     }
 
-    // Assemble the complete tool_use in order of appearance (restoring the tool_name_map short name)
-    for id in order {
-        if let Some((name, buf)) = buffers.remove(&id) {
-            let input: Value = if buf.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tool input JSON: {}", e);
-                    json!({})
-                })
-            };
-            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
-            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
-        }
+    // 非法 / 半截 JSON 不作为成功工具调用：记 stream_error，由 run_round 按
+    // upstream_error 收尾（与 messages 路径 ToolJsonAccumulator 同口径，不再 fallback {}）。
+    let (tool_uses, tool_json_error) = accumulate_tool_usages(&tool_use_events, tool_name_map);
+    if stream_error.is_none() {
+        stream_error = tool_json_error;
     }
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
@@ -1788,6 +1796,50 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
 mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
+
+    fn tool_use_event(
+        id: &str,
+        name: &str,
+        input: &str,
+        stop: bool,
+    ) -> crate::kiro::model::events::ToolUseEvent {
+        crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        }
+    }
+
+    #[test]
+    fn accumulate_tool_usages_empty_input_is_empty_object() {
+        let events = [tool_use_event("t1", "web_search", "", true)];
+        let (uses, err) = accumulate_tool_usages(&events, &std::collections::HashMap::new());
+        assert!(err.is_none());
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].input, json!({}));
+    }
+
+    #[test]
+    fn accumulate_tool_usages_invalid_json_marks_error_and_drops_call() {
+        // 非法 JSON 不得当 {} 成功工具调用：记 stream_error，且不装配该工具
+        let events = [
+            tool_use_event("t1", "web_search", "{bad json", true),
+            tool_use_event("t2", "web_search", "{}", true),
+        ];
+        let (uses, err) = accumulate_tool_usages(&events, &std::collections::HashMap::new());
+        assert!(err.is_some());
+        assert!(uses.is_empty());
+    }
+
+    #[test]
+    fn accumulate_tool_usages_incomplete_at_stream_end_marks_error() {
+        // 上游截断（未 stop）：不把半截 JSON 转发给客户端
+        let events = [tool_use_event("t1", "web_search", "{\"query\":\"x", false)];
+        let (uses, err) = accumulate_tool_usages(&events, &std::collections::HashMap::new());
+        assert!(err.is_some());
+        assert!(uses.is_empty());
+    }
 
     fn decode_sse(bytes: Bytes) -> (String, Value) {
         let text = String::from_utf8(bytes.to_vec()).unwrap();

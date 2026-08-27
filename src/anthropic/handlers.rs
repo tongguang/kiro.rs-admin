@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -1085,8 +1085,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         },
     }
 }
-
-use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(

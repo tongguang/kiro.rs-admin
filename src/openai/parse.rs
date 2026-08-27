@@ -1,8 +1,10 @@
 //! OpenAI 兼容层共享解析工具
 //!
-//! 由 Chat Completions 与 Responses 两条路径共用：Anthropic 响应体解析
-//! （[`parse_anthropic_message`]）、文本收集（[`collect_text_strings`]）、
-//! 会话亲和元数据（[`resolve_session_metadata`]）等。
+//! Chat Completions 路径消费会话亲和元数据（[`resolve_session_metadata`]）与
+//! `data:` 图解析（[`parse_data_url`]）；其余工具（Anthropic 响应体解析
+//! [`parse_anthropic_message`] / [`ParsedResponse`]、文本收集
+//! [`collect_text_strings`]、合并 [`push_merged`]、时间戳 `now_ts`）由
+//! Responses 路径消费。
 //! 移植自上游 v0.8.0 `anthropic/openai.rs` 的共享段。
 
 use axum::http::HeaderMap;
@@ -36,6 +38,16 @@ pub(crate) fn resolve_session_metadata(
             user_id: Some(format!("session_{uuid}")),
         })
     })
+}
+
+/// 解析 `data:` URL：`data:<media_type>;base64,<data>` → `(media_type, data)`。
+///
+/// 畸形输入（缺 `;base64,` 分隔）返回 `None`，由调用方降级为文本引用，
+/// 不静默丢弃用户输入。Chat 与 Responses 两条路径共用。
+pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    Some((media_type, data))
 }
 
 /// 追加到 merged，若与上一轮 role 相同则合并 content blocks

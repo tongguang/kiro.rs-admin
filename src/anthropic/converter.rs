@@ -232,18 +232,16 @@ fn strip_thinking_suffix(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+/// Claude 模型族名表（`normalize_claude_model` 与 `claude_context_window` 共用）。
+///
+/// 漏配会让该模型窗口回落 200K：usage 按更小窗口换算，上报虚高 5 倍。
+const CLAUDE_FAMILIES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "mythos"];
+
 const MAX_MODEL_ID_LEN: usize = 256;
 
-fn invalid_model_reason(model: &str) -> Option<&'static str> {
-    if model.trim().is_empty() {
-        Some("模型 ID 不能为空")
-    } else if model.len() > MAX_MODEL_ID_LEN {
-        Some("模型 ID 过长")
-    } else if model.chars().any(char::is_control) {
-        Some("模型 ID 不能包含控制字符")
-    } else {
-        None
-    }
+/// 非法模型 ID（空 / 超长 / 含控制字符）：本地拒绝为 400，不透传给上游在重试链上放大。
+fn is_invalid_model(model: &str) -> bool {
+    model.trim().is_empty() || model.len() > MAX_MODEL_ID_LEN || model.chars().any(char::is_control)
 }
 
 fn canonical_version(parts: &[&str]) -> Option<String> {
@@ -296,9 +294,8 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     }
 
     let body = normalized.strip_prefix("claude-")?;
-    const FAMILIES: [&str; 5] = ["sonnet", "opus", "haiku", "fable", "mythos"];
 
-    for family in FAMILIES {
+    for family in CLAUDE_FAMILIES {
         if let Some(rest) = body.strip_prefix(family) {
             let rest = rest
                 .strip_prefix('-')
@@ -312,7 +309,9 @@ fn normalize_claude_model(model: &str) -> Option<String> {
 
     // 旧式日期 ID 把系列名放在版本之后，例如 claude-3-5-sonnet-20241022。
     let parts: Vec<&str> = body.split('-').collect();
-    let family_index = parts.iter().position(|part| FAMILIES.contains(part))?;
+    let family_index = parts
+        .iter()
+        .position(|part| CLAUDE_FAMILIES.contains(part))?;
     if family_index == 0 || family_index + 1 != parts.len() {
         return None;
     }
@@ -324,9 +323,7 @@ fn claude_context_window(model_lower: &str) -> Option<i32> {
     let parts: Vec<&str> = model_lower.split('-').collect();
     let claude_idx = parts.iter().position(|part| *part == "claude")?;
     let family = parts.get(claude_idx + 1)?;
-    // 注意与 normalize_claude_model 的 FAMILIES 保持同步，漏配会让该模型
-    // 窗口回落 200K（usage 按更小窗口换算，上报虚高 5 倍）
-    if !matches!(*family, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
+    if !CLAUDE_FAMILIES.contains(family) {
         return None;
     }
 
@@ -356,7 +353,7 @@ fn claude_context_window(model_lower: &str) -> Option<i32> {
 /// 与未来的新模型不需要每次改代码；非法 ID（空/超长/控制字符）返回 None。
 /// 用户别名映射不在此层，由 handler 层 `model_mappings.resolve()` 先行改写。
 pub fn map_model(model: &str) -> Option<String> {
-    if invalid_model_reason(model).is_some() {
+    if is_invalid_model(model) {
         return None;
     }
 
@@ -400,13 +397,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
-///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
-/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
-/// 若后续实测某模型 400，从这里去除即可。
+/// Kiro 上 GPT-5.6 系走 `reasoning.effort` 字段，与 `output_config` 通道无关。
 fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
     matches!(
         model_id.to_ascii_lowercase().as_str(),
@@ -414,6 +405,13 @@ fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
     )
 }
 
+/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
+///
+/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
+/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
+/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
+/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
+/// 若后续实测某模型 400，从这里去除即可。
 pub(crate) fn model_supports_native_reasoning(model_id: &str) -> bool {
     if model_uses_gpt_reasoning_effort(model_id) {
         return true;
@@ -752,7 +750,7 @@ pub fn convert_request_with_mode(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型：非法 ID（空/超长/控制字符）本地拒绝，不透传给上游在重试链上放大
-    if invalid_model_reason(&req.model).is_some() {
+    if is_invalid_model(&req.model) {
         return Err(ConversionError::UnsupportedModel(req.model.clone()));
     }
     let model_id = normalize_model_id(&req.model);
@@ -2151,8 +2149,8 @@ mod tests {
 
     #[test]
     fn test_context_window_mythos_matches_normalize_families() {
-        // claude_context_window 的 family 列表必须与 normalize_claude_model 的 FAMILIES
-        // 同步，否则 mythos-5（1M 窗口）按 200K 换算，usage 上报虚高 5 倍
+        // mythos-5（1M 窗口）必须落在 CLAUDE_FAMILIES 里：normalize 与窗口共用一份
+        // 族名表，漏配会按 200K 换算，usage 上报虚高 5 倍
         assert_eq!(
             map_model("claude-mythos-5-20261020"),
             Some("claude-mythos-5".to_string())

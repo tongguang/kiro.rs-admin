@@ -530,16 +530,67 @@ fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
 }
 
 /// 获取使用额度信息
+///
+/// 回退语义与请求构造见 [`q_rest_get_with_region_fallback`]。
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    tracing::debug!("正在获取使用额度信息...");
+    q_rest_get_with_region_fallback(
+        credentials,
+        config,
+        token,
+        proxy,
+        "getUsageLimits",
+        "使用额度",
+        usage_limits_url,
+    )
+    .await
+}
 
-    // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
+/// 获取该凭据当前可用的模型列表
+///
+/// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
+/// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
+/// 请求头与构造方式与 [`get_usage_limits`] 完全一致，共用 [`q_rest_get_with_region_fallback`]。
+pub(crate) async fn get_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    q_rest_get_with_region_fallback(
+        credentials,
+        config,
+        token,
+        proxy,
+        "ListAvailableModels",
+        "可用模型",
+        available_models_url,
+    )
+    .await
+}
+
+/// 用量类 REST GET 的区域端点回退循环（getUsageLimits / ListAvailableModels 共用）。
+///
+/// 两类接口仅在 us-east-1 / eu-central-1 提供服务：依据凭据 SSO 区域选主端点，
+/// `usage_api_should_fallback`（403 恒回退；带 ARN 的 400/401 形态拒绝同样回退）
+/// 命中时依次尝试「带 profileArn → 不带 → 备用区域端点」。429 立即返回类型化
+/// [`UpstreamRateLimitError`]，不进入回退。错误文案经 `cn_label` 区分接口
+///（"使用额度" / "可用模型"），`api_name` 仅用于回退日志。
+async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    api_name: &str,
+    cn_label: &str,
+    build_url: fn(&str, Option<&str>) -> String,
+) -> anyhow::Result<T> {
+    tracing::debug!("正在获取{}...", cn_label);
+
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
@@ -563,7 +614,7 @@ pub(crate) async fn get_usage_limits(
     let mut last_error: Option<String> = None;
     for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, *profile_arn);
+        let url = build_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -585,7 +636,7 @@ pub(crate) async fn get_usage_limits(
         let rate_limit_error = (status.as_u16() == 429)
             .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
-            let data: UsageLimitsResponse = response.json().await?;
+            let data: T = response.json().await?;
             return Ok(data);
         }
 
@@ -599,7 +650,8 @@ pub(crate) async fn get_usage_limits(
         if usage_api_should_fallback(status.as_u16(), profile_arn.is_some(), idx + 1 < attempts.len())
         {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 {}（profileArn={}），尝试下一候选",
+                "{} 在 {} 返回 {}（profileArn={}），尝试下一候选",
+                api_name,
                 region,
                 status,
                 profile_arn.is_some()
@@ -609,116 +661,19 @@ pub(crate) async fn get_usage_limits(
         }
 
         let error_msg = match status.as_u16() {
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取使用额度",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取使用额度失败",
+            401 => "认证失败，Token 无效或已过期".to_string(),
+            403 => format!("权限不足，无法获取{}", cn_label),
+            429 => "请求过于频繁，已被限流".to_string(),
+            500..=599 => "服务器错误，AWS 服务暂时不可用".to_string(),
+            _ => format!("获取{}失败", cn_label),
         };
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
     // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
     bail!(
-        "权限不足，无法获取使用额度: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
-}
-
-/// 获取该凭据当前可用的模型列表
-///
-/// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
-/// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
-/// 请求头与构造方式与 [`get_usage_limits`] 完全一致。
-pub(crate) async fn get_available_models(
-    credentials: &KiroCredentials,
-    config: &Config,
-    token: &str,
-    proxy: Option<&ProxyConfig>,
-) -> anyhow::Result<ListAvailableModelsResponse> {
-    tracing::debug!("正在获取可用模型列表...");
-
-    // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
-    // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
-    let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
-    let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 User-Agent headers（与 get_usage_limits 保持一致）
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
-
-    let client = build_client(proxy, 60, config.tls_backend)?;
-
-    let attempts = usage_api_attempts(credentials, &candidates);
-
-    let mut last_error: Option<String> = None;
-    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, *profile_arn);
-
-        let mut request = client
-            .get(&url)
-            .header("x-amz-user-agent", &amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close");
-
-        if let Some(token_type) = credentials.token_type_header() {
-            request = request.header("tokentype", token_type);
-        }
-
-        let response = request.send().await?;
-
-        let status = response.status();
-        let rate_limit_error = (status.as_u16() == 429)
-            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
-        if status.is_success() {
-            let data: ListAvailableModelsResponse = response.json().await?;
-            return Ok(data);
-        }
-
-        let body_text = response.text().await.unwrap_or_default();
-        if let Some(error) = rate_limit_error {
-            return Err(error.into());
-        }
-
-        // 依次回退：带 profileArn → 不带 → 备用区域端点
-        // （403 恒回退；带 ARN 的 400/401 形态拒绝同样回退，见 usage_api_should_fallback）
-        if usage_api_should_fallback(status.as_u16(), profile_arn.is_some(), idx + 1 < attempts.len())
-        {
-            tracing::debug!(
-                "ListAvailableModels 在 {} 返回 {}（profileArn={}），尝试下一候选",
-                region,
-                status,
-                profile_arn.is_some()
-            );
-            last_error = Some(format!("{} {}", status, body_text));
-            continue;
-        }
-
-        let error_msg = match status.as_u16() {
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取可用模型",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取可用模型失败",
-        };
-        bail!("{}: {} {}", error_msg, status, body_text);
-    }
-
-    // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取可用模型: {}",
+        "权限不足，无法获取{}: {}",
+        cn_label,
         last_error.unwrap_or_else(|| "无可用端点".to_string())
     );
 }
@@ -2502,11 +2457,6 @@ impl MultiTokenManager {
         }
     }
 
-    /// 记录一次「对该账号上游发起请求」，用于 RPM 滑动窗口计数。
-    ///
-    /// push now 到队尾，并从队首剔除所有超过 60s 的过期时间戳。
-    /// 由 provider 在「会话级首次用到该凭据」时调用一次（同凭据重试不重复记，
-    /// 故障转移到新凭据时各记一次）。必须在未持有 entries 锁时调用。
     /// 尝试为一次真实业务请求预留 RPM 额度（原子预留）。
     ///
     /// 在同一把 `entries` 锁内完成过期清理、上限检查和记账，避免多个并发请求

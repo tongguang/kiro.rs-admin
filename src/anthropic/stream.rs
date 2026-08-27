@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::converter::get_context_window_size;
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 
 /// thinking 块的 signature 占位字符串
@@ -1368,8 +1369,6 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -2661,34 +2660,9 @@ impl BufferedStreamContext {
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
-
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
+        self.finish_buffer(final_events)
     }
 
     /// 以错误终态完成流处理并返回所有事件
@@ -2698,6 +2672,13 @@ impl BufferedStreamContext {
     /// 不发 message_delta / message_stop 的「正常完成」帧，避免客户端把截断的
     /// 内容误判为 completed。
     pub fn finish_with_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        // 断流终态：关闭未收尾的块（含 thinking 签名）后追加 error 事件
+        let error_events = self.inner.generate_error_events(error_type, message);
+        self.finish_buffer(error_events)
+    }
+
+    /// 缓冲流收尾共用：补初始事件 → 追终态事件 → 按最终用量更正 message_start → 返回全部。
+    fn finish_buffer(&mut self, terminal_events: Vec<SseEvent>) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -2708,9 +2689,7 @@ impl BufferedStreamContext {
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
         let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
 
-        // 断流终态：关闭未收尾的块（含 thinking 签名）后追加 error 事件
-        let error_events = self.inner.generate_error_events(error_type, message);
-        self.event_buffer.extend(error_events);
+        self.event_buffer.extend(terminal_events);
 
         // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
         for event in &mut self.event_buffer {

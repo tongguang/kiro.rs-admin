@@ -86,8 +86,6 @@ pub struct OpenAIToolFunction {
 #[derive(Debug)]
 pub struct ConvertedOpenAIRequest {
     pub anthropic: MessagesRequest,
-    #[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
-    pub openai_messages: Vec<OpenAIMessage>,
 }
 
 #[derive(Debug)]
@@ -123,7 +121,7 @@ pub fn chat_to_anthropic(
 
     // 模型名原样透传（别名在 handler 层 apply_model_mapping 已先行改写，
     // 与上游 Chat 及本仓库 Responses 一致）；非法 ID 由下游 converter 的
-    // invalid_model_reason 拦截为本地 400。
+    // is_invalid_model 拦截为本地 400。
     let model = req.model.trim().to_string();
     let (system, messages) = split_chat_messages(&req.messages)?;
     if messages.is_empty() {
@@ -160,39 +158,7 @@ pub fn chat_to_anthropic(
             metadata,
             force_web_search_loop,
         },
-        openai_messages: req.messages.clone(),
     })
-}
-
-#[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
-pub fn append_openai_messages(
-    mut out: Vec<OpenAIMessage>,
-    messages: Vec<OpenAIMessage>,
-) -> Vec<OpenAIMessage> {
-    for msg in messages {
-        let merge_tool_calls = out
-            .last()
-            .is_some_and(|last| {
-                last.role == "assistant"
-                    && !last.tool_calls.is_empty()
-                    && msg.role == "assistant"
-                    && !msg.tool_calls.is_empty()
-                    && content_to_text(last.content.as_ref().unwrap_or(&Value::Null))
-                        .trim()
-                        .is_empty()
-                    && content_to_text(msg.content.as_ref().unwrap_or(&Value::Null))
-                        .trim()
-                        .is_empty()
-            });
-        if merge_tool_calls {
-            if let Some(last) = out.last_mut() {
-                last.tool_calls.extend(msg.tool_calls);
-            }
-        } else {
-            out.push(msg);
-        }
-    }
-    out
 }
 
 fn split_chat_messages(
@@ -368,7 +334,7 @@ fn image_part_to_anthropic(part: &Value) -> Result<Option<Value>, OpenAIConversi
         return Ok(None);
     };
 
-    if let Some((media_type, data)) = parse_data_url(url) {
+    if let Some((media_type, data)) = super::parse::parse_data_url(url) {
         return Ok(Some(json!({
             "type": "image",
             "source": {
@@ -379,16 +345,11 @@ fn image_part_to_anthropic(part: &Value) -> Result<Option<Value>, OpenAIConversi
         })));
     }
 
+    // 非 data URL 与畸形 data: URL 统一降级为文本引用，不静默丢弃用户输入。
     Ok(Some(json!({
         "type": "text",
         "text": format!("[image_url: {}]", url)
     })))
-}
-
-fn parse_data_url(url: &str) -> Option<(&str, &str)> {
-    let rest = url.strip_prefix("data:")?;
-    let (media_type, data) = rest.split_once(";base64,")?;
-    Some((media_type, data))
 }
 
 fn tool_result_content(content: Option<&Value>) -> Result<Value, OpenAIConversionError> {
@@ -414,13 +375,23 @@ fn tool_result_content(content: Option<&Value>) -> Result<Value, OpenAIConversio
 /// OpenAI 内置 web search 工具的默认 max_uses（与 Anthropic 原生路径 websearch.rs 对齐）。
 const DEFAULT_WEB_SEARCH_MAX_USES: i32 = 8;
 
-/// 判断 OpenAI 工具是否为内置 web search 工具。
+/// 从客户端声明的参数读取 web_search 的 `max_uses`（兼容 `max_num_results` 别名），
+/// 缺失或为非正值时回落 [`DEFAULT_WEB_SEARCH_MAX_USES`]。Chat 与 Responses 共用口径。
+pub(crate) fn web_search_max_uses(parameters: Option<&Value>) -> i32 {
+    parameters
+        .and_then(|p| p.get("max_uses").or_else(|| p.get("max_num_results")))
+        .and_then(Value::as_i64)
+        .map(|v| v as i32)
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_WEB_SEARCH_MAX_USES)
+}
+
+/// 识别 OpenAI 内置 web_search 工具声明（含 `web_search_preview` 等 `web_search_` 前缀变体）。
 ///
 /// OpenAI/Codex 的 web search 工具类型有多个变体：`web_search`（Responses API 新版）、
 /// `web_search_preview` / `web_search_preview_2025_03_11`（早期预览）。统一识别后
 /// 归一化为 Anthropic 原生 `web_search_20250305`，否则会在 `tool_type != "function"`
 /// 处被直接丢弃，导致 Codex 的联网搜索能力在 OpenAI 兼容层彻底失效。
-/// 识别 OpenAI web_search 工具声明（含 `web_search_preview` 等 `web_search_` 前缀变体）。
 /// Chat 与 Responses 两路径共用，保证变体声明在任一端点都被注入原生 web_search。
 pub(crate) fn is_openai_web_search_tool(tool_type: &str) -> bool {
     tool_type == "web_search" || tool_type.starts_with("web_search_")
@@ -431,20 +402,12 @@ fn convert_openai_tools(tools: &[OpenAITool]) -> Option<Vec<Tool>> {
     for tool in tools {
         // 内置 web search：转成 Anthropic 原生工具，交给后端 web_search 路由/agentic loop。
         if is_openai_web_search_tool(&tool.tool_type) {
-            let max_uses = tool
-                .parameters
-                .as_ref()
-                .and_then(|p| p.get("max_uses").or_else(|| p.get("max_num_results")))
-                .and_then(Value::as_i64)
-                .map(|v| v as i32)
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_WEB_SEARCH_MAX_USES);
             out.push(Tool {
                 tool_type: Some("web_search_20250305".to_string()),
                 name: "web_search".to_string(),
                 description: String::new(),
                 input_schema: BTreeMap::new(),
-                max_uses: Some(max_uses),
+                max_uses: Some(web_search_max_uses(tool.parameters.as_ref())),
                 cache_control: None::<CacheControl>,
             });
             continue;
@@ -761,15 +724,4 @@ pub fn openai_error(message: impl Into<String>, error_type: impl Into<String>) -
             "type": error_type.into(),
         }
     })
-}
-
-#[allow(dead_code)] // 2-3 重接 previous_response_id 历史时恢复使用
-pub fn assistant_message_for_history(parts: &AssistantParts) -> OpenAIMessage {
-    OpenAIMessage {
-        role: "assistant".to_string(),
-        content: Some(Value::String(parts.text.clone())),
-        tool_calls: parts.tool_calls.clone(),
-        tool_call_id: None,
-        name: None,
-    }
 }

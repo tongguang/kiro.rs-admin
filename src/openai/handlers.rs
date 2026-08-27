@@ -31,7 +31,7 @@ pub async fn post_chat_completions(
     headers: axum::http::HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ChatCompletionRequest>,
 ) -> Response {
-    apply_model_mapping(&state, &mut req.model);
+    super::apply_model_mapping(&state, &mut req.model);
     let include_usage = req
         .stream_options
         .as_ref()
@@ -56,20 +56,6 @@ pub async fn post_chat_completions(
         convert_chat_stream_response(anthropic_response, model, include_usage).await
     } else {
         convert_chat_non_stream_response(anthropic_response).await
-    }
-}
-
-/// 请求时应用模型映射：命中配置的源模型名则原地改写为目标模型名。
-///
-/// 映射是唯一的别名层：改写后（或未命中时）模型名原样透传给 converter，
-/// 不再有任何启发式二次改写（gpt-*/o1/o3/codex 启发式已删除，与上游对齐）。
-/// 默认 seed 含 gpt-5.5/gpt-5.4 → claude-opus-4.8，Codex 开箱即用。
-fn apply_model_mapping(state: &AppState, model: &mut String) {
-    if let Some(mappings) = &state.model_mappings
-        && let Some(target) = mappings.resolve(model)
-    {
-        tracing::debug!("模型映射命中: {} → {}", model, target);
-        *model = target;
     }
 }
 

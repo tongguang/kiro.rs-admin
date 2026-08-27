@@ -193,6 +193,88 @@ pub struct KiroProvider {
     profile_resolution_attempted: Mutex<HashSet<u64>>,
 }
 
+/// 单请求内跨 attempt 的凭据状态（API / MCP 重试循环共用）。
+#[derive(Default)]
+struct CredentialRetryState {
+    /// 本请求内被排除的凭据（RPM 抢占 / 普通 429 换号）。
+    throttled_ids: HashSet<u64>,
+    /// 会话级 RPM 记账去重：同一凭据在本请求（含 429 重试）只记 1 次 tick；
+    /// 故障转移到不同凭据时各记 1 次。
+    rpm_recorded: HashSet<u64>,
+    /// token 被上游失效时每凭据仅一次强制刷新机会。
+    force_refreshed: HashSet<u64>,
+}
+
+impl CredentialRetryState {
+    /// RPM 原子预留：本会话首次用到该凭据才记账；预留失败（额度被并发请求
+    /// 抢先占用）则抢占排除该凭据并返回 `false`——调用方 `continue`（占一次 attempt）。
+    fn reserve_rpm(&mut self, tm: &MultiTokenManager, id: u64) -> bool {
+        if self.rpm_recorded.insert(id) && !tm.record_request(id) {
+            self.rpm_recorded.remove(&id);
+            self.throttled_ids.insert(id);
+            tracing::debug!("凭据 #{} RPM 额度被并发请求抢占，重新选择", id);
+            return false;
+        }
+        true
+    }
+
+    /// 普通 429（非账号风控）换号策略：API 与 MCP 共用。
+    ///
+    /// 仅当 Failover 或 `credential_switch_on_429` 开启时换号：
+    /// - 有其它可用凭据 → 排除当前号；非 Failover 再写入限流冷却；返回 `Switched`（调用方 continue）。
+    /// - Failover 且无其它可用 → 排除集清空后仅保留当前号，下一轮从它起手；返回 `FailoverKeepCurrent`。
+    /// - 非 Failover 且无其它可用 → 排除集清空；未开换号开关 → 不动排除集。均返回 `NotSwitched`。
+    ///
+    /// `!should_retry_locally` 的类型化 429 与账号风控路径由调用方先行处理。
+    fn switch_credential_on_ordinary_429(
+        &mut self,
+        tm: &MultiTokenManager,
+        model: Option<&str>,
+        group: Option<&str>,
+        credential_id: u64,
+        retry_mode: RetryMode,
+        retry_policy: &RetryPolicy,
+        retry_after: Option<Duration>,
+    ) -> Ordinary429Outcome {
+        let switch_on_ordinary_429 =
+            retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
+        if !switch_on_ordinary_429 {
+            return Ordinary429Outcome::NotSwitched;
+        }
+
+        self.throttled_ids.insert(credential_id);
+        if tm.has_available_excluding(model, group, &self.throttled_ids) {
+            if retry_mode != RetryMode::Failover {
+                let cooldown = retry_after
+                    .unwrap_or_else(|| Duration::from_millis(retry_policy.rate_limit_cooldown_ms));
+                tm.report_rate_limited(credential_id, cooldown);
+            }
+            return Ordinary429Outcome::Switched;
+        }
+
+        if retry_mode == RetryMode::Failover && !self.throttled_ids.is_empty() {
+            self.throttled_ids.clear();
+            self.throttled_ids.insert(credential_id);
+            return Ordinary429Outcome::FailoverKeepCurrent;
+        }
+        if retry_mode != RetryMode::Failover {
+            self.throttled_ids.clear();
+        }
+        Ordinary429Outcome::NotSwitched
+    }
+}
+
+/// 普通 429 换号决策的三分支结果。
+#[derive(Debug, PartialEq, Eq)]
+enum Ordinary429Outcome {
+    /// 存在其它可用凭据：排除集已含当前号，调用方格式化错误后 `continue`。
+    Switched,
+    /// Failover 且本轮无其它可用：排除集清空后仅保留当前号，开启下一轮重试。
+    FailoverKeepCurrent,
+    /// 不换号：未开换号开关（排除集未动），或非 Failover 无可用（排除集已清空）。
+    NotSwitched,
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -817,21 +899,16 @@ impl KiroProvider {
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
         let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
-        let mut request_throttled_ids: HashSet<u64> = HashSet::new();
-        // 会话级 RPM 记账去重（同 call_api_with_retry）
-        let mut rpm_recorded: HashSet<u64> = HashSet::new();
+        let mut state = CredentialRetryState::default();
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let ctx_result = if request_throttled_ids.is_empty() {
-                self.token_manager.acquire_context(None, group).await
-            } else {
-                self.token_manager
-                    .acquire_context_excluding(None, group, &request_throttled_ids)
-                    .await
-            };
+            // 与 call_api_with_retry 同口径：一律 excluding（空排除集语义与 acquire_context 相同）。
+            let ctx_result = self
+                .token_manager
+                .acquire_context_excluding(None, group, &state.throttled_ids)
+                .await;
             let ctx = match ctx_result {
                 Ok(c) => c,
                 Err(e) => {
@@ -870,10 +947,7 @@ impl KiroProvider {
 
             // RPM 记账：本会话首次用到该凭据才记 1 次；原子预留失败（额度被并发
             // 请求抢先占用）则排除该凭据重新选择。
-            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
-                rpm_recorded.remove(&ctx.id);
-                request_throttled_ids.insert(ctx.id);
-                tracing::debug!("凭据 #{} RPM 额度被并发请求抢占，重新选择", ctx.id);
+            if !state.reserve_rpm(&self.token_manager, ctx.id) {
                 continue;
             }
 
@@ -998,19 +1072,17 @@ impl KiroProvider {
                     && self.token_manager.get_suspended_detection_enabled()
                     && endpoint.is_account_suspended(&body)
                 {
-                    Self::emit_attempt(
+                    let has_available = self.handle_account_suspended(
                         sink,
                         attempt,
                         ctx.id,
                         endpoint_name,
-                        Some(status.as_u16()),
-                        outcome::ACCOUNT_SUSPENDED,
-                        Some(&body),
+                        status,
+                        &body,
                         attempt_start,
+                        None,
+                        group,
                     );
-                    let has_available = self
-                        .token_manager
-                        .report_suspended_for_request(ctx.id, None, group);
                     if !has_available {
                         anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                     }
@@ -1031,8 +1103,8 @@ impl KiroProvider {
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
+                if endpoint.is_bearer_token_invalid(&body) && !state.force_refreshed.contains(&ctx.id) {
+                    state.force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if Self::handle_force_refresh_result(
                         self.token_manager.force_refresh_token_for(ctx.id).await,
@@ -1070,21 +1142,16 @@ impl KiroProvider {
                     {
                         return Err(rate_limit.clone().into());
                     }
-                    let switch_on_ordinary_429 =
-                        retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
-                    if switch_on_ordinary_429 {
-                        request_throttled_ids.insert(ctx.id);
-                        if self.token_manager.has_available_excluding(
-                            None,
-                            group,
-                            &request_throttled_ids,
-                        ) {
-                            if retry_mode != RetryMode::Failover {
-                                let cooldown = retry_after.unwrap_or_else(|| {
-                                    Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
-                                });
-                                self.token_manager.report_rate_limited(ctx.id, cooldown);
-                            }
+                    match state.switch_credential_on_ordinary_429(
+                        &self.token_manager,
+                        None,
+                        group,
+                        ctx.id,
+                        retry_mode,
+                        &retry_policy,
+                        retry_after,
+                    ) {
+                        Ordinary429Outcome::Switched => {
                             tracing::info!(
                                 "MCP 凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
                                 ctx.id,
@@ -1098,15 +1165,7 @@ impl KiroProvider {
                             ));
                             continue;
                         }
-                        if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
-                            let keep_excluded = Some(ctx.id);
-                            request_throttled_ids.clear();
-                            if let Some(id) = keep_excluded {
-                                request_throttled_ids.insert(id);
-                            }
-                        } else if retry_mode != RetryMode::Failover {
-                            request_throttled_ids.clear();
-                        }
+                        Ordinary429Outcome::FailoverKeepCurrent | Ordinary429Outcome::NotSwitched => {}
                     }
                 }
 
@@ -1194,11 +1253,7 @@ impl KiroProvider {
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
         let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
-        let mut request_throttled_ids: HashSet<u64> = HashSet::new();
-        // 会话级 RPM 记账去重：同一凭据在本会话（含 429 重试）只记 1 次 tick；
-        // 故障转移到不同凭据时各记 1 次。
-        let mut rpm_recorded: HashSet<u64> = HashSet::new();
+        let mut state = CredentialRetryState::default();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -1210,7 +1265,7 @@ impl KiroProvider {
             let stage_acquire_start = Instant::now();
             let mut ctx = match self
                 .token_manager
-                .acquire_context_excluding(model.as_deref(), group, &request_throttled_ids)
+                .acquire_context_excluding(model.as_deref(), group, &state.throttled_ids)
                 .await
             {
                 Ok(c) => c,
@@ -1242,10 +1297,7 @@ impl KiroProvider {
 
             // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）；
             // 原子预留失败（额度被并发请求抢先占用）则排除该凭据重新选择。
-            if rpm_recorded.insert(ctx.id) && !self.token_manager.record_request(ctx.id) {
-                rpm_recorded.remove(&ctx.id);
-                request_throttled_ids.insert(ctx.id);
-                tracing::debug!("凭据 #{} RPM 额度被并发请求抢占，重新选择", ctx.id);
+            if !state.reserve_rpm(&self.token_manager, ctx.id) {
                 continue;
             }
 
@@ -1428,18 +1480,14 @@ impl KiroProvider {
                         status,
                         body
                     );
-                    Self::emit_attempt(
+                    let has_available = self.handle_account_suspended(
                         sink,
                         attempt,
                         ctx.id,
                         endpoint_name,
-                        Some(status.as_u16()),
-                        outcome::ACCOUNT_SUSPENDED,
-                        Some(&body),
+                        status,
+                        &body,
                         attempt_start,
-                    );
-                    let has_available = self.token_manager.report_suspended_for_request(
-                        ctx.id,
                         model.as_deref(),
                         group,
                     );
@@ -1479,8 +1527,8 @@ impl KiroProvider {
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
+                if endpoint.is_bearer_token_invalid(&body) && !state.force_refreshed.contains(&ctx.id) {
+                    state.force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if Self::handle_force_refresh_result(
                         self.token_manager.force_refresh_token_for(ctx.id).await,
@@ -1651,47 +1699,38 @@ impl KiroProvider {
                 {
                     return Err(rate_limit_error.expect("429 rate limit error").into());
                 }
-                let switch_on_ordinary_429 =
-                    retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
-                if status.as_u16() == 429 && !account_throttled && switch_on_ordinary_429 {
-                    request_throttled_ids.insert(ctx.id);
-                    if self.token_manager.has_available_excluding(
+                if status.as_u16() == 429 && !account_throttled {
+                    match state.switch_credential_on_ordinary_429(
+                        &self.token_manager,
                         model.as_deref(),
                         group,
-                        &request_throttled_ids,
+                        ctx.id,
+                        retry_mode,
+                        &retry_policy,
+                        retry_after,
                     ) {
-                        if retry_mode != RetryMode::Failover {
-                            let cooldown = retry_after.unwrap_or_else(|| {
-                                Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
-                            });
-                            self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        Ordinary429Outcome::Switched => {
+                            last_error = Some(anyhow::anyhow!(
+                                "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
+                                api_type,
+                                ctx.id,
+                                status,
+                                body
+                            ));
+                            tracing::info!(
+                                "凭据 #{} 主/备用端点均返回普通 429，按 {} 策略切换其它凭据",
+                                ctx.id,
+                                retry_mode
+                            );
+                            continue;
                         }
-                        last_error = Some(anyhow::anyhow!(
-                            "{} API 请求失败（凭据 #{} 429，备用端点也失败，已切换其它凭据重试）: {} {}",
-                            api_type,
-                            ctx.id,
-                            status,
-                            body
-                        ));
-                        tracing::info!(
-                            "凭据 #{} 主/备用端点均返回普通 429，按 {} 策略切换其它凭据",
-                            ctx.id,
-                            retry_mode
-                        );
-                        continue;
-                    }
-                    if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
-                        let keep_excluded = Some(ctx.id);
-                        request_throttled_ids.clear();
-                        if let Some(id) = keep_excluded {
-                            request_throttled_ids.insert(id);
+                        Ordinary429Outcome::FailoverKeepCurrent => {
+                            tracing::info!(
+                                "本轮可用凭据主/备用端点均返回普通 429，开启下一轮并暂避凭据 #{}。",
+                                ctx.id
+                            );
                         }
-                        tracing::info!(
-                            "本轮可用凭据主/备用端点均返回普通 429，开启下一轮并暂避凭据 #{}。",
-                            ctx.id
-                        );
-                    } else if retry_mode != RetryMode::Failover {
-                        request_throttled_ids.clear();
+                        Ordinary429Outcome::NotSwitched => {}
                     }
                 }
             }
@@ -1848,6 +1887,37 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    /// 403 + 明确封禁文案：trace 一跳 ACCOUNT_SUSPENDED，禁用凭据（不参与自愈），
+    /// 返回是否仍有可用凭据。
+    ///
+    /// API 传 `model`、MCP 传 `None`；bail / continue 与各自的错误文案留在调用方。
+    #[allow(clippy::too_many_arguments)]
+    fn handle_account_suspended(
+        &self,
+        sink: Option<&dyn TraceSink>,
+        attempt: usize,
+        credential_id: u64,
+        endpoint_name: &str,
+        status: reqwest::StatusCode,
+        body: &str,
+        started: Instant,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        Self::emit_attempt(
+            sink,
+            attempt,
+            credential_id,
+            endpoint_name,
+            Some(status.as_u16()),
+            outcome::ACCOUNT_SUSPENDED,
+            Some(body),
+            started,
+        );
+        self.token_manager
+            .report_suspended_for_request(credential_id, model, group)
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
@@ -2169,5 +2239,155 @@ mod tests {
             readable_response_snippet_from_bytes(b"{\"message\":\"bad request\"}").as_deref(),
             Some("{\"message\":\"bad request\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_retry_tests {
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::{Config, RetryMode, RetryPolicy};
+
+    fn manager_with(creds: Vec<KiroCredentials>) -> MultiTokenManager {
+        MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap()
+    }
+
+    #[test]
+    fn reserve_rpm_preempted_excludes_credential() {
+        let mut cred = KiroCredentials::default();
+        cred.rpm_limit = 1;
+        let manager = manager_with(vec![cred]);
+        // 并发请求先把 1/1 窗口占满
+        assert!(manager.record_request(1));
+
+        let mut state = CredentialRetryState::default();
+        assert!(!state.reserve_rpm(&manager, 1), "额度被抢占时应返回 false");
+        assert!(state.throttled_ids.contains(&1), "应抢占排除该凭据");
+        assert!(!state.rpm_recorded.contains(&1), "预留失败应回滚记账去重");
+    }
+
+    #[test]
+    fn reserve_rpm_records_once_per_credential() {
+        let mut cred = KiroCredentials::default();
+        cred.rpm_limit = 1;
+        let manager = manager_with(vec![cred]);
+
+        let mut state = CredentialRetryState::default();
+        assert!(state.reserve_rpm(&manager, 1));
+        assert!(state.reserve_rpm(&manager, 1), "同凭据重试不再重复记账");
+        assert!(!manager.record_request(1), "只记了 1 次 tick：窗口 1/1 已满");
+    }
+
+    #[test]
+    fn switch_on_429_switched_writes_cooldown_outside_failover() {
+        let manager = manager_with(vec![
+            KiroCredentials::default(),
+            KiroCredentials::default(),
+        ]);
+        let mut state = CredentialRetryState::default();
+
+        let outcome = state.switch_credential_on_ordinary_429(
+            &manager,
+            None,
+            None,
+            1,
+            RetryMode::Balanced,
+            &RetryPolicy::preset(RetryMode::Balanced),
+            None,
+        );
+        assert_eq!(outcome, Ordinary429Outcome::Switched);
+        assert!(state.throttled_ids.contains(&1));
+        // 非 Failover 写入了限流冷却：排除 #2 后无任何可用
+        let mut excluded = HashSet::new();
+        excluded.insert(2u64);
+        assert!(
+            !manager.has_available_excluding(None, None, &excluded),
+            "凭据 #1 应已被写入 rate_limited 冷却"
+        );
+    }
+
+    #[test]
+    fn switch_on_429_failover_switched_without_cooldown() {
+        let manager = manager_with(vec![
+            KiroCredentials::default(),
+            KiroCredentials::default(),
+        ]);
+        let mut state = CredentialRetryState::default();
+
+        let outcome = state.switch_credential_on_ordinary_429(
+            &manager,
+            None,
+            None,
+            1,
+            RetryMode::Failover,
+            &RetryPolicy::preset(RetryMode::Failover),
+            None,
+        );
+        assert_eq!(outcome, Ordinary429Outcome::Switched);
+        assert!(state.throttled_ids.contains(&1));
+        // Failover 不写冷却：排除 #2 后 #1 仍可用
+        let mut excluded = HashSet::new();
+        excluded.insert(2u64);
+        assert!(manager.has_available_excluding(None, None, &excluded));
+    }
+
+    #[test]
+    fn switch_on_429_failover_keep_current_when_none_available() {
+        let manager = manager_with(vec![KiroCredentials::default()]);
+        let mut state = CredentialRetryState::default();
+
+        let outcome = state.switch_credential_on_ordinary_429(
+            &manager,
+            None,
+            None,
+            1,
+            RetryMode::Failover,
+            &RetryPolicy::preset(RetryMode::Failover),
+            None,
+        );
+        assert_eq!(outcome, Ordinary429Outcome::FailoverKeepCurrent);
+        assert!(
+            state.throttled_ids.contains(&1) && state.throttled_ids.len() == 1,
+            "排除集清空后仅保留当前号"
+        );
+    }
+
+    #[test]
+    fn switch_on_429_non_failover_clears_when_none_available() {
+        let manager = manager_with(vec![KiroCredentials::default()]);
+        let mut state = CredentialRetryState::default();
+
+        let outcome = state.switch_credential_on_ordinary_429(
+            &manager,
+            None,
+            None,
+            1,
+            RetryMode::Balanced,
+            &RetryPolicy::preset(RetryMode::Balanced),
+            None,
+        );
+        assert_eq!(outcome, Ordinary429Outcome::NotSwitched);
+        assert!(state.throttled_ids.is_empty(), "非 Failover 无可用时清空排除集");
+    }
+
+    #[test]
+    fn switch_on_429_disabled_switch_leaves_state_untouched() {
+        let manager = manager_with(vec![
+            KiroCredentials::default(),
+            KiroCredentials::default(),
+        ]);
+        let mut state = CredentialRetryState::default();
+
+        let outcome = state.switch_credential_on_ordinary_429(
+            &manager,
+            None,
+            None,
+            1,
+            RetryMode::Polite,
+            &RetryPolicy::preset(RetryMode::Polite),
+            None,
+        );
+        assert_eq!(outcome, Ordinary429Outcome::NotSwitched);
+        assert!(state.throttled_ids.is_empty(), "未开换号开关时不排除任何凭据");
     }
 }

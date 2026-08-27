@@ -52,8 +52,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::parse::{
-    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
-    resolve_session_metadata,
+    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, parse_data_url,
+    push_merged, resolve_session_metadata,
 };
 use crate::anthropic::handlers::post_messages;
 use crate::anthropic::middleware::{AppState, KeyContext};
@@ -284,13 +284,8 @@ pub async fn post_responses(
     headers: HeaderMap,
     Json(mut req): Json<ResponsesRequest>,
 ) -> Response {
-    // fork 的用户模型映射在翻译前显式生效（上游无此机制，随文件替换需补回）
-    if let Some(mappings) = &state.model_mappings
-        && let Some(target) = mappings.resolve(&req.model)
-    {
-        tracing::debug!("模型映射命中: {} → {}", req.model, target);
-        req.model = target;
-    }
+    // fork 的用户模型映射在翻译前显式生效（随上游文件替换需补回），与 Chat 共用实现
+    super::apply_model_mapping(&state, &mut req.model);
 
     let want_stream = req.stream;
     let model = req.model.clone();
@@ -486,12 +481,18 @@ fn responses_to_anthropic(
     }
 
     // 含 web_search_preview 等前缀变体（与 Chat 路径 is_openai_web_search_tool 同口径）
-    let hosted_web_search_declared = declared_entries.iter().any(|entry| {
+    let hosted_web_search_entry = declared_entries.iter().find(|entry| {
         entry
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(super::types::is_openai_web_search_tool)
     });
+    let hosted_web_search_declared = hosted_web_search_entry.is_some();
+    // 客户端可在声明 entry 的 `parameters` 里给 max_uses / max_num_results
+    //（与 Chat 同口径，不读顶层字段；Codex 常见 {type: web_search} 无 parameters，走默认 8）。
+    let web_search_max_uses = super::types::web_search_max_uses(
+        hosted_web_search_entry.and_then(|entry| entry.get("parameters")),
+    );
 
     let tool_choice = req
         .tool_choice
@@ -515,22 +516,16 @@ fn responses_to_anthropic(
         && !tool_list.iter().any(|t| t.name == "web_search")
     {
         if tool_list.is_empty() {
-            // noop 保证不触发单 WebSearch fast-path，继续使用已验证的 agentic loop。
-            tool_list.push(Tool {
-                tool_type: None,
-                name: "noop".to_string(),
-                description: "Placeholder tool; never call this.".to_string(),
-                input_schema: Default::default(),
-                max_uses: None,
-                cache_control: None,
-            });
-            tool_list.push(native_web_search_tool());
+            // force_web_search_loop 已置位，单 web_search 工具也会被
+            // has_web_search_tool 短路出快速路径、进 agentic loop（websearch.rs:122/141），
+            // 无需 noop 占位。
+            tool_list.push(native_web_search_tool(web_search_max_uses));
             system.push(SystemMessage {
                 text: NUDGE_STRICT.to_string(),
                 cache_control: None,
             });
         } else {
-            tool_list.push(native_web_search_tool());
+            tool_list.push(native_web_search_tool(web_search_max_uses));
             system.push(SystemMessage {
                 text: NUDGE_SOFT.to_string(),
                 cache_control: None,
@@ -585,14 +580,17 @@ fn responses_to_anthropic(
     ))
 }
 
-/// 原生 web_search 工具（kiro-rs 内部代答，最多 5 轮）
-fn native_web_search_tool() -> Tool {
+/// 原生 web_search 工具（kiro-rs 内部代答）。
+///
+/// `max_uses` 取客户端声明 entry 的 `parameters`（`max_uses` / `max_num_results`），
+/// 缺失或非正时默认 `DEFAULT_WEB_SEARCH_MAX_USES`=8，与 Chat 路径同口径。
+fn native_web_search_tool(max_uses: i32) -> Tool {
     Tool {
         tool_type: Some("web_search_20250305".to_string()),
         name: "web_search".to_string(),
         description: String::new(),
         input_schema: Default::default(),
-        max_uses: Some(5),
+        max_uses: Some(max_uses),
         cache_control: None,
     }
 }
@@ -902,24 +900,24 @@ fn collect_content_text(content: Option<&Value>) -> Vec<String> {
 }
 
 /// Responses `input_image.image_url` 转 Anthropic block。
-/// data: URL 转 base64 image block；http(s) 等非 data URL 与 Chat 路径
-/// `types::image_part_to_anthropic` 同口径降级为文本引用，不静默丢弃用户输入。
+/// `data:` URL 转 base64 image block；http(s) 等非 data URL 与畸形 data: URL
+/// 与 Chat 路径 `types::image_part_to_anthropic` 同口径降级为文本引用，不静默丢弃用户输入。
+/// （不采纳 Chat 的 `{url:{url}}` 嵌套形态：Responses 协议中 image_url 恒为字符串。）
 fn image_block(part: &Value) -> Option<Value> {
     let url = part.get("image_url").and_then(|v| v.as_str())?;
-    let Some(rest) = url.strip_prefix("data:") else {
+    if let Some((media_type, data)) = parse_data_url(url) {
         return Some(json!({
-            "type": "text",
-            "text": format!("[image_url: {}]", url)
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
         }));
-    };
-    let (media_type, data) = rest.split_once(";base64,")?;
+    }
     Some(json!({
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": media_type,
-            "data": data,
-        }
+        "type": "text",
+        "text": format!("[image_url: {}]", url)
     }))
 }
 
@@ -2736,12 +2734,12 @@ mod tests {
     }
 
     #[test]
-    fn hosted_web_search_without_local_tools_uses_agentic_loop_pair() {
+    fn hosted_web_search_without_local_tools_uses_agentic_loop() {
         let req = req_with(json!([{ "type": "web_search" }]), simple_input());
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let tools = anth.tools.as_ref().unwrap();
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert_eq!(names, vec!["noop", "web_search"]);
+        assert_eq!(names, vec!["web_search"]);
         assert!(
             system_texts(&anth)
                 .iter()
@@ -2842,7 +2840,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["noop", "web_search"],
+            vec!["web_search"],
             "web_search_preview 变体应注入原生 web_search"
         );
         assert!(anth.force_web_search_loop, "preview 变体应触发强制搜索循环");
@@ -2859,6 +2857,81 @@ mod tests {
         // data: URL 仍走 base64 image block
         let part = json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"});
         assert_eq!(image_block(&part).unwrap()["type"], json!("image"));
+    }
+
+    #[test]
+    fn image_block_degrades_malformed_data_url_to_text() {
+        // 缺 `;base64,` 的畸形 data: URL 同样降级为文本引用，不静默丢图（与 Chat 同口径）
+        let part = json!({"type": "input_image", "image_url": "data:image/png,AAAA"});
+        assert_eq!(
+            image_block(&part).unwrap(),
+            json!({"type": "text", "text": "[image_url: data:image/png,AAAA]"})
+        );
+    }
+
+    #[test]
+    fn hosted_web_search_tool_defaults_to_eight_max_uses() {
+        let req = req_with(json!([{ "type": "web_search" }]), simple_input());
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let ws = anth
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|t| t.name == "web_search")
+            .unwrap();
+        assert_eq!(ws.max_uses, Some(8));
+    }
+
+    #[test]
+    fn hosted_web_search_tool_honors_client_max_uses() {
+        let req = req_with(
+            json!([{ "type": "web_search", "parameters": { "max_uses": 3 } }]),
+            simple_input(),
+        );
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let ws = anth
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|t| t.name == "web_search")
+            .unwrap();
+        assert_eq!(ws.max_uses, Some(3));
+    }
+
+    #[test]
+    fn hosted_web_search_tool_honors_max_num_results_alias() {
+        let req = req_with(
+            json!([{ "type": "web_search", "parameters": { "max_num_results": 4 } }]),
+            simple_input(),
+        );
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let ws = anth
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|t| t.name == "web_search")
+            .unwrap();
+        assert_eq!(ws.max_uses, Some(4));
+    }
+
+    #[test]
+    fn hosted_web_search_tool_nonpositive_max_uses_falls_back_to_default() {
+        let req = req_with(
+            json!([{ "type": "web_search", "parameters": { "max_uses": 0 } }]),
+            simple_input(),
+        );
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let ws = anth
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|t| t.name == "web_search")
+            .unwrap();
+        assert_eq!(ws.max_uses, Some(8));
     }
 
     #[tokio::test]
