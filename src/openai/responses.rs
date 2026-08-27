@@ -284,6 +284,15 @@ fn input_as_items(input: &Value) -> Vec<Value> {
     }
 }
 
+/// 续接前缀里的 `additional_tools` 是上一轮的工具声明；本轮以当前请求为准。
+/// 原样拼前缀会让 convert 把同名工具收两遍（Anthropic 要求工具名唯一）。
+fn strip_chained_tool_declarations(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
+        .collect()
+}
+
 /// GET /v1/responses/{id}
 pub async fn get_response(
     Path(id): Path<String>,
@@ -347,7 +356,7 @@ pub async fn post_responses(
     let mut chained_items: Vec<Value> = Vec::new();
     if let Some(prev_id) = previous_response_id.as_deref() {
         match load_owned_response(prev_id, owner_key_id) {
-            Some(stored) => chained_items = stored.items,
+            Some(stored) => chained_items = strip_chained_tool_declarations(stored.items),
             None => {
                 return responses_error(
                     StatusCode::NOT_FOUND,
@@ -2572,6 +2581,53 @@ mod tests {
         assert!(!tools.iter().any(|t| t.name == "noop"));
         // additional_tools item 本身不进消息
         assert_eq!(anth.messages.len(), 1);
+    }
+
+    #[test]
+    fn chained_additional_tools_are_dropped_before_convert() {
+        // 模拟 previous_response_id 取出的已存链（含上一轮 additional_tools）
+        // 再跟本轮同名 exec/wait 声明；滤前缀后工具名仍各一份。
+        let stored_items = json!([
+            { "type": "additional_tools", "role": "developer", "tools": [
+                { "type": "custom", "name": "exec", "description": "Run JS" },
+                { "type": "function", "name": "wait", "parameters": { "type": "object" } },
+            ]},
+            { "type": "message", "role": "user", "content": "hi" },
+            { "type": "message", "role": "assistant", "content": "ok" },
+        ]);
+        let current_input = json!([
+            { "type": "additional_tools", "role": "developer", "tools": [
+                { "type": "custom", "name": "exec", "description": "Run JS" },
+                { "type": "function", "name": "wait", "parameters": { "type": "object" } },
+            ]},
+            { "type": "message", "role": "user", "content": "again" },
+        ]);
+
+        let mut chained = strip_chained_tool_declarations(stored_items.as_array().unwrap().clone());
+        chained.extend(current_input.as_array().unwrap().iter().cloned());
+
+        let req = req_with(json!([]), Value::Array(chained));
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
+        let tools = anth.tools.as_ref().unwrap();
+        assert_eq!(
+            tools.iter().filter(|t| t.name == "exec").count(),
+            1,
+            "续接后 exec 应仍只有一份"
+        );
+        assert_eq!(
+            tools.iter().filter(|t| t.name == "wait").count(),
+            1,
+            "续接后 wait 应仍只有一份"
+        );
+        assert_eq!(
+            kinds.get("exec").map(|d| d.kind),
+            Some(DeclaredToolKind::Custom)
+        );
+        assert_eq!(
+            kinds.get("wait").map(|d| d.kind),
+            Some(DeclaredToolKind::Function)
+        );
+        assert_eq!(anth.messages.len(), 3);
     }
 
     #[test]

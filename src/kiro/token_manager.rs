@@ -2782,6 +2782,7 @@ impl MultiTokenManager {
                 || e.throttled_until.map(|t| t > now).unwrap_or(false)
                 || e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 || !credential_matches_request(&e.credentials, model, group)
+                || self.cached_model_support(e.id, model) == CachedModelSupport::Unsupported
             {
                 continue;
             }
@@ -3057,11 +3058,16 @@ impl MultiTokenManager {
                     next.id,
                     next.credentials.priority
                 );
-                true
-            } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
             }
+            // 返回值与 report_failure 同口径：只要还有启用且匹配的号就让
+            // 调用方 continue，RPM/冷却由下一轮 acquire 给出类型化 429。
+            let has_remaining = entries.iter().any(|entry| {
+                !entry.disabled && credential_matches_request(&entry.credentials, model, group)
+            });
+            if !has_remaining {
+                tracing::error!("所有凭据均已禁用！");
+            }
+            has_remaining
         };
         if let Err(error) = self.persist_credentials() {
             tracing::warn!("凭据 #{} 封禁状态持久化失败: {}", id, error);
@@ -3079,10 +3085,13 @@ impl MultiTokenManager {
     ///
     /// 自愈门闩：只有全部匹配凭据都因各种原因被禁用（自动禁用导致全灭）才允许
     /// 自愈；仍启用但处于 RPM/429 冷却或被本请求排除的凭据不算全灭，返回 false
-    /// 以阻止误触发自愈、消耗自愈轮次。
+    /// 以阻止误触发自愈、消耗自愈轮次。新鲜缓存明确标记为 Unsupported 的凭据
+    /// 不算活号；缓存过期或缺失时仍按 Unknown 算活号。
     fn all_matching_credentials_disabled(&self, model: Option<&str>, group: Option<&str>) -> bool {
         !self.entries.lock().iter().any(|entry| {
-            !entry.disabled && credential_matches_request(&entry.credentials, model, group)
+            !entry.disabled
+                && credential_matches_request(&entry.credentials, model, group)
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         })
     }
 
@@ -5622,6 +5631,30 @@ mod tests {
     }
 
     #[test]
+    fn report_suspended_keeps_retrying_when_remaining_is_rpm_full() {
+        // A 被封禁，B 启用匹配但 RPM 窗口打满 → 返回 true，让下一轮 acquire 给 429。
+        let mut cred_a = grouped_cred("suspended-token", &[]);
+        cred_a.id = Some(1);
+        let mut cred_b = grouped_cred("rpm-token", &[]);
+        cred_b.id = Some(2);
+        cred_b.rpm_limit = 1;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred_a, cred_b], None, None, false)
+                .unwrap();
+        assert!(manager.record_request(2), "B RPM 记账应成功");
+        assert!(
+            manager.report_suspended_for_request(1, None, None),
+            "剩余号仅 RPM 打满仍应允许下一轮 acquire"
+        );
+        let snapshot = manager.snapshot();
+        let a = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(a.disabled);
+        assert_eq!(a.disabled_reason.as_deref(), Some("Suspended"));
+        let b = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!b.disabled);
+    }
+
+    #[test]
     fn report_suspended_upgrades_too_many_failures() {
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -6160,6 +6193,63 @@ mod tests {
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
         assert_eq!(consecutive, 0);
         assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_peer_does_not_block_self_heal() {
+        // A 支持目标模型但 TooManyFailures；B 缓存 Unsupported 且启用。
+        // 门闩应跳过 B，自愈 A，而不是 502。
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let mut cred_a = grouped_cred("heal-token", &[]);
+        cred_a.id = Some(1);
+        let mut cred_b = grouped_cred("unsupported-token", &[]);
+        cred_b.id = Some(2);
+        let manager =
+            MultiTokenManager::new(config, vec![cred_a, cred_b], None, None, false).unwrap();
+        seed_model_cache(&manager, 1, &["deepseek-3.2"]);
+        seed_model_cache(&manager, 2, &["glm-5"]);
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        manager
+            .acquire_context(Some("deepseek-3.2"), None)
+            .await
+            .expect("异构池应自愈支持该模型的号，而不是 502");
+        let snapshot = manager.snapshot();
+        let a = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!a.disabled, "A 应被自愈");
+        let b = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!b.disabled, "Unsupported 的 B 不应被误伤");
+    }
+
+    #[tokio::test]
+    async fn unsupported_zero_rpm_peer_does_not_mask_typed_429() {
+        // A 支持但 RPM 打满；B Unsupported 且 rpm_limit=0。
+        // RPM 回退应跳过 B，给出类型化 429，而不是「均已禁用」。
+        let mut cred_a = grouped_cred("rpm-token", &[]);
+        cred_a.id = Some(1);
+        cred_a.rpm_limit = 1;
+        let mut cred_b = grouped_cred("unsupported-token", &[]);
+        cred_b.id = Some(2);
+        cred_b.rpm_limit = 0;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred_a, cred_b], None, None, false)
+                .unwrap();
+        seed_model_cache(&manager, 1, &["deepseek-3.2"]);
+        seed_model_cache(&manager, 2, &["glm-5"]);
+        assert!(manager.record_request(1), "A 首次 RPM 记账应成功");
+
+        let err = match manager.acquire_context(Some("deepseek-3.2"), None).await {
+            Ok(_) => panic!("RPM 打满不应成功获取上下文"),
+            Err(err) => err,
+        };
+        assert!(
+            err.downcast_ref::<UpstreamRateLimitError>().is_some(),
+            "异构池 RPM 打满应为类型化 429，不是均已禁用: {}",
+            err
+        );
     }
 
     #[test]
