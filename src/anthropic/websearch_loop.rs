@@ -1326,10 +1326,8 @@ fn finalize_aggregated_trace(
 
 fn settle_round_failure(
     failure: RoundFailure,
-    hook: UsageRecordHook,
-    tracer: Arc<RequestTracer>,
+    settlement: &mut WebSearchUsageSettlement,
 ) -> Response {
-    let mut settlement = WebSearchUsageSettlement::new(hook, tracer);
     settlement.add(
         failure.credential_id,
         failure.token_usage,
@@ -1357,10 +1355,11 @@ pub(super) async fn run_web_search_loop(
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     if !stream_client {
+        let settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
         return run_web_search_loop_inner(
             provider,
             payload,
-            hook,
+            settlement,
             tracer,
             group,
             tool_compatibility_mode,
@@ -1376,6 +1375,10 @@ pub(super) async fn run_web_search_loop(
         &payload.messages,
         payload.tools.as_deref(),
     ) as i32;
+    // 建连 await 之前建好 settlement:客户端在首轮建连期间断连时 handler
+    // future 被整体 drop,靠 settlement 的 Drop 兜底记一条 interrupted 并
+    // finalize trace,避免该请求零记录。
+    let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let started = match start_round(
         &provider,
         &payload,
@@ -1387,7 +1390,7 @@ pub(super) async fn run_web_search_loop(
     .await
     {
         Ok(started) => started,
-        Err(failure) => return settle_round_failure(failure, hook, tracer),
+        Err(failure) => return settle_round_failure(failure, &mut settlement),
     };
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
@@ -1403,7 +1406,7 @@ pub(super) async fn run_web_search_loop(
             AssertUnwindSafe(run_web_search_loop_inner(
                 provider,
                 payload,
-                hook,
+                settlement,
                 tracer,
                 group,
                 tool_compatibility_mode,
@@ -1444,7 +1447,7 @@ pub(super) async fn run_web_search_loop(
 async fn run_web_search_loop_inner(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
-    hook: UsageRecordHook,
+    mut settlement: WebSearchUsageSettlement,
     tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -1452,7 +1455,6 @@ async fn run_web_search_loop_inner(
     mut first_round: Option<StartedRound>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
-    let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
 
@@ -2096,6 +2098,91 @@ mod tests {
             resp.headers().get(header::RETRY_AFTER).is_some(),
             "首轮 429 必须带 Retry-After"
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_first_connect_records_interrupted_once() {
+        // 挂起的本地代理：接受连接但永不响应，使首轮建连 await 一直 pending。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let mut cred = crate::kiro::model::credentials::KiroCredentials::default();
+        cred.access_token = Some("t".to_string());
+        cred.expires_at =
+            Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        let manager = std::sync::Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![cred],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut endpoints = std::collections::HashMap::new();
+        endpoints.insert(
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string(),
+            std::sync::Arc::new(crate::kiro::endpoint::ide::IdeEndpoint::new())
+                as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        );
+        let provider = std::sync::Arc::new(crate::kiro::provider::KiroProvider::with_proxy(
+            manager,
+            Some(crate::http_client::ProxyConfig::new(format!(
+                "http://{addr}"
+            ))),
+            endpoints,
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string(),
+            None,
+        ));
+
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }))
+        .unwrap();
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: payload.model.clone(),
+            started_at: std::time::Instant::now(),
+        };
+        let tracer = std::sync::Arc::new(RequestTracer::noop(payload.model.clone()));
+
+        // 客户端在首轮建连期间断连 = handler future 被整体 drop。
+        let fut = run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            tracer,
+            true,
+            None,
+            ToolCompatibilityMode::Raw,
+        );
+        let mut fut = Box::pin(fut);
+        let completed = tokio::time::timeout(Duration::from_millis(500), &mut fut).await;
+        assert!(completed.is_err(), "首轮建连应挂起等待代理响应");
+        drop(fut);
+
+        // settlement 在建连 await 前已创建，drop 兜底恰好记一条 interrupted。
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+        assert_eq!(overview.today_input_tokens, 0);
+        assert_eq!(overview.today_output_tokens, 0);
     }
 
     #[tokio::test]

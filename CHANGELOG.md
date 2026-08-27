@@ -28,6 +28,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **禁用状态落盘对称**：额度用尽 / Token 刷新失败 / refreshToken 失效禁用后写回凭据文件，避免重启复活。
 - **流式 web_search 首轮失败保留 HTTP 状态码**：首轮上游失败原样返回（含 429+Retry-After），成功后再切 200+SSE。
 - **主流式断连落账**：客户端中途断开时按 interrupted/error 结算 usage 与 trace（与 web_search loop 口径对齐）。
+- **web_search 建连窗口断连记账**：首轮上游建连等待期间客户端断开也按 interrupted 恰好记账一次并 finalize trace，此前该窗口的请求完全漏记。
 - **代理 failover / 模型发现过滤**：JSON decode 失败不再换代理重放；`rate_limited_until` 冷却中的凭据不进模型发现与分组可用计数。
 
 ### 📚 说明 — 自愈 streak 现状口径
