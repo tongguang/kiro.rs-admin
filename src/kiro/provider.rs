@@ -16,7 +16,7 @@ use crate::admin::trace_db::{TraceAttempt, TraceSink, TraceStage, outcome, trunc
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{UnsupportedModelError, UpstreamRateLimitError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -912,7 +912,7 @@ impl KiroProvider {
             let ctx = match ctx_result {
                 Ok(c) => c,
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_fatal_acquire_error(&e) {
                         Self::emit_attempt(
                             sink,
                             attempt,
@@ -1293,7 +1293,7 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
-                    if is_rate_limit_error(&e) {
+                    if is_fatal_acquire_error(&e) {
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
@@ -2123,6 +2123,10 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
 }
 
+fn is_fatal_acquire_error(error: &anyhow::Error) -> bool {
+    is_rate_limit_error(error) || error.downcast_ref::<UnsupportedModelError>().is_some()
+}
+
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
     if last_error
         .as_ref()
@@ -2223,6 +2227,10 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+        assert!(is_fatal_acquire_error(&error));
+        let unsupported = anyhow::Error::new(UnsupportedModelError::new("glm-5"));
+        assert!(is_fatal_acquire_error(&unsupported));
+        assert!(!is_rate_limit_error(&unsupported));
     }
 }
 

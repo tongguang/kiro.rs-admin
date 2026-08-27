@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{UnsupportedModelError, UpstreamRateLimitError};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
@@ -2215,6 +2215,11 @@ impl MultiTokenManager {
                             UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
                         );
                     }
+                    if let Some(model) = model.filter(|name| !name.is_empty())
+                        && self.all_enabled_matching_unsupported(&entries, Some(model), group)
+                    {
+                        return Err(UnsupportedModelError::new(model).into());
+                    }
                     // 注意：必须在 bail! 之前计算 available_count，
                     // 因为 available_count() 会尝试获取 entries 锁，
                     // 而此时我们已经持有该锁，会导致死锁
@@ -3110,6 +3115,27 @@ impl MultiTokenManager {
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         })
+    }
+
+    /// 启用且匹配该请求的凭据全部为缓存判定 Unsupported（至少一条）。
+    /// 存在 Confirmed/Unknown 的启用匹配凭据时返回 false，避免把冷却中的可用号误报成模型不支持。
+    fn all_enabled_matching_unsupported(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        let mut saw_unsupported = false;
+        for entry in entries {
+            if entry.disabled || !credential_matches_request(&entry.credentials, model, group) {
+                continue;
+            }
+            match self.cached_model_support(entry.id, model) {
+                CachedModelSupport::Unsupported => saw_unsupported = true,
+                CachedModelSupport::Confirmed | CachedModelSupport::Unknown => return false,
+            }
+        }
+        saw_unsupported
     }
 
     /// 受控的凭据自愈。
@@ -6267,6 +6293,30 @@ mod tests {
             "异构池 RPM 打满应为类型化 429，不是均已禁用: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_reports_unsupported_model_when_pool_has_no_match() {
+        let mut cred_a = grouped_cred("a-token", &[]);
+        cred_a.id = Some(1);
+        let mut cred_b = grouped_cred("b-token", &[]);
+        cred_b.id = Some(2);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred_a, cred_b], None, None, false)
+                .unwrap();
+        seed_model_cache(&manager, 1, &["glm-5"]);
+        seed_model_cache(&manager, 2, &["glm-5"]);
+
+        let err = match manager.acquire_context(Some("deepseek-3.2"), None).await {
+            Ok(_) => panic!("池内无该模型不应成功获取上下文"),
+            Err(err) => err,
+        };
+        let typed = err
+            .downcast_ref::<UnsupportedModelError>()
+            .unwrap_or_else(|| panic!("应为类型化模型不支持，实际: {}", err));
+        assert_eq!(typed.model, "deepseek-3.2");
+        assert!(err.to_string().contains("模型不支持"));
+        assert!(!err.to_string().contains("所有凭据均已禁用"));
     }
 
     #[test]

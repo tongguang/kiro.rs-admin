@@ -32,6 +32,21 @@ impl UpstreamRateLimitError {
     }
 }
 
+/// 当前凭据池均不支持请求的模型（新鲜缓存判定为 Unsupported）。
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("模型不支持: {model}")]
+pub struct UnsupportedModelError {
+    pub model: String,
+}
+
+impl UnsupportedModelError {
+    pub(crate) fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+}
+
 fn normalize_retry_after(value: String) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {

@@ -381,6 +381,18 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         return response;
     }
 
+    if let Some(unsupported) = err.downcast_ref::<crate::kiro::error::UnsupportedModelError>() {
+        tracing::warn!(error = %err, "凭据池不支持请求的模型");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("模型不支持: {}", unsupported.model),
+            )),
+        )
+            .into_response();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -2098,6 +2110,13 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn unsupported_model_maps_to_400() {
+        let err = crate::kiro::error::UnsupportedModelError::new("deepseek-3.2");
+        let resp = map_provider_error(err.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
