@@ -49,6 +49,11 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+    /// 凭据分桶明细记录（如 WebSearch 多凭据拆分）：只更新 by_credential /
+    /// by_key_credential 的 token/credits，不参与 overall/by_key/by_model 的
+    /// calls 计数，避免一条客户端请求被回放成多次调用。
+    #[serde(default)]
+    pub credential_detail: bool,
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -193,6 +198,19 @@ impl BucketStats {
         if rec.status != "success" {
             self.errors += 1;
         }
+    }
+
+    /// 凭据明细：累计 token/credits，并给参与凭据记 1 次调用（不计 errors）。
+    ///
+    /// calls 只落在 by_credential / by_key_credential 维度，overall/by_key/by_model
+    /// 仍只靠主记录计数，因此凭据维度的 calls 总和可能大于 overall（多轮各记一次）。
+    fn add_credential_detail(&mut self, rec: &UsageRecord) {
+        self.input_tokens += rec.input_tokens;
+        self.output_tokens += rec.output_tokens;
+        self.cache_creation_tokens += rec.cache_creation_tokens;
+        self.cache_read_tokens += rec.cache_read_tokens;
+        self.credits += rec.credits;
+        self.calls += 1;
     }
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
@@ -623,6 +641,25 @@ fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max
 }
 
 fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
+    // 凭据明细记录只更新凭据维度，不污染 overall/by_key/by_model 的调用数
+    if rec.credential_detail {
+        if rec.credential_id == 0 {
+            return;
+        }
+        bucket
+            .by_credential
+            .entry(rec.credential_id)
+            .or_default()
+            .add_credential_detail(rec);
+        bucket
+            .by_key_credential
+            .entry(rec.key_id)
+            .or_default()
+            .entry(rec.credential_id)
+            .or_default()
+            .add_credential_detail(rec);
+        return;
+    }
     bucket.overall.add(rec);
     bucket.by_key.entry(rec.key_id).or_default().add(rec);
     bucket
@@ -733,6 +770,7 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            credential_detail: false,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -771,6 +809,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            credential_detail: false,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -784,6 +823,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            credential_detail: false,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -838,6 +878,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            credential_detail: false,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -851,6 +892,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            credential_detail: false,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -900,9 +942,63 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            credential_detail: false,
         };
         agg.ingest(&rec);
         let ov = agg.overview();
         assert_eq!(ov.today_errors, 1);
+    }
+
+    #[test]
+    fn credential_detail_updates_credential_buckets_without_double_counting_overall() {
+        let agg = UsageAggregator::new();
+        // 主记录：一次请求，合计用量（credential_id=0 不进凭据分布）
+        let main = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: 0,
+            model: "m".to_string(),
+            input_tokens: 13,
+            output_tokens: 25,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.75,
+            duration_ms: 100,
+            status: "success".to_string(),
+            credential_detail: false,
+        };
+        // 凭据明细：两个凭据各自的拆分
+        let detail = |cid: u64, input: u64, credits: f64| UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: cid,
+            model: "m".to_string(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 100,
+            status: "success".to_string(),
+            credential_detail: true,
+        };
+        agg.ingest(&main);
+        agg.ingest(&detail(7, 3, 0.5));
+        agg.ingest(&detail(8, 10, 0.25));
+
+        // overall / by_key / by_model 只计一次调用
+        let ov = agg.overview();
+        assert_eq!(ov.today_calls, 1);
+        assert_eq!(ov.today_input_tokens, 13);
+
+        // 凭据维度带 token/credits，且每个参与凭据各记 1 次调用
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let by_cred = agg.query_by_credential(window, None, None);
+        let cred7 = by_cred.iter().find(|c| c.credential_id == 7).unwrap();
+        let cred8 = by_cred.iter().find(|c| c.credential_id == 8).unwrap();
+        assert_eq!(cred7.input_tokens, 3);
+        assert_eq!(cred7.calls, 1);
+        assert_eq!(cred8.input_tokens, 10);
+        assert_eq!(cred8.calls, 1);
     }
 }

@@ -93,6 +93,7 @@ impl UsageRecordHook {
             },
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
+            credential_detail: false,
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -111,6 +112,49 @@ impl UsageRecordHook {
                     rec.credits,
                 );
             }
+        }
+    }
+
+    /// 记录按凭据拆分的用量明细（WebSearch 多轮跨凭据故障转移）。
+    ///
+    /// 只写 recorder / aggregator 的凭据维度，不重复累计 overall / client key
+    /// 总量与调用数——一次客户端请求的总调用数仍由 [`Self::record`] 记一次。
+    pub fn record_credential_detail(
+        &self,
+        credential_id: u64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation_tokens: i32,
+        cache_read_tokens: i32,
+        credits: f64,
+        status: &str,
+    ) {
+        if credential_id == 0 {
+            return;
+        }
+        let rec = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: self.key_id,
+            credential_id,
+            model: self.model.clone(),
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: cache_read_tokens.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
+            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            status: status.to_string(),
+            credential_detail: true,
+        };
+        if let Some(r) = &self.recorder {
+            r.record(&rec);
+        }
+        if let Some(a) = &self.aggregator {
+            a.ingest(&rec);
         }
     }
 }
@@ -567,6 +611,24 @@ pub async fn get_models(
                 )),
             )
                 .into_response();
+        }
+        Err(crate::kiro::token_manager::ModelDiscoveryError::RateLimited { retry_after }) => {
+            tracing::warn!("动态模型列表加载被上游限流");
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new(
+                    "rate_limit_error",
+                    "Upstream rate limit exceeded. Retry later.",
+                )),
+            )
+                .into_response();
+            if let Some(value) = retry_after
+                .as_deref()
+                .and_then(|value| value.parse::<header::HeaderValue>().ok())
+            {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return response;
         }
         Err(error @ crate::kiro::token_manager::ModelDiscoveryError::ColdStartFailed { .. }) => {
             tracing::warn!("动态模型列表加载失败: {}", error);
@@ -2025,17 +2087,13 @@ mod tests {
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).unwrap(),
-            "1800"
-        );
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1800");
     }
 
     #[test]
     fn upstream_rate_limit_drops_invalid_retry_after() {
-        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
-            "not-a-retry-delay".to_string(),
-        ));
+        let err =
+            crate::kiro::error::UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);

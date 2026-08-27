@@ -57,9 +57,7 @@ use super::parse::{
 };
 use crate::anthropic::handlers::post_messages;
 use crate::anthropic::middleware::{AppState, KeyContext};
-use crate::anthropic::types::{
-    Message, MessagesRequest, Metadata, SystemMessage, Thinking, Tool,
-};
+use crate::anthropic::types::{Message, MessagesRequest, Metadata, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -205,24 +203,70 @@ impl ResponsesResponseConfig {
 /// 本响应 output items 的拼接，下一轮直接作为 input 前缀回放）。
 #[derive(Clone)]
 struct StoredResponse {
+    owner_key_id: u64,
     response: Value,
     items: Vec<Value>,
 }
 
 const MAX_STORED_RESPONSES: usize = 512;
+/// 单条存储上限：超限则跳过 store（续接时表现为 not found）。
+const MAX_STORED_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 static RESPONSES_STORE: OnceLock<RwLock<LruCache<String, StoredResponse>>> = OnceLock::new();
 
 fn responses_store() -> &'static RwLock<LruCache<String, StoredResponse>> {
     RESPONSES_STORE.get_or_init(|| {
-        RwLock::new(LruCache::new(NonZeroUsize::new(MAX_STORED_RESPONSES).unwrap()))
+        RwLock::new(LruCache::new(
+            NonZeroUsize::new(MAX_STORED_RESPONSES).unwrap(),
+        ))
     })
 }
 
-fn save_response(id: String, response: Value, items: Vec<Value>) {
-    responses_store()
-        .write()
-        .put(id, StoredResponse { response, items });
+fn stored_response_size(response: &Value, items: &[Value]) -> usize {
+    serde_json::to_vec(&json!({ "response": response, "items": items }))
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn save_response(id: String, owner_key_id: u64, response: Value, items: Vec<Value>) {
+    if id.is_empty() {
+        return;
+    }
+    let size = stored_response_size(&response, &items);
+    if size > MAX_STORED_RESPONSE_BYTES {
+        tracing::warn!(
+            id = %id,
+            size,
+            cap = MAX_STORED_RESPONSE_BYTES,
+            "skipping responses store: entry exceeds size cap"
+        );
+        return;
+    }
+    responses_store().write().put(
+        id,
+        StoredResponse {
+            owner_key_id,
+            response,
+            items,
+        },
+    );
+}
+
+/// 命中且归属当前 Key 才返回；不匹配时当作不存在（避免 403 泄露 id）。
+fn load_owned_response(id: &str, key_id: u64) -> Option<StoredResponse> {
+    let stored = responses_store().write().get(id).cloned()?;
+    if stored.owner_key_id != key_id {
+        return None;
+    }
+    Some(stored)
+}
+
+fn delete_owned_response(id: &str, key_id: u64) -> bool {
+    let mut store = responses_store().write();
+    match store.peek(id) {
+        Some(stored) if stored.owner_key_id == key_id => store.pop(id).is_some(),
+        _ => false,
+    }
 }
 
 /// 把请求 input 归一化为 item 数组（字符串 input 包装成单条 user message）。
@@ -241,9 +285,11 @@ fn input_as_items(input: &Value) -> Vec<Value> {
 }
 
 /// GET /v1/responses/{id}
-pub async fn get_response(Path(id): Path<String>) -> Response {
-    let stored = responses_store().write().get(&id).cloned();
-    if let Some(stored) = stored {
+pub async fn get_response(
+    Path(id): Path<String>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> Response {
+    if let Some(stored) = load_owned_response(&id, key_ctx.key_id) {
         return (StatusCode::OK, Json(stored.response)).into_response();
     }
     responses_error(
@@ -254,10 +300,13 @@ pub async fn get_response(Path(id): Path<String>) -> Response {
 }
 
 /// DELETE /v1/responses/{id}
-pub async fn delete_response(Path(id): Path<String>) -> Response {
-    let deleted = responses_store().write().pop(&id).is_some();
+pub async fn delete_response(
+    Path(id): Path<String>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> Response {
+    let deleted = delete_owned_response(&id, key_ctx.key_id);
     if !deleted {
-        // 与 OpenAI 契约及 get_response 一致：未命中返回 404 错误信封
+        // 与 OpenAI 契约及 get_response 一致：未命中（含他 Key 持有）返回 404
         return responses_error(
             StatusCode::NOT_FOUND,
             "invalid_request_error",
@@ -292,12 +341,12 @@ pub async fn post_responses(
     let store_response = req.store.unwrap_or(true);
     let previous_response_id = req.previous_response_id.clone();
     let request_metadata = req.metadata.clone();
+    let owner_key_id = key_ctx.key_id;
 
     // previous_response_id 续接：取出历史链（input + output items）作为本次 input 前缀
     let mut chained_items: Vec<Value> = Vec::new();
     if let Some(prev_id) = previous_response_id.as_deref() {
-        let stored = responses_store().write().get(prev_id).cloned();
-        match stored {
+        match load_owned_response(prev_id, owner_key_id) {
             Some(stored) => chained_items = stored.items,
             None => {
                 return responses_error(
@@ -362,6 +411,7 @@ pub async fn post_responses(
             response_config,
             StreamStorePlan {
                 enabled: store_response,
+                owner_key_id,
                 previous_response_id,
                 metadata: request_metadata,
                 input_items: full_input_items,
@@ -409,9 +459,7 @@ pub async fn post_responses(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if !id.is_empty() {
-            save_response(id, body.clone(), items);
-        }
+        save_response(id, owner_key_id, body.clone(), items);
     }
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -821,7 +869,7 @@ fn translate_input_item(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let content = stringify_output(item.get("output"));
+            let content = convert_tool_output(item.get("output"))?;
             let block = json!({
                 "type": "tool_result",
                 "tool_use_id": call_id,
@@ -921,13 +969,60 @@ fn image_block(part: &Value) -> Option<Value> {
     }))
 }
 
-/// function_call_output.output 归一化为字符串
-fn stringify_output(output: Option<&Value>) -> String {
+/// function_call_output.output 转 Anthropic tool_result.content。
+/// 字符串保持原样；纯文本数组仍拼成字符串；图片块复用 `image_block`；
+/// 文件或无法表示的类型明确报错，避免静默变成空串。
+fn convert_tool_output(output: Option<&Value>) -> Result<Value, String> {
     match output {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(_)) => collect_text_strings(output).join("\n"),
-        Some(other) => other.to_string(),
-        None => String::new(),
+        Some(Value::String(s)) => Ok(json!(s)),
+        Some(Value::Array(parts)) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                let ty = part.get("type").and_then(Value::as_str).unwrap_or("");
+                match ty {
+                    "input_text" | "output_text" | "text" | "" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    "input_image" | "image" => {
+                        let Some(block) = image_block(part) else {
+                            return Err(
+                                "function_call_output image part is missing image_url".to_string()
+                            );
+                        };
+                        blocks.push(block);
+                    }
+                    "input_file" | "file" => {
+                        return Err(
+                            "function_call_output file content is not supported".to_string()
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported function_call_output content type: {other}"
+                        ));
+                    }
+                }
+            }
+            if blocks
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            {
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(json!(text))
+            } else {
+                Ok(Value::Array(blocks))
+            }
+        }
+        Some(other) => Ok(json!(other.to_string())),
+        None => Ok(json!("")),
     }
 }
 
@@ -1888,6 +1983,7 @@ impl ResponsesStreamContext {
 
 struct StreamStorePlan {
     enabled: bool,
+    owner_key_id: u64,
     previous_response_id: Option<String>,
     metadata: Option<Value>,
     input_items: Vec<Value>,
@@ -1898,6 +1994,7 @@ impl StreamStorePlan {
     fn disabled() -> Self {
         Self {
             enabled: false,
+            owner_key_id: 0,
             previous_response_id: None,
             metadata: None,
             input_items: Vec::new(),
@@ -1943,7 +2040,12 @@ fn responses_streaming_response(
                             if let Some(output) = response.get("output").and_then(Value::as_array) {
                                 items.extend(output.iter().cloned());
                             }
-                            save_response(response["id"].as_str().unwrap_or_default().to_string(), response, items);
+                            save_response(
+                                response["id"].as_str().unwrap_or_default().to_string(),
+                                store_plan.owner_key_id,
+                                response,
+                                items,
+                            );
                         }
                     }
                     return None;
@@ -2303,6 +2405,16 @@ fn responses_error(status: StatusCode, err_type: &str, message: &str) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::trace_db::TraceKeySource;
+    use crate::anthropic::types::Thinking;
+
+    fn test_key(id: u64) -> Extension<KeyContext> {
+        Extension(KeyContext {
+            key_id: id,
+            group: None,
+            key_source: TraceKeySource::ClientKey,
+        })
+    }
 
     // ---- 测试辅助 ----
 
@@ -2936,8 +3048,81 @@ mod tests {
 
     #[tokio::test]
     async fn delete_response_returns_404_for_missing_id() {
-        let resp = delete_response(Path("resp_does_not_exist_000".to_string())).await;
+        let resp = delete_response(Path("resp_does_not_exist_000".to_string()), test_key(1)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stored_response_is_isolated_by_owner_key() {
+        let id = "resp_owner_isolation_test".to_string();
+        save_response(
+            id.clone(),
+            7,
+            json!({"id": id, "object": "response"}),
+            vec![json!({"type": "message", "role": "user", "content": "secret"})],
+        );
+
+        let foreign_get = get_response(Path(id.clone()), test_key(8)).await;
+        assert_eq!(foreign_get.status(), StatusCode::NOT_FOUND);
+        let foreign_delete = delete_response(Path(id.clone()), test_key(8)).await;
+        assert_eq!(foreign_delete.status(), StatusCode::NOT_FOUND);
+        assert!(load_owned_response(&id, 8).is_none());
+        assert!(load_owned_response(&id, 7).is_some());
+
+        let owner_get = get_response(Path(id.clone()), test_key(7)).await;
+        assert_eq!(owner_get.status(), StatusCode::OK);
+        assert!(delete_owned_response(&id, 7));
+    }
+
+    #[test]
+    fn oversized_response_is_not_stored() {
+        let id = "resp_too_large_for_store".to_string();
+        let blob = "x".repeat(MAX_STORED_RESPONSE_BYTES + 1);
+        save_response(id.clone(), 1, json!({"id": id, "blob": blob}), Vec::new());
+        assert!(
+            load_owned_response(&id, 1).is_none(),
+            "entries over the byte cap must not be stored"
+        );
+    }
+
+    #[test]
+    fn function_call_output_array_converts_images() {
+        let req = req_with(
+            json!([{ "type": "function", "name": "vision", "parameters": {} }]),
+            json!([
+                { "type": "message", "role": "user", "content": "look" },
+                { "type": "function_call", "call_id": "f1", "name": "vision",
+                  "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "f1",
+                  "output": [
+                      { "type": "output_text", "text": "see" },
+                      { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+                  ] },
+            ]),
+        );
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let content = anth.messages[2].content.as_array().unwrap()[0]["content"]
+            .as_array()
+            .expect("mixed tool output should become content blocks");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "see");
+        assert_eq!(content[1]["type"], "image");
+    }
+
+    #[test]
+    fn function_call_output_file_array_is_rejected() {
+        let req = req_with(
+            json!([{ "type": "function", "name": "read", "parameters": {} }]),
+            json!([
+                { "type": "message", "role": "user", "content": "file" },
+                { "type": "function_call", "call_id": "f1", "name": "read",
+                  "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "f1",
+                  "output": [{ "type": "input_file", "filename": "a.pdf" }] },
+            ]),
+        );
+        let err = responses_to_anthropic(req, None).unwrap_err();
+        assert!(err.contains("file content is not supported"));
     }
 
     // ---- 请求方向：input item 回放 ----

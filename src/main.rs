@@ -15,7 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use kiro::endpoint::{
     AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
-    RuntimeEndpoint, RuntimeCliEndpoint,
+    RuntimeCliEndpoint, RuntimeEndpoint,
 };
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -180,7 +180,9 @@ async fn main() {
             config.account_throttle_cooldown_secs
         );
     } else {
-        tracing::info!("账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）");
+        tracing::info!(
+            "账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）"
+        );
     }
 
     // 创建 MultiTokenManager 和 KiroProvider

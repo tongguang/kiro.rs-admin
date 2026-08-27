@@ -584,7 +584,7 @@ impl Config {
         self.config_path.as_deref()
     }
 
-    /// 将当前配置写回原始配置文件
+    /// 将当前配置写回原始配置文件（同目录临时文件 + rename 原子替换）
     pub fn save(&self) -> anyhow::Result<()> {
         let path = self
             .config_path
@@ -592,10 +592,38 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        let tmp = path.with_extension("json.tmp");
+        let write_result = fs::write(&tmp, &content).and_then(|()| fs::rename(&tmp, path));
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("写入配置文件失败: {}", path.display()));
+        }
         Ok(())
     }
+
+    /// 进程内共享写锁下的「重新加载 → 修改 → 原子保存」。
+    ///
+    /// 所有运行时配置写盘统一走这里，避免并发 setter 之间读改写互相覆盖。
+    pub fn update_file<P: AsRef<Path>>(
+        path: P,
+        updater: impl FnOnce(&mut Config),
+    ) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let _guard = config_file_write_lock().lock();
+        let mut config =
+            Self::load(path).with_context(|| format!("重新加载配置失败: {}", path.display()))?;
+        updater(&mut config);
+        config
+            .save()
+            .with_context(|| format!("持久化配置失败: {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// 全进程共享的 config 文件写锁（覆盖 load-modify-save 整个临界区）。
+fn config_file_write_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    &LOCK
 }
 
 #[cfg(test)]
@@ -632,5 +660,51 @@ mod tests {
         assert!(!config.self_heal_enabled);
         assert_eq!(config.self_heal_min_interval_secs, 60);
         assert_eq!(config.self_heal_max_consecutive_rounds, 0);
+    }
+
+    #[test]
+    fn concurrent_update_file_preserves_all_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-config-lock-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        Config::load(&path).unwrap().save().unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for (interval, rounds) in [(123_u64, 7_u32), (456, 9)] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                Config::update_file(&path, move |config| {
+                    config.self_heal_min_interval_secs = interval;
+                    config.self_heal_max_consecutive_rounds = rounds;
+                })
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // 后写者基于先写者的落盘结果继续修改：两个字段都必须来自最后一次写入，
+        // 关键是任何一次写入都不能丢失另一线程已保存的字段。
+        let persisted = Config::load(&path).unwrap();
+        assert!(
+            (persisted.self_heal_min_interval_secs == 123
+                && persisted.self_heal_max_consecutive_rounds == 7)
+                || (persisted.self_heal_min_interval_secs == 456
+                    && persisted.self_heal_max_consecutive_rounds == 9),
+            "并发更新不得出现字段混杂: interval={} rounds={}",
+            persisted.self_heal_min_interval_secs,
+            persisted.self_heal_max_consecutive_rounds
+        );
+        assert!(!dir.join("config.json.tmp").exists(), "不得残留临时文件");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

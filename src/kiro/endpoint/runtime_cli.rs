@@ -40,8 +40,7 @@ impl RuntimeCliEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version,
-            ctx.config.kiro_version,
+            ctx.config.system_version, ctx.config.kiro_version,
         )
     }
 
@@ -147,7 +146,10 @@ mod tests {
             machine_id: "machine",
             config: &config,
         };
-        assert_eq!(endpoint.api_url(&ctx), "https://runtime.us-east-1.kiro.dev/");
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://runtime.us-east-1.kiro.dev/"
+        );
         assert_eq!(endpoint.content_type(), "application/x-amz-json-1.0");
         // 降级链回切同协议的 cli，绝不跨到 IDE 协议
         assert_eq!(

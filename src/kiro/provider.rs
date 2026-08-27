@@ -163,7 +163,7 @@ fn readable_response_snippet_from_bytes(body: &[u8]) -> Option<String> {
 }
 
 fn should_try_next_proxy(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 407 | 502 | 503 | 504)
+    crate::http_client::ProxyConfig::should_try_next_proxy_status(status.as_u16())
 }
 
 /// Kiro API Provider
@@ -946,8 +946,15 @@ impl KiroProvider {
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
 
             // RPM 记账：本会话首次用到该凭据才记 1 次；原子预留失败（额度被并发
-            // 请求抢先占用）则排除该凭据重新选择。
+            // 请求抢先占用）则排除该凭据重新选择。写入类型化 429 last_error，
+            // 避免最后一轮抢占后返回泛化的「达到最大重试次数」502。
             if !state.reserve_rpm(&self.token_manager, ctx.id) {
+                let retry_after = self
+                    .token_manager
+                    .rpm_retry_after_for_credential(ctx.id)
+                    .unwrap_or(1);
+                last_error =
+                    Some(UpstreamRateLimitError::new(Some(retry_after.to_string())).into());
                 continue;
             }
 
@@ -1086,8 +1093,11 @@ impl KiroProvider {
                     if !has_available {
                         anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                     }
-                    last_error =
-                        Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（账号封禁）: {} {}",
+                        status,
+                        body
+                    ));
                     continue;
                 }
 
@@ -1103,7 +1113,9 @@ impl KiroProvider {
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !state.force_refreshed.contains(&ctx.id) {
+                if endpoint.is_bearer_token_invalid(&body)
+                    && !state.force_refreshed.contains(&ctx.id)
+                {
                     state.force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if Self::handle_force_refresh_result(
@@ -1165,7 +1177,8 @@ impl KiroProvider {
                             ));
                             continue;
                         }
-                        Ordinary429Outcome::FailoverKeepCurrent | Ordinary429Outcome::NotSwitched => {}
+                        Ordinary429Outcome::FailoverKeepCurrent
+                        | Ordinary429Outcome::NotSwitched => {}
                     }
                 }
 
@@ -1297,7 +1310,14 @@ impl KiroProvider {
 
             // RPM 记账：本会话首次用到该凭据才记 1 次（同凭据重试不再记）；
             // 原子预留失败（额度被并发请求抢先占用）则排除该凭据重新选择。
+            // 写入类型化 429 last_error，避免最后一轮抢占后返回泛化 502。
             if !state.reserve_rpm(&self.token_manager, ctx.id) {
+                let retry_after = self
+                    .token_manager
+                    .rpm_retry_after_for_credential(ctx.id)
+                    .unwrap_or(1);
+                last_error =
+                    Some(UpstreamRateLimitError::new(Some(retry_after.to_string())).into());
                 continue;
             }
 
@@ -1527,7 +1547,9 @@ impl KiroProvider {
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !state.force_refreshed.contains(&ctx.id) {
+                if endpoint.is_bearer_token_invalid(&body)
+                    && !state.force_refreshed.contains(&ctx.id)
+                {
                     state.force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if Self::handle_force_refresh_result(
@@ -1569,8 +1591,14 @@ impl KiroProvider {
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1579,14 +1607,16 @@ impl KiroProvider {
             // 放大客户端等待时间和 Claude 端 Retrying 轮数；快速返回，让客户端下一次调用重新建连。
             // 同样必须在多端点降级链之前拦截。
             if status.as_u16() == 524 || endpoint.is_gateway_timeout(&body) {
-                tracing::warn!(
-                    "API 请求失败（上游网关超时，不重试）: {} {}",
-                    status,
-                    body
-                );
+                tracing::warn!("API 请求失败（上游网关超时，不重试）: {} {}", status, body);
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
@@ -1610,7 +1640,11 @@ impl KiroProvider {
                     && self.token_manager.get_account_throttle_failover()
                     && endpoint.is_account_throttled(&body);
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
                     if account_throttled {
                         outcome::ACCOUNT_THROTTLED
                     } else {
@@ -1648,8 +1682,14 @@ impl KiroProvider {
                         Ok(fb_resp) if fb_resp.status().is_success() => {
                             let fb_status = fb_resp.status();
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
-                                outcome::SUCCESS, None, fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::SUCCESS,
+                                None,
+                                fb_start,
                             );
                             self.token_manager
                                 .report_success_for_request(ctx.id, model.as_deref());
@@ -1668,8 +1708,14 @@ impl KiroProvider {
                             let fb_status = fb_resp.status();
                             let fb_body = fb_resp.text().await.unwrap_or_default();
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
-                                outcome::TRANSIENT, Some(&fb_body), fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                Some(fb_status.as_u16()),
+                                outcome::TRANSIENT,
+                                Some(&fb_body),
+                                fb_start,
                             );
                             tracing::warn!(
                                 "备用端点 [{}] 也失败（{}），尝试链中下一个桶",
@@ -1679,8 +1725,14 @@ impl KiroProvider {
                         }
                         Err(e) => {
                             Self::emit_attempt(
-                                sink, attempt, ctx.id, fb_name, None,
-                                outcome::NETWORK_ERROR, Some(&e.to_string()), fb_start,
+                                sink,
+                                attempt,
+                                ctx.id,
+                                fb_name,
+                                None,
+                                outcome::NETWORK_ERROR,
+                                Some(&e.to_string()),
+                                fb_start,
                             );
                             tracing::warn!(
                                 "备用端点 [{}] 请求发送失败（{}），尝试链中下一个桶",
@@ -1755,14 +1807,12 @@ impl KiroProvider {
                     body
                 );
 
-                let remaining = self
-                    .token_manager
-                    .report_account_throttled_for_request(
-                        ctx.id,
-                        cooldown,
-                        model.as_deref(),
-                        group,
-                    );
+                let remaining = self.token_manager.report_account_throttled_for_request(
+                    ctx.id,
+                    cooldown,
+                    model.as_deref(),
+                    group,
+                );
                 // 本跳 trace 已在上方降级链入口发射，此处只处理冷却与错误传播。
                 // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
                 // 让下游网关在同一时段内也停止调度该虚拟账号。
@@ -2130,10 +2180,8 @@ mod rate_limit_tests {
 
     #[test]
     fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
-            Some(UpstreamRateLimitError::new(None)),
-            300,
-        );
+        let (error, must_wait) =
+            account_rate_limit_with_fallback(Some(UpstreamRateLimitError::new(None)), 300);
 
         assert_eq!(error.retry_after(), Some("300"));
         assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");
@@ -2275,15 +2323,15 @@ mod credential_retry_tests {
         let mut state = CredentialRetryState::default();
         assert!(state.reserve_rpm(&manager, 1));
         assert!(state.reserve_rpm(&manager, 1), "同凭据重试不再重复记账");
-        assert!(!manager.record_request(1), "只记了 1 次 tick：窗口 1/1 已满");
+        assert!(
+            !manager.record_request(1),
+            "只记了 1 次 tick：窗口 1/1 已满"
+        );
     }
 
     #[test]
     fn switch_on_429_switched_writes_cooldown_outside_failover() {
-        let manager = manager_with(vec![
-            KiroCredentials::default(),
-            KiroCredentials::default(),
-        ]);
+        let manager = manager_with(vec![KiroCredentials::default(), KiroCredentials::default()]);
         let mut state = CredentialRetryState::default();
 
         let outcome = state.switch_credential_on_ordinary_429(
@@ -2308,10 +2356,7 @@ mod credential_retry_tests {
 
     #[test]
     fn switch_on_429_failover_switched_without_cooldown() {
-        let manager = manager_with(vec![
-            KiroCredentials::default(),
-            KiroCredentials::default(),
-        ]);
+        let manager = manager_with(vec![KiroCredentials::default(), KiroCredentials::default()]);
         let mut state = CredentialRetryState::default();
 
         let outcome = state.switch_credential_on_ordinary_429(
@@ -2367,15 +2412,15 @@ mod credential_retry_tests {
             None,
         );
         assert_eq!(outcome, Ordinary429Outcome::NotSwitched);
-        assert!(state.throttled_ids.is_empty(), "非 Failover 无可用时清空排除集");
+        assert!(
+            state.throttled_ids.is_empty(),
+            "非 Failover 无可用时清空排除集"
+        );
     }
 
     #[test]
     fn switch_on_429_disabled_switch_leaves_state_untouched() {
-        let manager = manager_with(vec![
-            KiroCredentials::default(),
-            KiroCredentials::default(),
-        ]);
+        let manager = manager_with(vec![KiroCredentials::default(), KiroCredentials::default()]);
         let mut state = CredentialRetryState::default();
 
         let outcome = state.switch_credential_on_ordinary_429(
@@ -2388,6 +2433,9 @@ mod credential_retry_tests {
             None,
         );
         assert_eq!(outcome, Ordinary429Outcome::NotSwitched);
-        assert!(state.throttled_ids.is_empty(), "未开换号开关时不排除任何凭据");
+        assert!(
+            state.throttled_ids.is_empty(),
+            "未开换号开关时不排除任何凭据"
+        );
     }
 }

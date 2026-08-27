@@ -779,9 +779,10 @@ fn record_aggregated_usage(
 struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
     tracer: Option<Arc<RequestTracer>>,
-    credential_id: u64,
     usage: TokenUsage,
     credits: f64,
+    /// 按凭据拆分的用量（跨轮故障转移时各轮可能命中不同凭据）。
+    by_credential: std::collections::HashMap<u64, (TokenUsage, f64)>,
     settled: bool,
 }
 
@@ -790,9 +791,9 @@ impl WebSearchUsageSettlement {
         Self {
             hook,
             tracer: Some(tracer),
-            credential_id: 0,
             usage: TokenUsage::default(),
             credits: 0.0,
+            by_credential: std::collections::HashMap::new(),
             settled: false,
         }
     }
@@ -802,25 +803,35 @@ impl WebSearchUsageSettlement {
         Self {
             hook,
             tracer: None,
-            credential_id: 0,
             usage: TokenUsage::default(),
             credits: 0.0,
+            by_credential: std::collections::HashMap::new(),
             settled: false,
         }
     }
 
     fn add(&mut self, credential_id: u64, usage: TokenUsage, credits: f64) {
-        if credential_id != 0 {
-            self.credential_id = credential_id;
-        }
+        let credits = if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        };
         self.usage = self.usage.saturating_add(usage);
-        if credits.is_finite() && credits > 0.0 {
-            self.credits += credits;
+        self.credits += credits;
+        if credential_id != 0 {
+            let entry = self.by_credential.entry(credential_id).or_default();
+            entry.0 = entry.0.saturating_add(usage);
+            entry.1 += credits;
         }
     }
 
     fn usage(&self) -> TokenUsage {
         self.usage.sanitized()
+    }
+
+    /// 跨轮累计的 credits（响应 credit_usage 口径，与内部统计一致）。
+    fn credits(&self) -> f64 {
+        self.credits
     }
 
     fn finish(
@@ -833,13 +844,22 @@ impl WebSearchUsageSettlement {
         if self.settled {
             return;
         }
-        record_aggregated_usage(
-            &self.hook,
-            self.credential_id,
-            self.usage,
-            self.credits,
-            usage_status,
-        );
+        // 总请求只记一次（credential_id=0，不算入凭据分布），保证
+        // overall/by_key/by_model 的 calls 不因多轮而放大。
+        record_aggregated_usage(&self.hook, 0, self.usage, self.credits, usage_status);
+        // 按凭据明细各记一次：仅更新凭据维度，不重复计调用数。
+        for (credential_id, (usage, credits)) in &self.by_credential {
+            let usage = usage.sanitized();
+            self.hook.record_credential_detail(
+                *credential_id,
+                usage.uncached_input_tokens,
+                usage.output_tokens,
+                usage.cache_write_input_tokens,
+                usage.cache_read_input_tokens,
+                *credits,
+                usage_status,
+            );
+        }
         if let Some(tracer) = &self.tracer {
             finalize_aggregated_trace(
                 tracer,
@@ -1560,6 +1580,13 @@ async fn run_web_search_loop_inner(
         );
 
         let final_usage = settlement.usage();
+        // 响应 credit_usage 用跨轮累计值（与内部统计同口径），
+        // unit / unit_plural 仍取最后一次 metering event。
+        let total_credits = settlement.credits();
+        let mut response_metering = latest_metering.clone();
+        if let Some(metering) = response_metering.as_mut() {
+            metering.usage = total_credits;
+        }
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {
@@ -1569,7 +1596,7 @@ async fn run_web_search_loop_inner(
                     &stop_reason,
                     final_usage,
                     &all_thinking,
-                    latest_metering.as_ref(),
+                    response_metering.as_ref(),
                 )
                 .await;
             StatusCode::OK.into_response()
@@ -1580,7 +1607,7 @@ async fn run_web_search_loop_inner(
                 &stop_reason,
                 final_usage,
                 &all_thinking,
-                latest_metering.as_ref(),
+                response_metering.as_ref(),
             )
         };
     }
@@ -2137,6 +2164,74 @@ mod tests {
         assert_eq!(overview.today_input_tokens, 3);
         assert_eq!(overview.today_output_tokens, 5);
         assert_eq!(overview.today_credits, 0.75);
+    }
+
+    #[tokio::test]
+    async fn settlement_attributes_usage_per_credential_without_double_counting_calls() {
+        use crate::admin::usage_stats::{Range, StatsGranularity, StatsQueryWindow};
+
+        let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(
+            7,
+            TokenUsage {
+                uncached_input_tokens: 3,
+                output_tokens: 5,
+                ..TokenUsage::default()
+            },
+            0.5,
+        );
+        settlement.add(
+            8,
+            TokenUsage {
+                uncached_input_tokens: 10,
+                output_tokens: 20,
+                ..TokenUsage::default()
+            },
+            0.25,
+        );
+        settlement.finish("success", "success", None, None);
+
+        // 一条客户端请求只计一次调用，token/credits 为跨轮合计
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_input_tokens, 13);
+        assert_eq!(overview.today_output_tokens, 25);
+        assert!((overview.today_credits - 0.75).abs() < 1e-9);
+
+        // 凭据维度按轮各自归因，不被最后一个凭据吞掉
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let by_cred = aggregator.query_by_credential(window, None, None);
+        let cred7 = by_cred.iter().find(|c| c.credential_id == 7).unwrap();
+        let cred8 = by_cred.iter().find(|c| c.credential_id == 8).unwrap();
+        assert_eq!(cred7.input_tokens, 3);
+        assert_eq!(cred7.output_tokens, 5);
+        assert_eq!(cred8.input_tokens, 10);
+        assert_eq!(cred8.output_tokens, 20);
+    }
+
+    #[test]
+    fn settlement_credits_accumulate_across_rounds() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(1, TokenUsage::default(), 0.5);
+        settlement.add(2, TokenUsage::default(), 0.25);
+        assert!((settlement.credits() - 0.75).abs() < 1e-9);
     }
 
     #[tokio::test]

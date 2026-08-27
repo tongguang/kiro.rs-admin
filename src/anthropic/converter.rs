@@ -2119,7 +2119,10 @@ mod tests {
     fn test_map_model_gpt_5_6_family() {
         // Kiro serves the GPT-5.6 family; ids pass through verbatim.
         assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
         assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
         assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
     }

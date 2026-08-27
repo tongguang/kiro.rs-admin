@@ -66,6 +66,11 @@ impl ProxyConfig {
             || value.starts_with("socks4://")
     }
 
+    /// 与数据面故障转移同口径：仅这些 HTTP 状态值得换下一个代理候选。
+    pub fn should_try_next_proxy_status(status: u16) -> bool {
+        matches!(status, 407 | 502 | 503 | 504)
+    }
+
     pub fn from_url_with_auth(
         url: impl Into<String>,
         username: Option<&str>,
@@ -199,6 +204,18 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890, direct");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_should_try_next_proxy_status() {
+        assert!(ProxyConfig::should_try_next_proxy_status(407));
+        assert!(ProxyConfig::should_try_next_proxy_status(502));
+        assert!(ProxyConfig::should_try_next_proxy_status(503));
+        assert!(ProxyConfig::should_try_next_proxy_status(504));
+        assert!(!ProxyConfig::should_try_next_proxy_status(401));
+        assert!(!ProxyConfig::should_try_next_proxy_status(403));
+        assert!(!ProxyConfig::should_try_next_proxy_status(429));
+        assert!(!ProxyConfig::should_try_next_proxy_status(400));
     }
 
     #[test]

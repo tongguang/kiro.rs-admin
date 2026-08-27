@@ -993,7 +993,11 @@ pub struct StartIdcLoginResponse {
 /// 得到 `undefined`（Kiro Hosted 登录成功 toast 显示"已添加凭据 #undefined"，
 /// 二段登录 `nextUrl` 链接也拿不到）。
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "status")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status"
+)]
 pub enum PollIdcLoginResponse {
     #[serde(rename = "pending")]
     Pending,
@@ -1307,8 +1311,8 @@ mod tests {
     /// `rename_all_fields`，否则前端拿到 undefined（toast 显示"已添加凭据 #undefined"）。
     #[test]
     fn poll_login_response_serializes_fields_as_camel_case() {
-        let success = serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 })
-            .unwrap();
+        let success =
+            serde_json::to_value(PollIdcLoginResponse::Success { credential_id: 7 }).unwrap();
         assert_eq!(success["status"], "success");
         assert_eq!(success["credentialId"], 7);
         assert!(success.get("credential_id").is_none());

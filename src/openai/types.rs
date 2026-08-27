@@ -128,10 +128,8 @@ pub fn chat_to_anthropic(
         return Err(err("messages must contain at least one non-system message"));
     }
 
-    let (thinking, output_config) = openai_reasoning_to_anthropic(
-        req.reasoning_effort.as_deref(),
-        req.reasoning.as_ref(),
-    );
+    let (thinking, output_config) =
+        openai_reasoning_to_anthropic(req.reasoning_effort.as_deref(), req.reasoning.as_ref());
 
     let tools = convert_openai_tools(&req.tools);
     // OpenAI/Codex 客户端带 web_search 时强制走 agentic loop：纯快速路径恒返回 SSE 且
@@ -541,7 +539,11 @@ pub fn content_to_text(content: &Value) -> String {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
         Value::Number(_) | Value::Bool(_) => content.to_string(),
-        Value::Array(items) => items.iter().map(content_to_text).collect::<Vec<_>>().join(""),
+        Value::Array(items) => items
+            .iter()
+            .map(content_to_text)
+            .collect::<Vec<_>>()
+            .join(""),
         Value::Object(obj) => {
             if let Some(text) = obj.get("text").and_then(Value::as_str) {
                 return text.to_string();

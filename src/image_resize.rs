@@ -227,7 +227,11 @@ pub fn estimate_image_tokens(media_type: &str, data_base64: &str) -> u32 {
 
 /// 实际的尺寸探测 + token 估算（不含缓存）。
 fn estimate_image_tokens_uncached(media_type: &str, data_base64: &str) -> u32 {
-    let format = media_type.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    let format = media_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let Some((w, h)) = peek_dimensions(&format, data_base64) else {
         return IMAGE_TOKEN_FALLBACK;
     };

@@ -1629,7 +1629,8 @@ impl StreamContext {
                     usage = metering.usage,
                     unit = metering.unit.as_deref().unwrap_or_default(),
                     unit_plural = metering.unit_plural.as_deref().unwrap_or_default(),
-                    "metering credits +{:.6}", metering.usage
+                    "metering credits +{:.6}",
+                    metering.usage
                 );
                 // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
                 // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
@@ -5546,10 +5547,8 @@ mod tests {
         }));
         // 上游中途断流：必须以 error 终态收尾，不能回放 message_stop
         // 让客户端把截断内容误判为 completed
-        let events = ctx.finish_with_error_events(
-            "upstream_error",
-            "Upstream response stream was interrupted",
-        );
+        let events = ctx
+            .finish_with_error_events("upstream_error", "Upstream response stream was interrupted");
 
         let error_event = events
             .iter()

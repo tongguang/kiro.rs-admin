@@ -109,13 +109,21 @@ impl ModelMappingManager {
         if key.is_empty() {
             return None;
         }
-        self.inner.read().entries.get(&key).map(|m| m.target.clone())
+        self.inner
+            .read()
+            .entries
+            .get(&key)
+            .map(|m| m.target.clone())
     }
 
     /// 列出全部映射（按源名排序，输出稳定）
     pub fn list(&self) -> Vec<ModelMapping> {
         let mut out: Vec<ModelMapping> = self.inner.read().entries.values().cloned().collect();
-        out.sort_by(|a, b| a.source.to_ascii_lowercase().cmp(&b.source.to_ascii_lowercase()));
+        out.sort_by(|a, b| {
+            a.source
+                .to_ascii_lowercase()
+                .cmp(&b.source.to_ascii_lowercase())
+        });
         out
     }
 
@@ -171,7 +179,11 @@ impl ModelMappingManager {
             return;
         };
         let mut list: Vec<&ModelMapping> = inner.entries.values().collect();
-        list.sort_by(|a, b| a.source.to_ascii_lowercase().cmp(&b.source.to_ascii_lowercase()));
+        list.sort_by(|a, b| {
+            a.source
+                .to_ascii_lowercase()
+                .cmp(&b.source.to_ascii_lowercase())
+        });
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(path, json) {
@@ -230,8 +242,14 @@ mod tests {
         assert!(!mgr.remove("A"));
         assert_eq!(mgr.list().len(), 1);
         mgr.replace_all(vec![
-            ModelMapping { source: "x".into(), target: "10".into() },
-            ModelMapping { source: "  ".into(), target: "skip".into() },
+            ModelMapping {
+                source: "x".into(),
+                target: "10".into(),
+            },
+            ModelMapping {
+                source: "  ".into(),
+                target: "skip".into(),
+            },
         ]);
         assert_eq!(mgr.list().len(), 1);
         assert_eq!(mgr.resolve("x").as_deref(), Some("10"));

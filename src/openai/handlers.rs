@@ -362,11 +362,7 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         match frame.event.as_str() {
             "message_start" => self.ensure_role(),
             "content_block_start" => {
-                if data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("tool_use")
-                {
+                if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
                     let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
                     self.tools.insert(
                         block_index,
@@ -475,7 +471,9 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
             self.stop_reason.as_deref().unwrap_or("end_turn"),
             self.saw_tool_calls,
         );
-        let usage = self.include_usage.then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
+        let usage = self
+            .include_usage
+            .then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
         out.push(self.chunk(json!({}), Some(finish_reason), usage));
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
@@ -617,7 +615,11 @@ mod tests {
     /// 注意裸 "web_search" 不满足该前缀，必须归一化。
     #[test]
     fn chat_request_converts_web_search_tool_variants() {
-        for typ in ["web_search", "web_search_preview", "web_search_preview_2025_03_11"] {
+        for typ in [
+            "web_search",
+            "web_search_preview",
+            "web_search_preview_2025_03_11",
+        ] {
             let req: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": "gpt-5",
                 "messages": [{"role": "user", "content": "查一下今天的新闻"}],
@@ -656,9 +658,17 @@ mod tests {
         let converted = chat_to_anthropic(&req, None).unwrap();
         let tools = converted.anthropic.tools.unwrap();
         assert_eq!(tools.len(), 2);
-        assert!(tools.iter().any(|t| t.name == "web_search"
-            && t.tool_type.as_deref().is_some_and(|s| s.starts_with("web_search_"))));
-        assert!(tools.iter().any(|t| t.name == "get_weather" && t.tool_type.is_none()));
+        assert!(tools.iter().any(|t| {
+            t.name == "web_search"
+                && t.tool_type
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("web_search_"))
+        }));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.name == "get_weather" && t.tool_type.is_none())
+        );
     }
 
     /// 回归：OpenAI 并行工具调用（一条 assistant 带多个 tool_calls + 多条独立 tool
@@ -690,13 +700,20 @@ mod tests {
         // assistant 轮次带两个 tool_use
         assert_eq!(msgs[1].role, "assistant");
         let assistant_blocks = msgs[1].content.as_array().unwrap();
-        let tool_uses = assistant_blocks.iter().filter(|b| b["type"] == "tool_use").count();
+        let tool_uses = assistant_blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .count();
         assert_eq!(tool_uses, 2);
 
         // 两个 tool_result 必须在同一条 user 消息里（关键：不能拆成两条）
         assert_eq!(msgs[2].role, "user");
         let results = msgs[2].content.as_array().unwrap();
-        assert_eq!(results.len(), 2, "两个 tool_result 必须合并进一条 user 消息");
+        assert_eq!(
+            results.len(),
+            2,
+            "两个 tool_result 必须合并进一条 user 消息"
+        );
         assert!(results.iter().all(|r| r["type"] == "tool_result"));
         assert_eq!(results[0]["tool_use_id"], "call_a");
         assert_eq!(results[1]["tool_use_id"], "call_b");
@@ -704,7 +721,6 @@ mod tests {
         // 不应出现连续两条 user 消息承载 tool_result
         assert_eq!(msgs[3].role, "user"); // 这是"总结"，与上一条 tool_result user 相邻是允许的
     }
-
 
     /// chat completions 流式：纯文本。验证首个 chunk 带 role=assistant，
     /// 文本以 delta.content 增量下发，末尾 chunk 带 finish_reason=stop，

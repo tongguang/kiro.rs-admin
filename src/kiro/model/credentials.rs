@@ -632,7 +632,8 @@ impl CredentialsConfig {
 }
 
 impl KiroCredentials {
-    /// 特殊值：显式不使用代理
+    /// 特殊值：显式不使用代理（生产路径走 effective_proxy_candidates，仅测试保留）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const PROXY_DIRECT: &'static str = "direct";
 
     /// 获取默认凭证文件路径
@@ -660,6 +661,7 @@ impl KiroCredentials {
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
