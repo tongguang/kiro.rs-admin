@@ -222,6 +222,23 @@ impl RequestTracer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn noop(model: impl Into<String>) -> Self {
+        Self {
+            store: None,
+            trace_id: "test".into(),
+            ts: String::new(),
+            key_id: 0,
+            key_source: crate::admin::trace_db::TraceKeySource::ClientKey,
+            model: model.into(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+            stages: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
         let mut slot = self.first_token_at.lock();

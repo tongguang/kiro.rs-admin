@@ -31,7 +31,7 @@ use crate::admin::trace_db::outcome;
 use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::provider::KiroProvider;
+use crate::kiro::provider::{KiroCallResult, KiroProvider};
 use crate::token;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
@@ -378,6 +378,13 @@ async fn decode_round(
     }
 }
 
+/// Convert + serialize + open the upstream stream for one round.
+struct StartedRound {
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    call_result: KiroCallResult,
+}
+
 /// A failed round plus any usage that can still be attributed to its provider call.
 struct RoundFailure {
     response: Response,
@@ -392,14 +399,14 @@ struct RoundFailure {
 ///
 /// Usage recording belongs to the outer loop so every terminal path writes exactly one
 /// aggregate. A failure after a provider call carries the usage already observed in that call.
-async fn run_round(
+async fn start_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
-) -> Result<(RoundOutcome, u64), RoundFailure> {
+) -> Result<StartedRound, RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
@@ -474,22 +481,30 @@ async fn run_round(
             });
         }
     };
+    Ok(StartedRound {
+        tool_name_map: conversion.tool_name_map,
+        known_tool_names: conversion.known_tool_names,
+        call_result,
+    })
+}
+
+async fn finish_round(
+    started: StartedRound,
+    payload: &MessagesRequest,
+    fallback_input_tokens: i32,
+    tracer: &RequestTracer,
+) -> Result<(RoundOutcome, u64), RoundFailure> {
+    let StartedRound {
+        tool_name_map,
+        known_tool_names,
+        call_result,
+    } = started;
     let credential_id = call_result.credential_id;
-    let mut outcome = decode_round(
-        call_result.response,
-        &payload.model,
-        &conversion.tool_name_map,
-        tracer,
-    )
-    .await;
-    // Carry the declared tool names (original + shortened) so the flush step can run the
-    // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
-    outcome.known_tool_names = conversion.known_tool_names;
-    // Carry the short->original tool name map so reclaimed <invoke> names get restored.
-    outcome.tool_name_map = conversion.tool_name_map;
+    let mut outcome =
+        decode_round(call_result.response, &payload.model, &tool_name_map, tracer).await;
+    outcome.known_tool_names = known_tool_names;
+    outcome.tool_name_map = tool_name_map;
     if let Some(error_message) = outcome.stream_error.take() {
-        // The stream is partial and cannot re-enter the search loop, but any final metadata
-        // snapshot/credits observed before the cut still belong to this real provider call.
         let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
         return Err(RoundFailure {
             response: (
@@ -509,6 +524,26 @@ async fn run_round(
         });
     }
     Ok((outcome, credential_id))
+}
+
+async fn run_round(
+    provider: &Arc<KiroProvider>,
+    payload: &MessagesRequest,
+    fallback_input_tokens: i32,
+    tracer: &RequestTracer,
+    group: Option<&str>,
+    tool_compatibility_mode: ToolCompatibilityMode,
+) -> Result<(RoundOutcome, u64), RoundFailure> {
+    let started = start_round(
+        provider,
+        payload,
+        fallback_input_tokens,
+        tracer,
+        group,
+        tool_compatibility_mode,
+    )
+    .await?;
+    finish_round(started, payload, fallback_input_tokens, tracer).await
 }
 
 /// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
@@ -1290,6 +1325,26 @@ fn finalize_aggregated_trace(
     );
 }
 
+fn settle_round_failure(
+    failure: RoundFailure,
+    hook: UsageRecordHook,
+    tracer: Arc<RequestTracer>,
+) -> Response {
+    let mut settlement = WebSearchUsageSettlement::new(hook, tracer);
+    settlement.add(
+        failure.credential_id,
+        failure.token_usage.unwrap_or_default(),
+        failure.credits,
+    );
+    settlement.finish(
+        "error",
+        "error",
+        Some(failure.error_type),
+        Some(&failure.error_message),
+    );
+    failure.response
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -1311,6 +1366,7 @@ pub(super) async fn run_web_search_loop(
             group,
             tool_compatibility_mode,
             None,
+            None,
         )
         .await;
     }
@@ -1321,6 +1377,19 @@ pub(super) async fn run_web_search_loop(
         &payload.messages,
         payload.tools.as_deref(),
     ) as i32;
+    let started = match start_round(
+        &provider,
+        &payload,
+        initial_input_tokens,
+        tracer.as_ref(),
+        group.as_deref(),
+        tool_compatibility_mode,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(failure) => return settle_round_failure(failure, hook, tracer),
+    };
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
     tokio::spawn(async move {
@@ -1340,6 +1409,7 @@ pub(super) async fn run_web_search_loop(
                 group,
                 tool_compatibility_mode,
                 Some(&mut emitter),
+                Some(started),
             ))
             .catch_unwind(),
         )
@@ -1380,6 +1450,7 @@ async fn run_web_search_loop_inner(
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
     mut emitter: Option<&mut WebSearchSseEmitter>,
+    mut first_round: Option<StartedRound>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
@@ -1395,16 +1466,25 @@ async fn run_web_search_loop_inner(
                 &payload.messages,
                 payload.tools.as_deref(),
             ) as i32;
-            let (round, credential_id) = match run_round(
-                &provider,
-                &payload,
-                round_fallback_input_tokens,
-                tracer.as_ref(),
-                group.as_deref(),
-                tool_compatibility_mode,
-            )
-            .await
-            {
+            let (round, credential_id) = match if let Some(started) = first_round.take() {
+                finish_round(
+                    started,
+                    &payload,
+                    round_fallback_input_tokens,
+                    tracer.as_ref(),
+                )
+                .await
+            } else {
+                run_round(
+                    &provider,
+                    &payload,
+                    round_fallback_input_tokens,
+                    tracer.as_ref(),
+                    group.as_deref(),
+                    tool_compatibility_mode,
+                )
+                .await
+            } {
                 Ok(v) => v,
                 Err(failure) => {
                     if let Some(usage) = failure.token_usage {
@@ -1961,6 +2041,70 @@ mod tests {
         // Keep the sender alive through the assertion: the event came from the
         // response prefix rather than from progress-channel completion.
         drop(sender);
+    }
+
+    #[tokio::test]
+    async fn streaming_first_round_rate_limit_returns_http_retry_after() {
+        let mut cred = crate::kiro::model::credentials::KiroCredentials::default();
+        cred.id = Some(1);
+        cred.rpm_limit = 1;
+        let manager = std::sync::Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![cred],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(manager.record_request(1));
+
+        let mut endpoints = std::collections::HashMap::new();
+        endpoints.insert(
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string(),
+            std::sync::Arc::new(crate::kiro::endpoint::ide::IdeEndpoint::new())
+                as std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        );
+        let provider = std::sync::Arc::new(crate::kiro::provider::KiroProvider::with_proxy(
+            manager,
+            None,
+            endpoints,
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string(),
+            None,
+        ));
+
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }))
+        .unwrap();
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: payload.model.clone(),
+            started_at: std::time::Instant::now(),
+        };
+        let tracer = std::sync::Arc::new(RequestTracer::noop(payload.model.clone()));
+        let resp = run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            tracer,
+            true,
+            None,
+            ToolCompatibilityMode::Raw,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_some(),
+            "首轮 429 必须带 Retry-After"
+        );
     }
 
     #[tokio::test]
