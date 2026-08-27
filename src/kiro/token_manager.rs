@@ -192,24 +192,41 @@ fn match_file_credential<'a>(
     current_email: &Option<String>,
     entries_len: usize,
 ) -> Option<&'a KiroCredentials> {
-    file_creds
-        .iter()
-        .find(|file_cred| {
-            if file_cred.id.is_some() && file_cred.id == current_cred_id {
-                return true;
-            }
+    if current_cred_id.is_some()
+        && let Some(hit) = file_creds
+            .iter()
+            .find(|file_cred| file_cred.id.is_some() && file_cred.id == current_cred_id)
+    {
+        return Some(hit);
+    }
+
+    if current_email.is_some() {
+        let mut email_hit = None;
+        let mut email_ambiguous = false;
+        for file_cred in file_creds {
             if file_cred.email.is_some() && file_cred.email == *current_email {
-                return true;
+                if email_hit.is_some() {
+                    email_ambiguous = true;
+                    break;
+                }
+                email_hit = Some(file_cred);
             }
-            false
-        })
-        .or_else(|| {
-            if file_creds.len() == 1 && entries_len == 1 {
-                file_creds.first()
-            } else {
-                None
-            }
-        })
+        }
+        if email_ambiguous {
+            tracing::warn!(
+                email = current_email.as_deref(),
+                "磁盘凭据存在多条相同 email，跳过 email 回退匹配以免串写 token"
+            );
+        } else if let Some(hit) = email_hit {
+            return Some(hit);
+        }
+    }
+
+    if file_creds.len() == 1 && entries_len == 1 {
+        file_creds.first()
+    } else {
+        None
+    }
 }
 
 /// 刷新 Token
@@ -7443,6 +7460,44 @@ mod tests {
     }
 
     // ── try_reload_credential_from_file ─────────────────────────────────────
+
+    fn file_cred(id: u64, email: &str, token: &str) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(id);
+        cred.email = Some(email.to_string());
+        cred.refresh_token = Some(token.to_string());
+        cred
+    }
+
+    #[test]
+    fn match_file_credential_id_beats_earlier_email() {
+        let files = vec![
+            file_cred(1, "a@x.com", "tok_a"),
+            file_cred(2, "a@x.com", "tok_b"),
+        ];
+        let hit = match_file_credential(&files, Some(2), &Some("a@x.com".into()), 2).unwrap();
+        assert_eq!(hit.id, Some(2));
+        assert_eq!(hit.refresh_token.as_deref(), Some("tok_b"));
+    }
+
+    #[test]
+    fn match_file_credential_same_email_without_id_is_ambiguous() {
+        let files = vec![
+            file_cred(1, "a@x.com", "tok_a"),
+            file_cred(2, "a@x.com", "tok_b"),
+        ];
+        let hit = match_file_credential(&files, Some(3), &Some("a@x.com".into()), 3);
+        assert!(hit.is_none(), "同 email 多条且 id 未命中时不得串写");
+    }
+
+    #[test]
+    fn match_file_credential_email_fallback_when_id_absent() {
+        let mut named = file_cred(2, "a@x.com", "tok_a");
+        named.id = None;
+        let files = vec![file_cred(1, "b@x.com", "tok_b"), named];
+        let hit = match_file_credential(&files, Some(99), &Some("a@x.com".into()), 2).unwrap();
+        assert_eq!(hit.refresh_token.as_deref(), Some("tok_a"));
+    }
 
     /// 文件中有新 refreshToken 时，reload 返回 true 并更新内存凭据
     #[test]
