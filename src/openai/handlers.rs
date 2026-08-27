@@ -75,7 +75,7 @@ async fn convert_chat_non_stream_response(response: Response) -> Response {
     let status = response.status();
     let body = response.into_body();
     if !status.is_success() {
-        return convert_error_body(status, body).await;
+        return super::parse::convert_error_body(status, body).await;
     }
 
     let value = match collect_json_body(body).await {
@@ -125,23 +125,6 @@ async fn collect_json_body(body: Body) -> Result<Value, Response> {
     })
 }
 
-async fn convert_error_body(status: StatusCode, body: Body) -> Response {
-    let bytes = to_bytes(body, MAX_COLLECT_BYTES).await.unwrap_or_default();
-    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
-    let message = parsed
-        .as_ref()
-        .and_then(|v| v.pointer("/error/message"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).to_string());
-    let error_type = parsed
-        .as_ref()
-        .and_then(|v| v.pointer("/error/type"))
-        .and_then(Value::as_str)
-        .unwrap_or("server_error");
-    openai_status_error(status, error_type, message)
-}
-
 async fn convert_chat_stream_response(
     response: Response,
     model: String,
@@ -149,7 +132,7 @@ async fn convert_chat_stream_response(
 ) -> Response {
     let status = response.status();
     if !status.is_success() {
-        return convert_error_body(status, response.into_body()).await;
+        return super::parse::convert_error_body(status, response.into_body()).await;
     }
 
     let stream = transform_anthropic_sse(

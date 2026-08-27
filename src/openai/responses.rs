@@ -395,21 +395,7 @@ pub async fn post_responses(
 
     let status = inner.status();
     if !status.is_success() {
-        let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
-            Ok(b) => b,
-            Err(e) => {
-                return responses_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("failed to read upstream response: {e}"),
-                );
-            }
-        };
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body_bytes))
-            .unwrap();
+        return super::parse::convert_error_body(status, inner.into_body()).await;
     }
 
     if want_stream {

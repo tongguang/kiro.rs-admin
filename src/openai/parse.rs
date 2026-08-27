@@ -8,10 +8,18 @@
 //! 移植自上游 v0.8.0 `anthropic/openai.rs` 的共享段。
 
 use axum::http::HeaderMap;
+use axum::{
+    body::{Body, to_bytes},
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::types::openai_error;
 use crate::anthropic::types::Metadata;
+
+const MAX_ERROR_BODY: usize = 32 * 1024 * 1024;
 
 /// 从 OpenAI 请求体或会话亲和请求头中提取并规范化 Kiro 会话 UUID。
 pub(crate) fn resolve_session_metadata(
@@ -255,6 +263,26 @@ pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// 把内部 Anthropic 错误体归一化为 OpenAI `{"error":{message,type}}` 形状。
+///
+/// 非 JSON 体用 lossy 文本作 message；缺 `error.type` 时补 `server_error`。
+pub(crate) async fn convert_error_body(status: StatusCode, body: Body) -> Response {
+    let bytes = to_bytes(body, MAX_ERROR_BODY).await.unwrap_or_default();
+    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).to_string());
+    let error_type = parsed
+        .as_ref()
+        .and_then(|v| v.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .unwrap_or("server_error");
+    (status, Json(openai_error(message, error_type))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +347,44 @@ mod tests {
         assert!(p.credit_usage.is_none());
         assert!(p.credit_unit.is_none());
         assert!(p.credit_unit_plural.is_none());
+    }
+
+    #[tokio::test]
+    async fn convert_error_body_normalizes_non_json_and_sets_content_type() {
+        let resp = convert_error_body(
+            StatusCode::TOO_MANY_REQUESTS,
+            Body::from("not-json retry later"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("application/json"),
+            "content-type={content_type}"
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("type").is_none());
+        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(v["error"]["message"], "not-json retry later");
+    }
+
+    #[tokio::test]
+    async fn convert_error_body_strips_anthropic_envelope() {
+        let inner = json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow down"}
+        });
+        let resp =
+            convert_error_body(StatusCode::TOO_MANY_REQUESTS, Body::from(inner.to_string())).await;
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("type").is_none());
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["message"], "slow down");
     }
 }
