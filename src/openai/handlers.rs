@@ -16,10 +16,12 @@ use crate::anthropic::{
     middleware::{AppState, KeyContext},
 };
 
+use super::parse::{
+    chat_message_from_parsed, chat_usage_json, map_finish_reason, now_ts, parse_anthropic_message,
+    parse_sse_frame, take_sse_frames,
+};
 use super::types::{
-    ChatCompletionRequest, OpenAIConversionError, assistant_parts_from_anthropic,
-    chat_message_from_parts, chat_to_anthropic, finish_reason_from_anthropic, openai_error,
-    usage_json,
+    ChatCompletionRequest, OpenAIConversionError, chat_to_anthropic, openai_error,
 };
 
 const MAX_COLLECT_BYTES: usize = 32 * 1024 * 1024;
@@ -55,7 +57,7 @@ pub async fn post_chat_completions(
     if stream {
         convert_chat_stream_response(anthropic_response, model, include_usage).await
     } else {
-        convert_chat_non_stream_response(anthropic_response).await
+        convert_chat_non_stream_response(anthropic_response, model).await
     }
 }
 
@@ -71,7 +73,7 @@ fn openai_status_error(
     (status, Json(openai_error(message, error_type))).into_response()
 }
 
-async fn convert_chat_non_stream_response(response: Response) -> Response {
+async fn convert_chat_non_stream_response(response: Response, model: String) -> Response {
     let status = response.status();
     let body = response.into_body();
     if !status.is_success() {
@@ -82,24 +84,21 @@ async fn convert_chat_non_stream_response(response: Response) -> Response {
         Ok(value) => value,
         Err(resp) => return resp,
     };
-    let parts = assistant_parts_from_anthropic(&value);
+    let parsed = parse_anthropic_message(&value, &model);
     (
         StatusCode::OK,
         Json(json!({
             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             "object": "chat.completion",
-            "created": unix_ts(),
-            "model": parts.model,
+            "created": now_ts(),
+            "model": parsed.model,
             "choices": [{
                 "index": 0,
-                "message": chat_message_from_parts(&parts),
+                "message": chat_message_from_parsed(&parsed),
                 "logprobs": null,
-                "finish_reason": finish_reason_from_anthropic(
-                    &parts.stop_reason,
-                    !parts.tool_calls.is_empty(),
-                ),
+                "finish_reason": parsed.finish_reason,
             }],
-            "usage": usage_json(&parts),
+            "usage": chat_usage_json(&parsed),
         })),
     )
         .into_response()
@@ -149,8 +148,9 @@ async fn convert_chat_stream_response(
 }
 
 trait AnthropicSseTranslator {
-    fn handle_frame(&mut self, frame: SseFrame) -> Vec<Bytes>;
+    fn handle_event(&mut self, event: &str, data: Value) -> Vec<Bytes>;
     fn finish(&mut self) -> Vec<Bytes>;
+    fn abort(&mut self, message: &str) -> Vec<Bytes>;
 }
 
 fn transform_anthropic_sse<T>(
@@ -162,8 +162,8 @@ where
 {
     let data_stream = body.into_data_stream();
     stream::unfold(
-        (data_stream, SseFrameParser::default(), translator, false),
-        |(mut data_stream, mut parser, mut translator, mut finished)| async move {
+        (data_stream, Vec::<u8>::new(), translator, false),
+        |(mut data_stream, mut buffer, mut translator, mut finished)| async move {
             if finished {
                 return None;
             }
@@ -171,44 +171,60 @@ where
             loop {
                 match data_stream.next().await {
                     Some(Ok(chunk)) => {
-                        let frames = parser.push(&chunk);
+                        buffer.extend_from_slice(&chunk);
                         let mut out = Vec::new();
-                        for frame in frames {
-                            out.extend(translator.handle_frame(frame).into_iter().map(Ok));
+                        for frame in take_sse_frames(&mut buffer) {
+                            match parse_sse_frame(&frame) {
+                                Ok(Some((event, data))) => {
+                                    out.extend(
+                                        translator.handle_event(&event, data).into_iter().map(Ok),
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(message) => {
+                                    finished = true;
+                                    out.extend(translator.abort(&message).into_iter().map(Ok));
+                                }
+                            }
                         }
                         if !out.is_empty() {
                             return Some((
                                 stream::iter(out),
-                                (data_stream, parser, translator, finished),
+                                (data_stream, buffer, translator, finished),
                             ));
                         }
                     }
                     Some(Err(e)) => {
                         finished = true;
-                        let bytes = chat_data_sse(json!({
-                            "error": {
-                                "message": format!("upstream stream error: {}", e),
-                                "type": "server_error",
-                            }
-                        }));
+                        let out: Vec<Result<Bytes, Infallible>> = translator
+                            .abort(&format!("upstream stream error: {}", e))
+                            .into_iter()
+                            .map(Ok)
+                            .collect();
                         return Some((
-                            stream::iter(vec![Ok(bytes)]),
-                            (data_stream, parser, translator, finished),
+                            stream::iter(out),
+                            (data_stream, buffer, translator, finished),
                         ));
                     }
                     None => {
                         finished = true;
                         let mut out = Vec::new();
-                        for frame in parser.finish() {
-                            out.extend(translator.handle_frame(frame).into_iter().map(Ok));
+                        if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                            out.extend(
+                                translator
+                                    .abort("upstream sent an incomplete SSE frame")
+                                    .into_iter()
+                                    .map(Ok),
+                            );
+                        } else {
+                            out.extend(translator.finish().into_iter().map(Ok));
                         }
-                        out.extend(translator.finish().into_iter().map(Ok));
                         if out.is_empty() {
                             return None;
                         }
                         return Some((
                             stream::iter(out),
-                            (data_stream, parser, translator, finished),
+                            (data_stream, buffer, translator, finished),
                         ));
                     }
                 }
@@ -216,56 +232,6 @@ where
         },
     )
     .flatten()
-}
-
-#[derive(Default)]
-struct SseFrameParser {
-    buffer: String,
-}
-
-#[derive(Debug)]
-struct SseFrame {
-    event: String,
-    data: String,
-}
-
-impl SseFrameParser {
-    fn push(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
-        let mut frames = Vec::new();
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let raw = self.buffer[..pos].to_string();
-            self.buffer = self.buffer[pos + 2..].to_string();
-            if let Some(frame) = parse_sse_frame(&raw) {
-                frames.push(frame);
-            }
-        }
-        frames
-    }
-
-    fn finish(&mut self) -> Vec<SseFrame> {
-        let raw = std::mem::take(&mut self.buffer);
-        parse_sse_frame(&raw).into_iter().collect()
-    }
-}
-
-fn parse_sse_frame(raw: &str) -> Option<SseFrame> {
-    let mut event = String::new();
-    let mut data_lines = Vec::new();
-    for line in raw.lines().map(|line| line.trim_end_matches('\r')) {
-        if let Some(rest) = line.strip_prefix("event:") {
-            event = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.trim_start().to_string());
-        }
-    }
-    if event.is_empty() && data_lines.is_empty() {
-        return None;
-    }
-    Some(SseFrame {
-        event,
-        data: data_lines.join("\n"),
-    })
 }
 
 struct ToolStreamAcc {
@@ -295,7 +261,7 @@ impl ChatStreamTranslator {
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             model,
-            created: unix_ts(),
+            created: now_ts(),
             include_usage,
             sent_role: false,
             done: false,
@@ -330,19 +296,26 @@ impl ChatStreamTranslator {
             "usage": usage,
         }))
     }
+
+    fn abort_value(&mut self, error: Value) -> Vec<Bytes> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        vec![
+            chat_data_sse(json!({ "error": error })),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]
+    }
 }
 
 impl AnthropicSseTranslator for ChatStreamTranslator {
-    fn handle_frame(&mut self, frame: SseFrame) -> Vec<Bytes> {
-        if self.done || frame.event == "ping" {
+    fn handle_event(&mut self, event: &str, data: Value) -> Vec<Bytes> {
+        if self.done || event == "ping" {
             return Vec::new();
         }
-        let data = match serde_json::from_str::<Value>(&frame.data) {
-            Ok(data) => data,
-            Err(_) => return Vec::new(),
-        };
 
-        match frame.event.as_str() {
+        match event {
             "message_start" => self.ensure_role(),
             "content_block_start" => {
                 if data.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
@@ -431,15 +404,7 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
                 Vec::new()
             }
             "message_stop" => self.finish(),
-            "error" => {
-                self.done = true;
-                vec![
-                    chat_data_sse(json!({
-                        "error": data.get("error").cloned().unwrap_or(data)
-                    })),
-                    Bytes::from_static(b"data: [DONE]\n\n"),
-                ]
-            }
+            "error" => self.abort_value(data.get("error").cloned().unwrap_or(data)),
             _ => Vec::new(),
         }
     }
@@ -450,7 +415,7 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         }
         self.done = true;
         let mut out = self.ensure_role();
-        let finish_reason = finish_reason_from_anthropic(
+        let finish_reason = map_finish_reason(
             self.stop_reason.as_deref().unwrap_or("end_turn"),
             self.saw_tool_calls,
         );
@@ -460,6 +425,13 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         out.push(self.chunk(json!({}), Some(finish_reason), usage));
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
+    }
+
+    fn abort(&mut self, message: &str) -> Vec<Bytes> {
+        self.abort_value(json!({
+            "message": message,
+            "type": "server_error",
+        }))
     }
 }
 
@@ -509,35 +481,38 @@ fn chat_data_sse(value: Value) -> Bytes {
     ))
 }
 
-fn unix_ts() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
     use serde_json::{Value, json};
 
+    use super::super::parse::{parse_sse_frame, take_sse_frames};
     use super::super::types::{ChatCompletionRequest, chat_to_anthropic};
-    use super::{AnthropicSseTranslator, ChatStreamTranslator, SseFrameParser};
+    use super::{AnthropicSseTranslator, ChatStreamTranslator};
 
     /// 把一段 Anthropic SSE 原文喂给 ChatStreamTranslator，收集其产出的
     /// `data: {...}` 行并解析成 JSON 序列（chat completions 流不带 `event:` 行）。
     /// `data: [DONE]` 作为 Value::Null 占位返回，便于断言收尾。
     fn run_chat_translator(anthropic_sse: &str, include_usage: bool) -> Vec<Value> {
         let mut translator = ChatStreamTranslator::new("gpt-4o".to_string(), include_usage);
-        let mut parser = SseFrameParser::default();
+        let mut buffer = anthropic_sse.as_bytes().to_vec();
         let mut raw_out: Vec<Bytes> = Vec::new();
-        for frame in parser.push(anthropic_sse.as_bytes()) {
-            raw_out.extend(translator.handle_frame(frame));
+        for frame in take_sse_frames(&mut buffer) {
+            match parse_sse_frame(&frame) {
+                Ok(Some((event, data))) => {
+                    raw_out.extend(translator.handle_event(&event, data));
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    raw_out.extend(translator.abort(&message));
+                }
+            }
         }
-        for frame in parser.finish() {
-            raw_out.extend(translator.handle_frame(frame));
+        if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            raw_out.extend(translator.abort("upstream sent an incomplete SSE frame"));
+        } else {
+            raw_out.extend(translator.finish());
         }
-        raw_out.extend(translator.finish());
 
         let joined = raw_out
             .iter()

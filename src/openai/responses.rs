@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use super::parse::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, parse_data_url,
-    push_merged, resolve_session_metadata,
+    parse_sse_frame, push_merged, resolve_session_metadata, take_sse_frames,
 };
 use crate::anthropic::handlers::post_messages;
 use crate::anthropic::middleware::{AppState, KeyContext};
@@ -2093,57 +2093,6 @@ fn responses_streaming_response(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
-}
-
-fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
-    loop {
-        let lf = buffer.windows(2).position(|window| window == b"\n\n");
-        let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-        let delimiter = match (lf, crlf) {
-            (Some(a), Some(b)) if a <= b => Some((a, 2)),
-            (Some(_), Some(b)) => Some((b, 4)),
-            (Some(a), None) => Some((a, 2)),
-            (None, Some(b)) => Some((b, 4)),
-            (None, None) => None,
-        };
-        let Some((position, length)) = delimiter else {
-            break;
-        };
-        let frame = buffer.drain(..position).collect::<Vec<_>>();
-        buffer.drain(..length);
-        if frame.iter().any(|byte| !byte.is_ascii_whitespace()) {
-            frames.push(frame);
-        }
-    }
-    frames
-}
-
-fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
-    let text = std::str::from_utf8(frame)
-        .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
-    let mut event = None;
-    let mut data_lines = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start());
-        }
-    }
-    let Some(event) = event else {
-        return Ok(None);
-    };
-    if event == "ping" {
-        return Ok(Some((event, json!({ "type": "ping" }))));
-    }
-    let data = serde_json::from_str::<Value>(&data_lines.join("\n"))
-        .map_err(|error| format!("failed to parse upstream SSE event {event}: {error}"))?;
-    Ok(Some((event, data)))
 }
 
 /// 把完整结果合成为 Responses SSE 事件序列

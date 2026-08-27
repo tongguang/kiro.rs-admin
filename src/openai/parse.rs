@@ -1,11 +1,10 @@
 //! OpenAI 兼容层共享解析工具
 //!
-//! Chat Completions 路径消费会话亲和元数据（[`resolve_session_metadata`]）与
-//! `data:` 图解析（[`parse_data_url`]）；其余工具（Anthropic 响应体解析
-//! [`parse_anthropic_message`] / [`ParsedResponse`]、文本收集
-//! [`collect_text_strings`]、合并 [`push_merged`]、时间戳 `now_ts`）由
-//! Responses 路径消费。
-//! 移植自上游 v0.8.0 `anthropic/openai.rs` 的共享段。
+//! Chat Completions 与 Responses 共用：会话亲和元数据
+//! [`resolve_session_metadata`]、`data:` 图解析 [`parse_data_url`]、
+//! Anthropic 响应体解析 [`parse_anthropic_message`] / [`ParsedResponse`]、
+//! SSE 字节级分帧 [`take_sse_frames`] / [`parse_sse_frame`]，以及文本收集 /
+//! 合并 / 时间戳辅助函数。
 
 use axum::http::HeaderMap;
 use axum::{
@@ -250,13 +249,109 @@ pub(crate) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     }
 }
 
-fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
+pub(crate) fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ if has_tool_calls => "tool_calls",
         _ => "stop",
     }
+}
+
+pub(crate) fn chat_message_from_parsed(p: &ParsedResponse) -> Value {
+    let content = if p.text.is_empty() && !p.tool_calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(p.text.clone())
+    };
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !p.thinking.is_empty() {
+        message["reasoning_content"] = Value::String(p.thinking.clone());
+    }
+    if !p.tool_calls.is_empty() {
+        message["tool_calls"] = json!(p.tool_calls);
+    }
+    message
+}
+
+pub(crate) fn chat_usage_json(p: &ParsedResponse) -> Value {
+    let mut usage = json!({
+        "prompt_tokens": p.prompt_tokens,
+        "completion_tokens": p.completion_tokens,
+        "total_tokens": p.prompt_tokens + p.completion_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": p.cached_tokens,
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": 0,
+        }
+    });
+    if let Some(credit_usage) = p.credit_usage {
+        usage["credit_usage"] = json!(credit_usage);
+        if let Some(unit) = &p.credit_unit {
+            usage["credit_unit"] = json!(unit);
+        }
+        if let Some(unit_plural) = &p.credit_unit_plural {
+            usage["credit_unit_plural"] = json!(unit_plural);
+        }
+    }
+    usage
+}
+
+/// 从字节缓冲切出完整 SSE 帧（`\n\n` 或 `\r\n\r\n`）。
+pub(crate) fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    loop {
+        let lf = buffer.windows(2).position(|window| window == b"\n\n");
+        let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        let delimiter = match (lf, crlf) {
+            (Some(a), Some(b)) if a <= b => Some((a, 2)),
+            (Some(_), Some(b)) => Some((b, 4)),
+            (Some(a), None) => Some((a, 2)),
+            (None, Some(b)) => Some((b, 4)),
+            (None, None) => None,
+        };
+        let Some((position, length)) = delimiter else {
+            break;
+        };
+        let frame = buffer.drain(..position).collect::<Vec<_>>();
+        buffer.drain(..length);
+        if frame.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+/// 解析一帧上游 Anthropic SSE：严格 UTF-8，跳过注释，ping 不要求 JSON data。
+pub(crate) fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
+    let text = std::str::from_utf8(frame)
+        .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
+    let mut event = None;
+    let mut data_lines = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim_start());
+        }
+    }
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    if event == "ping" {
+        return Ok(Some((event, json!({ "type": "ping" }))));
+    }
+    let data = serde_json::from_str::<Value>(&data_lines.join("\n"))
+        .map_err(|error| format!("failed to parse upstream SSE event {event}: {error}"))?;
+    Ok(Some((event, data)))
 }
 
 pub(crate) fn now_ts() -> i64 {
@@ -386,5 +481,52 @@ mod tests {
         assert!(v.get("type").is_none());
         assert_eq!(v["error"]["type"], "rate_limit_error");
         assert_eq!(v["error"]["message"], "slow down");
+    }
+
+    #[test]
+    fn chat_message_and_usage_from_parsed_response() {
+        let anthropic = json!({
+            "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 5,
+                "output_tokens": 6,
+                "credit_usage": 0.25
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-4o");
+        assert_eq!(p.finish_reason, "tool_calls");
+        let message = chat_message_from_parsed(&p);
+        assert_eq!(message["content"], Value::Null);
+        assert_eq!(message["reasoning_content"], "plan");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        let usage = chat_usage_json(&p);
+        assert_eq!(usage["prompt_tokens"], 12);
+        assert_eq!(usage["completion_tokens"], 6);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(usage["credit_usage"], 0.25);
+    }
+
+    #[test]
+    fn sse_parser_handles_chunk_boundaries_and_crlf() {
+        let mut buffer = b"event: ping\r\ndata: {}\r\n\r".to_vec();
+        assert!(take_sse_frames(&mut buffer).is_empty());
+        buffer.extend_from_slice(b"\nevent: message_stop\n");
+        let first = take_sse_frames(&mut buffer);
+        assert_eq!(first.len(), 1);
+        assert_eq!(parse_sse_frame(&first[0]).unwrap().unwrap().0, "ping");
+        buffer.extend_from_slice(b"data: {\"type\":\"message_stop\"}\n\n");
+        let second = take_sse_frames(&mut buffer);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            parse_sse_frame(&second[0]).unwrap().unwrap().0,
+            "message_stop"
+        );
     }
 }
