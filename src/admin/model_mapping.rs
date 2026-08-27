@@ -82,24 +82,40 @@ impl ModelMappingManager {
                 path: Some(path),
             })
         } else {
-            // 首次启动：写入内置默认映射
-            let mut entries = HashMap::new();
-            for (src, tgt) in DEFAULT_MAPPINGS {
-                entries.insert(
-                    norm(src),
-                    ModelMapping {
-                        source: src.to_string(),
-                        target: tgt.to_string(),
-                    },
-                );
-            }
-            let mgr = Self {
-                inner: RwLock::new(Inner { entries }),
-                path: Some(path),
-            };
-            mgr.save_locked(&mgr.inner.read());
-            Ok(mgr)
+            Ok(Self::seeded(path))
         }
+    }
+
+    /// 加载失败时隔离损坏文件并回退到带 path 的默认映射（仍可落盘）。
+    pub fn load_or_recover<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(mgr) => mgr,
+            Err(e) => {
+                tracing::warn!("加载模型映射失败 ({}): {}", path.display(), e);
+                isolate_corrupt_file(path);
+                Self::seeded(path.to_path_buf())
+            }
+        }
+    }
+
+    fn seeded(path: PathBuf) -> Self {
+        let mut entries = HashMap::new();
+        for (src, tgt) in DEFAULT_MAPPINGS {
+            entries.insert(
+                norm(src),
+                ModelMapping {
+                    source: src.to_string(),
+                    target: tgt.to_string(),
+                },
+            );
+        }
+        let mgr = Self {
+            inner: RwLock::new(Inner { entries }),
+            path: Some(path),
+        };
+        mgr.save_locked(&mgr.inner.read());
+        mgr
     }
 
     /// 解析源模型名 → 目标模型名（命中返回 Some(target)，未命中 None）。
@@ -186,12 +202,25 @@ impl ModelMappingManager {
         });
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = super::persist::atomic_write(path, json) {
                     tracing::warn!("写入模型映射失败 {}: {}", path.display(), e);
                 }
             }
             Err(e) => tracing::warn!("序列化模型映射失败: {}", e),
         }
+    }
+}
+
+/// 把损坏文件改名为 `*.json.bak`（已有 bak 直接覆盖）。
+fn isolate_corrupt_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let bak = path.with_extension("json.bak");
+    let _ = std::fs::remove_file(&bak);
+    match std::fs::rename(path, &bak) {
+        Ok(()) => tracing::warn!("已隔离损坏的模型映射到 {}", bak.display()),
+        Err(e) => tracing::warn!("隔离损坏的模型映射 {} 失败: {}", path.display(), e),
     }
 }
 
@@ -267,6 +296,36 @@ mod tests {
         // 重新加载应读回持久化内容
         let mgr2 = ModelMappingManager::load(&path).unwrap();
         assert_eq!(mgr2.resolve("gpt-5.5").as_deref(), Some("claude-opus-4.8"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_recover_isolates_corrupt_json_and_reseeds() {
+        let dir = std::env::temp_dir().join(format!("mm_bak_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = default_path_in(&dir);
+        std::fs::write(&path, "{not json").unwrap();
+        let existing_bak = path.with_extension("json.bak");
+        std::fs::write(&existing_bak, "old bak").unwrap();
+
+        let mgr = ModelMappingManager::load_or_recover(&path);
+        assert_eq!(mgr.resolve("gpt-5.5").as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(mgr.resolve("gpt-5.4").as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(std::fs::read_to_string(&existing_bak).unwrap(), "{not json");
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        mgr.upsert("gpt-4o", "claude-sonnet-4.5").unwrap();
+        let reloaded = ModelMappingManager::load(&path).unwrap();
+        assert_eq!(
+            reloaded.resolve("gpt-4o").as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(
+            reloaded.resolve("gpt-5.5").as_deref(),
+            Some("claude-opus-4.8")
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

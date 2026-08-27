@@ -312,16 +312,9 @@ async fn main() {
     // 模型映射：请求时把源模型名（如 gpt-5.5）转发到目标模型名（如 claude-opus-4.8）。
     // 首次启动写入内置默认映射；源名不会出现在 /v1/models 列表里。
     let model_mappings_path = admin::model_mapping::default_path_in(&cache_dir);
-    let model_mapping_manager = std::sync::Arc::new(
-        admin::ModelMappingManager::load(&model_mappings_path).unwrap_or_else(|e| {
-            tracing::warn!(
-                "加载模型映射失败 ({}): {}",
-                model_mappings_path.display(),
-                e
-            );
-            admin::ModelMappingManager::new()
-        }),
-    );
+    let model_mapping_manager = std::sync::Arc::new(admin::ModelMappingManager::load_or_recover(
+        &model_mappings_path,
+    ));
 
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider.clone()),

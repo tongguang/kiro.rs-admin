@@ -133,7 +133,7 @@ impl ClientKeyManager {
         list.sort_by_key(|k| k.id);
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = super::persist::atomic_write(path, json) {
                     tracing::warn!("写入客户端 Key 文件失败: {}", e);
                 }
             }
