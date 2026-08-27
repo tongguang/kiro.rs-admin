@@ -221,6 +221,11 @@ pub struct CacheControl {
     pub ttl: Option<String>,
 }
 
+/// web_search 工具的默认 `max_uses`：客户端未声明时，本地执行循环的搜索次数
+/// 预算（成本/延迟控制）。Chat / Responses / Anthropic 原生路径共用口径；
+/// 声明值还受执行循环的硬上限（`MAX_WEB_SEARCH_ROUNDS`）截断。
+pub const DEFAULT_WEB_SEARCH_MAX_USES: i32 = 5;
+
 /// 工具定义
 ///
 /// 支持两种格式：

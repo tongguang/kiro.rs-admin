@@ -34,7 +34,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::{KiroCallResult, KiroProvider};
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
 };
@@ -43,8 +43,22 @@ use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
 
-/// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
-const MAX_WEB_SEARCH_ROUNDS: usize = 5;
+/// 搜索轮次硬上限：防止上游不停要求搜索的失控循环（每轮都是真实 credit 消耗
+/// 与延迟）。客户端声明的 max_uses 也经此截断；未声明时的默认预算见
+/// [`super::types::DEFAULT_WEB_SEARCH_MAX_USES`]。
+const MAX_WEB_SEARCH_ROUNDS: usize = 10;
+
+/// 从请求 tools 读取 web_search 的搜索次数预算：客户端声明的 `max_uses`
+/// （缺失/非正 → 默认值），再经 [`MAX_WEB_SEARCH_ROUNDS`] 硬上限截断。
+/// Chat / Responses 注入的原生工具与 Anthropic 原生客户端的声明都经此读取。
+fn web_search_budget(tools: Option<&[super::types::Tool]>) -> usize {
+    let declared = tools
+        .and_then(|tools| tools.iter().find(|t| t.name == "web_search"))
+        .and_then(|t| t.max_uses)
+        .filter(|v| *v > 0)
+        .unwrap_or(super::types::DEFAULT_WEB_SEARCH_MAX_USES);
+    (declared as usize).min(MAX_WEB_SEARCH_ROUNDS)
+}
 
 /// A valid assistant turn after a tool result must contain either visible text or
 /// another client tool call. Kiro occasionally closes a successful upstream stream
@@ -195,11 +209,20 @@ fn log_normalized_web_search_query(tu: &CompletedToolUse, query: &str) {
 
 /// Decides whether this round should keep searching (enter the next loop round)
 ///
-/// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
-/// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
-fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
+/// Continue condition: every tool_use this round is web_search (at least one), the
+/// round limit has not been reached, and the WHOLE round still fits the remaining
+/// search budget (client max_uses, see [`web_search_budget`]). A round that only
+/// partially fits falls to the flush path, which enforces the budget per call.
+/// As soon as a client tool such as exec is mixed in, there is no tool_use at all,
+/// or the limit/budget is reached, it stops and flushes (exec is never swallowed).
+fn should_search_round(
+    round_idx: usize,
+    tool_uses: &[CompletedToolUse],
+    uses_so_far: usize,
+    budget: usize,
+) -> bool {
     let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
-    only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
+    only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS && uses_so_far + tool_uses.len() <= budget
 }
 
 /// Whether the request is the continuation immediately following a tool result.
@@ -270,7 +293,7 @@ fn accumulate_tool_usages(
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
-    model: &str,
+    context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
@@ -330,7 +353,7 @@ async fn decode_round(
                     }
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
+                    let window = context_window_size;
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
@@ -490,8 +513,8 @@ async fn start_round(
 
 async fn finish_round(
     started: StartedRound,
-    payload: &MessagesRequest,
     fallback_input_tokens: i32,
+    context_window_size: i32,
     tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let StartedRound {
@@ -500,8 +523,13 @@ async fn finish_round(
         call_result,
     } = started;
     let credential_id = call_result.credential_id;
-    let mut outcome =
-        decode_round(call_result.response, &payload.model, &tool_name_map, tracer).await;
+    let mut outcome = decode_round(
+        call_result.response,
+        context_window_size,
+        &tool_name_map,
+        tracer,
+    )
+    .await;
     outcome.known_tool_names = known_tool_names;
     outcome.tool_name_map = tool_name_map;
     if let Some(error_message) = outcome.stream_error.take() {
@@ -543,7 +571,11 @@ async fn run_round(
         tool_compatibility_mode,
     )
     .await?;
-    finish_round(started, payload, fallback_input_tokens, tracer).await
+    // 上下文窗口按本轮实际命中的凭据解析（跨轮故障转移时逐轮变化）
+    let context_window_size = provider
+        .token_manager()
+        .context_window_for_credential(started.call_result.credential_id, &payload.model);
+    finish_round(started, fallback_input_tokens, context_window_size, tracer).await
 }
 
 /// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
@@ -818,6 +850,8 @@ struct WebSearchUsageSettlement {
     credits: f64,
     /// 按凭据拆分的用量（跨轮故障转移时各轮可能命中不同凭据）。
     by_credential: std::collections::HashMap<u64, (TokenUsage, f64)>,
+    /// 首个非 0 凭据：请求级 calls/errors 的归属（HashMap 无序，需单独跟踪）。
+    first_credential: Option<u64>,
     settled: bool,
 }
 
@@ -829,6 +863,7 @@ impl WebSearchUsageSettlement {
             usage: TokenUsage::default(),
             credits: 0.0,
             by_credential: std::collections::HashMap::new(),
+            first_credential: None,
             settled: false,
         }
     }
@@ -841,6 +876,7 @@ impl WebSearchUsageSettlement {
             usage: TokenUsage::default(),
             credits: 0.0,
             by_credential: std::collections::HashMap::new(),
+            first_credential: None,
             settled: false,
         }
     }
@@ -854,6 +890,9 @@ impl WebSearchUsageSettlement {
         self.usage = self.usage.saturating_add(usage);
         self.credits += credits;
         if credential_id != 0 {
+            if self.first_credential.is_none() {
+                self.first_credential = Some(credential_id);
+            }
             let entry = self.by_credential.entry(credential_id).or_default();
             entry.0 = entry.0.saturating_add(usage);
             entry.1 += credits;
@@ -882,7 +921,12 @@ impl WebSearchUsageSettlement {
         // 总请求只记一次（credential_id=0，不算入凭据分布），保证
         // overall/by_key/by_model 的 calls 不因多轮而放大。
         record_aggregated_usage(&self.hook, 0, self.usage, self.credits, usage_status);
-        // 按凭据明细各记一次：仅更新凭据维度，不重复计调用数。
+        // 请求级凭据标记：分组时序的 calls/errors 归属首凭据（零 token，
+        // token/credit 归因仍由下方明细承担）。
+        if let Some(first) = self.first_credential {
+            self.hook.record_credential_request(first, usage_status);
+        }
+        // 按凭据明细各记一次：仅更新凭据维度的 token/credits，不计调用数。
         for (credential_id, (usage, credits)) in &self.by_credential {
             let usage = usage.sanitized();
             self.hook.record_credential_detail(
@@ -1328,11 +1372,7 @@ fn settle_round_failure(
     failure: RoundFailure,
     settlement: &mut WebSearchUsageSettlement,
 ) -> Response {
-    settlement.add(
-        failure.credential_id,
-        failure.token_usage,
-        failure.credits,
-    );
+    settlement.add(failure.credential_id, failure.token_usage, failure.credits);
     settlement.finish(
         "error",
         "error",
@@ -1457,6 +1497,9 @@ async fn run_web_search_loop_inner(
     let mut presentation: Vec<Value> = Vec::new();
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
+    // 搜索次数预算：客户端声明的 max_uses（默认 5），硬上限 10
+    let search_budget = web_search_budget(payload.tools.as_deref());
+    let mut search_uses = 0usize;
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
@@ -1468,10 +1511,15 @@ async fn run_web_search_loop_inner(
                 payload.tools.as_deref(),
             ) as i32;
             let (round, credential_id) = match if let Some(started) = first_round.take() {
+                // 上下文窗口按本轮实际命中的凭据解析（跨轮故障转移时逐轮变化）
+                let context_window_size = provider.token_manager().context_window_for_credential(
+                    started.call_result.credential_id,
+                    &payload.model,
+                );
                 finish_round(
                     started,
-                    &payload,
                     round_fallback_input_tokens,
+                    context_window_size,
                     tracer.as_ref(),
                 )
                 .await
@@ -1488,11 +1536,7 @@ async fn run_web_search_loop_inner(
             } {
                 Ok(v) => v,
                 Err(failure) => {
-                    settlement.add(
-                        failure.credential_id,
-                        failure.token_usage,
-                        failure.credits,
-                    );
+                    settlement.add(failure.credential_id, failure.token_usage, failure.credits);
                     settlement.finish(
                         "error",
                         "error",
@@ -1562,7 +1606,8 @@ async fn run_web_search_loop_inner(
             break round;
         };
 
-        if should_search_round(round_idx, &round.tool_uses) {
+        if should_search_round(round_idx, &round.tool_uses, search_uses, search_budget) {
+            search_uses += round.tool_uses.len();
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
@@ -1610,7 +1655,10 @@ async fn run_web_search_loop_inner(
         // (exec, etc.) are returned verbatim.
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
-            if tu.name == "web_search" {
+            // 预算已耗尽的 web_search 不再执行：产出空结果块（仍走
+            // server_tool_use + web_search_tool_result 呈现，INVARIANT 不破）
+            if tu.name == "web_search" && search_uses < search_budget {
+                search_uses += 1;
                 match execute_web_search(
                     &provider,
                     tu,
@@ -2103,9 +2151,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_during_first_connect_records_interrupted_once() {
         // 挂起的本地代理：接受连接但永不响应，使首轮建连 await 一直 pending。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let mut held = Vec::new();
@@ -2116,8 +2162,7 @@ mod tests {
 
         let mut cred = crate::kiro::model::credentials::KiroCredentials::default();
         cred.access_token = Some("t".to_string());
-        cred.expires_at =
-            Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        cred.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
         let manager = std::sync::Arc::new(
             crate::kiro::token_manager::MultiTokenManager::new(
                 crate::model::config::Config::default(),
@@ -2565,25 +2610,30 @@ mod tests {
     fn round_with_only_web_search_continues() {
         // Hit: this round is all web_search and the limit is not reached -> keep searching
         let tools = vec![tu("web_search"), tu("web_search")];
-        assert!(should_search_round(0, &tools));
-        assert!(should_search_round(MAX_WEB_SEARCH_ROUNDS - 1, &tools));
+        assert!(should_search_round(0, &tools, 0, 10));
+        assert!(should_search_round(
+            MAX_WEB_SEARCH_ROUNDS - 2,
+            &tools,
+            8,
+            MAX_WEB_SEARCH_ROUNDS
+        ));
     }
 
     #[test]
     fn round_with_exec_does_not_enter_loop() {
         // Skip: exec mixed in (not web_search) -> terminate, exec returned to the client as-is
         let mixed = vec![tu("web_search"), tu("exec")];
-        assert!(!should_search_round(0, &mixed));
+        assert!(!should_search_round(0, &mixed, 0, 10));
         // Same for exec-only
         let exec_only = vec![tu("exec")];
-        assert!(!should_search_round(0, &exec_only));
+        assert!(!should_search_round(0, &exec_only, 0, 10));
     }
 
     #[test]
     fn round_with_no_tool_use_does_not_enter_loop() {
         // Skip: no tool_use at all (plain-text answer) -> terminate
         let empty: Vec<CompletedToolUse> = vec![];
-        assert!(!should_search_round(0, &empty));
+        assert!(!should_search_round(0, &empty, 0, 10));
     }
 
     fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
@@ -2719,8 +2769,67 @@ mod tests {
     fn round_at_limit_stops_even_if_web_search() {
         // Limit reached: even if this round is all web_search, hitting the limit must stop (prevents an infinite loop)
         let tools = vec![tu("web_search")];
-        assert!(!should_search_round(MAX_WEB_SEARCH_ROUNDS, &tools));
-        assert!(!should_search_round(MAX_WEB_SEARCH_ROUNDS + 1, &tools));
+        assert!(!should_search_round(
+            MAX_WEB_SEARCH_ROUNDS,
+            &tools,
+            MAX_WEB_SEARCH_ROUNDS,
+            MAX_WEB_SEARCH_ROUNDS
+        ));
+        assert!(!should_search_round(
+            MAX_WEB_SEARCH_ROUNDS + 1,
+            &tools,
+            MAX_WEB_SEARCH_ROUNDS + 1,
+            MAX_WEB_SEARCH_ROUNDS
+        ));
+    }
+
+    // ---- web_search_budget: declared max_uses / default / hard cap ----
+
+    fn tool_with_max_uses(max_uses: Option<i32>) -> crate::anthropic::types::Tool {
+        crate::anthropic::types::Tool {
+            tool_type: Some("web_search_20250305".to_string()),
+            name: "web_search".to_string(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn search_budget_respects_declared_default_and_hard_cap() {
+        // 未声明（无 tools / 工具无 max_uses / 非正值）→ 默认 5
+        assert_eq!(web_search_budget(None), 5);
+        assert_eq!(web_search_budget(Some(&[tool_with_max_uses(None)])), 5);
+        assert_eq!(web_search_budget(Some(&[tool_with_max_uses(Some(0))])), 5);
+        // 显式声明 → 按声明执行
+        assert_eq!(web_search_budget(Some(&[tool_with_max_uses(Some(2))])), 2);
+        assert_eq!(web_search_budget(Some(&[tool_with_max_uses(Some(8))])), 8);
+        // 超过硬上限 → 截断
+        assert_eq!(
+            web_search_budget(Some(&[tool_with_max_uses(Some(50))])),
+            MAX_WEB_SEARCH_ROUNDS
+        );
+    }
+
+    #[test]
+    fn should_search_round_stops_when_budget_exhausted() {
+        let tools = vec![tu("web_search")];
+        // 预算 2：已执行 0/1 次时继续，执行满 2 次后停止（客户端 max_uses: 2 生效）
+        assert!(should_search_round(0, &tools, 0, 2));
+        assert!(should_search_round(1, &tools, 1, 2));
+        assert!(!should_search_round(2, &tools, 2, 2));
+    }
+
+    #[test]
+    fn round_partially_exceeding_budget_flushes_instead_of_continuing() {
+        // 同轮批量：预算 1 但本轮要 2 个搜索，整轮装不下 → 不 continue，
+        // 落到 flush 路径逐个扣减（执行 1 个、跳过 1 个），预算不被突破
+        let two = vec![tu("web_search"), tu("web_search")];
+        assert!(!should_search_round(0, &two, 0, 1));
+        // 整轮恰好装满预算时仍可 continue
+        assert!(should_search_round(0, &two, 0, 2));
+        assert!(!should_search_round(0, &two, 1, 2));
     }
 
     // ---- build_result_block: search results -> Contract A web_search_result fields ----

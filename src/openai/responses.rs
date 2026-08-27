@@ -388,9 +388,8 @@ pub async fn post_responses(
     // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
-    let status = inner.status();
-    if !status.is_success() {
-        return super::parse::convert_error_body(status, inner.into_body()).await;
+    if !inner.status().is_success() {
+        return super::parse::convert_error_body(inner).await;
     }
 
     if want_stream {
@@ -527,11 +526,15 @@ fn responses_to_anthropic(
     });
     let hosted_web_search_declared = hosted_web_search_entry.is_some();
     // 客户端可在声明 entry 的 `parameters` 里给 max_uses / max_num_results
-    //（与 Chat 同口径，不读顶层字段；Codex 常见 {type: web_search} 无 parameters，走默认 8）。
+    //（与 Chat 同口径，不读顶层字段；Codex 常见 {type: web_search} 无 parameters，走默认 5）。
     let web_search_max_uses = super::types::web_search_max_uses(
         hosted_web_search_entry.and_then(|entry| entry.get("parameters")),
     );
 
+    // tool_choice required/指定工具与 parallel_tool_calls:false 是有意兼容的
+    // 回显字段：Kiro 协议无对应执行控制，converter 不消费它们，响应原样回显
+    // （Codex 默认就发送 parallel_tool_calls:false，拒绝会破坏兼容）。
+    // tool_choice:none 是唯一实际生效的取值（下方把 tools 置空）。
     let tool_choice = req
         .tool_choice
         .as_ref()
@@ -587,8 +590,9 @@ fn responses_to_anthropic(
         Some(tool_list)
     };
     // effort 归一化与 Chat 路径逐字一致（types::openai_reasoning_to_anthropic）：
-    // none → 完全关推理（不下发 thinking/output_config）；minimal → low+4000；
-    // 未知值 → medium。原样透传会让 converter 兜底成 high（关推理变最高档推理）。
+    // none → 不下发 thinking，但保留 output_config.effort="none" 信号给模型感知的
+    // converter（GPT-5.6 显式关推理，其余模型不下发 reasoning 字段）；
+    // minimal → low+4000；未知值 → medium。
     let (thinking, output_config) = super::types::openai_reasoning_to_anthropic(
         req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
         None,
@@ -621,7 +625,8 @@ fn responses_to_anthropic(
 /// 原生 web_search 工具（kiro-rs 内部代答）。
 ///
 /// `max_uses` 取客户端声明 entry 的 `parameters`（`max_uses` / `max_num_results`），
-/// 缺失或非正时默认 `DEFAULT_WEB_SEARCH_MAX_USES`=8，与 Chat 路径同口径。
+/// 缺失或非正时默认 `DEFAULT_WEB_SEARCH_MAX_USES`=5，与 Chat 路径同口径；
+/// 执行循环按此预算扣减（另受 `MAX_WEB_SEARCH_ROUNDS`=10 硬上限截断）。
 fn native_web_search_tool(max_uses: i32) -> Tool {
     Tool {
         tool_type: Some("web_search_20250305".to_string()),
@@ -1311,7 +1316,9 @@ struct ResponsesStreamContext {
     stop_reason: Option<String>,
     saw_message_stop: bool,
     terminal: bool,
-    completed_response: Option<Value>,
+    /// store=true 时的落库计划：在 `finish()` 发出终态事件前完成保存，
+    /// 客户端收到 completed 即停止读取也不会丢存储
+    store_plan: Option<StreamStorePlan>,
 }
 
 impl ResponsesStreamContext {
@@ -1340,7 +1347,7 @@ impl ResponsesStreamContext {
             stop_reason: None,
             saw_message_stop: false,
             terminal: false,
-            completed_response: None,
+            store_plan: None,
         }
     }
 
@@ -1950,8 +1957,26 @@ impl ResponsesStreamContext {
             "response.completed"
         };
         self.terminal = true;
-        let response = self.response_object(status);
-        self.completed_response = Some(response.clone());
+        let mut response = self.response_object(status);
+        // store=true：先补全并落库，再发出终态事件（与非流式路径同口径）。
+        // 客户端收到 completed 后停止读取是常态，若等下一次 poll 才保存，
+        // 响应永远不会入库；终态对象本身也需携带 previous_response_id / metadata。
+        if let Some(store) = &self.store_plan {
+            response["previous_response_id"] = json!(store.previous_response_id);
+            if let Some(md) = &store.metadata {
+                response["metadata"] = md.clone();
+            }
+            let mut items = store.input_items.clone();
+            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                items.extend(output.iter().cloned());
+            }
+            save_response(
+                response["id"].as_str().unwrap_or_default().to_string(),
+                store.owner_key_id,
+                response.clone(),
+                items,
+            );
+        }
         vec![self.emit(event, json!({ "response": response }))]
     }
 
@@ -1995,6 +2020,7 @@ fn responses_streaming_response(
     store_plan: StreamStorePlan,
 ) -> Response {
     let mut context = ResponsesStreamContext::new(model, tool_kinds, response_config);
+    context.store_plan = store_plan.enabled.then_some(store_plan);
     let pending = VecDeque::from(context.initial_events());
     let stream = stream::unfold(
         (
@@ -2003,36 +2029,16 @@ fn responses_streaming_response(
             context,
             pending,
             false,
-            store_plan,
         ),
-        |(mut body, mut buffer, mut context, mut pending, mut finished, store_plan)| async move {
+        |(mut body, mut buffer, mut context, mut pending, mut finished)| async move {
             loop {
                 if let Some(bytes) = pending.pop_front() {
                     return Some((
                         Ok::<Bytes, Infallible>(bytes),
-                        (body, buffer, context, pending, finished, store_plan),
+                        (body, buffer, context, pending, finished),
                     ));
                 }
                 if finished || context.terminal {
-                    if store_plan.enabled {
-                        if let Some(mut response) = context.completed_response.take() {
-                            response["previous_response_id"] =
-                                json!(store_plan.previous_response_id);
-                            if let Some(md) = &store_plan.metadata {
-                                response["metadata"] = md.clone();
-                            }
-                            let mut items = store_plan.input_items.clone();
-                            if let Some(output) = response.get("output").and_then(Value::as_array) {
-                                items.extend(output.iter().cloned());
-                            }
-                            save_response(
-                                response["id"].as_str().unwrap_or_default().to_string(),
-                                store_plan.owner_key_id,
-                                response,
-                                items,
-                            );
-                        }
-                    }
                     return None;
                 }
                 match body.next().await {
@@ -2853,7 +2859,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_none_disables_thinking_and_output_config() {
+    fn reasoning_effort_none_disables_thinking_but_preserves_none_signal() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "input": simple_input(),
@@ -2861,10 +2867,11 @@ mod tests {
         }))
         .unwrap();
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
-        assert!(anth.thinking.is_none(), "effort=none 必须完全关推理");
-        assert!(
-            anth.output_config.is_none(),
-            "effort=none 不得下发 output_config（否则 converter 兜底成 high）"
+        assert!(anth.thinking.is_none(), "effort=none 必须关 thinking");
+        assert_eq!(
+            anth.output_config.map(|c| c.effort).as_deref(),
+            Some("none"),
+            "effort=none 的信号必须保留给模型感知的 converter（GPT-5.6 生成显式关推理 wire 字段）"
         );
     }
 
@@ -2963,7 +2970,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_web_search_tool_defaults_to_eight_max_uses() {
+    fn hosted_web_search_tool_defaults_to_five_max_uses() {
         let req = req_with(json!([{ "type": "web_search" }]), simple_input());
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
         let ws = anth
@@ -2973,7 +2980,7 @@ mod tests {
             .iter()
             .find(|t| t.name == "web_search")
             .unwrap();
-        assert_eq!(ws.max_uses, Some(8));
+        assert_eq!(ws.max_uses, Some(5));
     }
 
     #[test]
@@ -3024,7 +3031,7 @@ mod tests {
             .iter()
             .find(|t| t.name == "web_search")
             .unwrap();
-        assert_eq!(ws.max_uses, Some(8));
+        assert_eq!(ws.max_uses, Some(5));
     }
 
     #[tokio::test]
@@ -3584,6 +3591,71 @@ mod tests {
             .await
             .expect("translated stream must terminate after message_stop");
         assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_store_saves_before_terminal_event_is_read() {
+        let upstream = stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))])
+        .chain(stream::pending());
+        let response = responses_streaming_response(
+            Body::from_stream(upstream),
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+            StreamStorePlan {
+                enabled: true,
+                owner_key_id: 7,
+                previous_response_id: Some("resp_prev_1".to_string()),
+                metadata: Some(json!({"k": "v"})),
+                input_items: vec![json!({"type": "message", "role": "user", "content": "hi"})],
+            },
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        // 只读到 response.completed 就停止 poll（模拟客户端收到终态即断开）
+        let mut output = String::new();
+        while !output.contains("event: response.completed") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+                .await
+                .expect("response.completed must arrive")
+                .expect("stream must emit response.completed")
+                .unwrap();
+            output.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        drop(body);
+
+        // 终态事件本身携带 metadata / previous_response_id
+        let completed_frame = output
+            .split("\n\n")
+            .find(|frame| frame.contains("event: response.completed"))
+            .expect("completed event frame");
+        let data_line = completed_frame
+            .lines()
+            .find(|line| line.starts_with("data:"))
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(
+            payload["response"]["previous_response_id"],
+            json!("resp_prev_1")
+        );
+        assert_eq!(payload["response"]["metadata"], json!({"k": "v"}));
+        let resp_id = payload["response"]["id"].as_str().unwrap().to_string();
+
+        // 不再 poll 也已落库
+        let stored =
+            load_owned_response(&resp_id, 7).expect("store=true 的响应必须在终态事件发出前入库");
+        assert_eq!(
+            stored.response["previous_response_id"],
+            json!("resp_prev_1")
+        );
+        assert_eq!(stored.response["metadata"], json!({"k": "v"}));
+        assert_eq!(
+            stored.items.first(),
+            Some(&json!({"type": "message", "role": "user", "content": "hi"}))
+        );
     }
 
     #[test]

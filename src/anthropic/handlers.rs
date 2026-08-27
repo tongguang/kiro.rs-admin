@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -94,6 +94,7 @@ impl UsageRecordHook {
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -119,6 +120,35 @@ impl UsageRecordHook {
     ///
     /// 只写 recorder / aggregator 的凭据维度，不重复累计 overall / client key
     /// 总量与调用数——一次客户端请求的总调用数仍由 [`Self::record`] 记一次。
+    /// 请求级凭据标记：只让凭据维度计 calls/errors（零 token），供 WebSearch
+    /// 把请求归属到首凭据，分组时序据此取请求级 calls/errors。
+    pub fn record_credential_request(&self, credential_id: u64, status: &str) {
+        if credential_id == 0 {
+            return;
+        }
+        let rec = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: self.key_id,
+            credential_id,
+            model: self.model.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            status: status.to_string(),
+            credential_detail: false,
+            credential_request: true,
+        };
+        if let Some(r) = &self.recorder {
+            r.record(&rec);
+        }
+        if let Some(a) = &self.aggregator {
+            a.ingest(&rec);
+        }
+    }
+
     pub fn record_credential_detail(
         &self,
         credential_id: u64,
@@ -149,6 +179,7 @@ impl UsageRecordHook {
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
             credential_detail: true,
+            credential_request: false,
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -989,6 +1020,10 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
+    ctx.context_window_size = provider
+        .token_manager()
+        .context_window_for_credential(credential_id, model);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1346,6 +1381,10 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
+    let context_window_size = provider
+        .token_manager()
+        .context_window_for_credential(credential_id, model);
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1399,10 +1438,10 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
+                            let actual_input_tokens = (context_usage.context_usage_percentage
+                                * (context_window_size as f64)
+                                / 100.0)
+                                as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -1480,7 +1519,15 @@ async fn handle_non_stream_request(
         } else {
             TraceUsage::zero()
         };
-        hook.record(credential_id, in_t, out_t, cw, cr, credits_for_hook, "error");
+        hook.record(
+            credential_id,
+            in_t,
+            out_t,
+            cw,
+            cr,
+            credits_for_hook,
+            "error",
+        );
         tracer.finalize(
             "error",
             Some(outcome::BAD_REQUEST),
@@ -1997,6 +2044,12 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
+    ctx.set_context_window_size(
+        provider
+            .token_manager()
+            .context_window_for_credential(credential_id, model),
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

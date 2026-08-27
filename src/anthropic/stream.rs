@@ -1381,6 +1381,9 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 百分比反推用的上下文窗口大小：构造时取硬编码表，handler 可用
+    /// `MultiTokenManager::context_window_for_model` 的上游缓存值覆盖
+    pub context_window_size: i32,
     /// 上游 metadataEvent.tokenUsage 的精确最终快照。
     pub provider_token_usage: Option<TokenUsage>,
     /// 输出 tokens 累计
@@ -1487,12 +1490,15 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        let model = model.into();
+        let context_window_size = get_context_window_size(&model);
         Self {
             state_manager: SseStateManager::new(),
-            model: model.into(),
+            model,
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            context_window_size,
             provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
@@ -1606,7 +1612,7 @@ impl StreamContext {
             }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                let window_size = self.context_window_size;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -2636,6 +2642,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 覆盖上下文窗口大小（handler 用 manager 解析出的上游缓存值注入）。
+    pub fn set_context_window_size(&mut self, size: i32) {
+        self.inner.context_window_size = size;
     }
 
     /// 处理 Kiro 事件并缓冲结果

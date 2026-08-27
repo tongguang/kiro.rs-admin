@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::types::{
-    CacheControl, Message, MessagesRequest, OutputConfig, SystemMessage, Thinking, Tool,
+    CacheControl, DEFAULT_WEB_SEARCH_MAX_USES, Message, MessagesRequest, OutputConfig,
+    SystemMessage, Thinking, Tool,
 };
 
 pub(crate) const DEFAULT_MAX_TOKENS: i32 = 32000;
@@ -367,9 +368,6 @@ fn tool_result_content(content: Option<&Value>) -> Result<Value, OpenAIConversio
     }
 }
 
-/// OpenAI 内置 web search 工具的默认 max_uses（与 Anthropic 原生路径 websearch.rs 对齐）。
-const DEFAULT_WEB_SEARCH_MAX_USES: i32 = 8;
-
 /// 从客户端声明的参数读取 web_search 的 `max_uses`（兼容 `max_num_results` 别名），
 /// 缺失或为非正值时回落 [`DEFAULT_WEB_SEARCH_MAX_USES`]。Chat 与 Responses 共用口径。
 pub(crate) fn web_search_max_uses(parameters: Option<&Value>) -> i32 {
@@ -500,12 +498,21 @@ pub(crate) fn openai_reasoning_to_anthropic(
 
     // Codex/OpenAI 的 effort 档位（none/minimal/low/medium/high/xhigh）归一化为后端
     // `EffortTier` 认得的值（low/medium/high/xhigh），并给出对应 thinking 预算：
-    // - "none"：显式关闭推理，不下发 thinking / output_config。若原样透传，后端
-    //   `EffortTier::parse("none")` 会失败并 fallback 到 high，等于把“关推理”变成高强度推理。
+    // - "none"：显式关闭推理。不下发 thinking，但保留 output_config.effort="none"
+    //   信号给模型感知的 converter：GPT-5.6 系生成 `reasoning.effort:"none"` wire
+    //   字段显式关推理，其余模型不下发任何 reasoning 字段（若在此折叠信号，GPT-5.6
+    //   会落回默认推理强度而非"关"）。
     // - "minimal"：后端无此档，降级到最低的 low（原样透传同样会被 parse 拒绝 → fallback high）。
     // - 其他未知值：兜底 medium。
     let (budget, normalized_effort) = match effort.as_str() {
-        "none" => return (None, None),
+        "none" => {
+            return (
+                None,
+                Some(OutputConfig {
+                    effort: "none".to_string(),
+                }),
+            );
+        }
         "minimal" | "low" => (4_000, "low"),
         "medium" => (12_000, "medium"),
         "high" => (20_000, "high"),

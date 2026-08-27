@@ -377,8 +377,9 @@ pub fn normalize_model_id(model: &str) -> String {
 pub fn get_context_window_size(model: &str) -> i32 {
     let mapped = normalize_model_id(model);
     let model_lower = mapped.to_ascii_lowercase();
-    // GPT-5.6 family on Kiro ships a 272K context window.
-    if model_lower.starts_with("gpt") {
+    // GPT-5.6 family on Kiro ships a 272K context window. 只匹配 5.6 系：
+    // gpt-4 等其它透传型号不是 272K，落回通用默认值。
+    if model_lower.starts_with("gpt-5.6") {
         return 272_000;
     }
     match mapped.as_str() {
@@ -536,11 +537,9 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::None && !model_uses_gpt_reasoning_effort(model_id)
-    {
-        // `none` 仅 GPT-5.6 系接受；Claude 系下发改用 high，避免 400。
-        EffortTier::High
-    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+    // `none` 在到达这里之前已被 build_additional_model_request_fields 按模型拦截
+    // （GPT-5.6 系原样下发，其余模型不下发任何字段），不会走到归一化。
+    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
@@ -591,6 +590,18 @@ fn build_additional_model_request_fields(
         .thinking
         .as_ref()
         .is_some_and(|t| t.thinking_type == "disabled")
+    {
+        return None;
+    }
+
+    // 显式 effort "none"：仅 GPT-5.6 系接受该档位（下方生成 reasoning.effort:"none"
+    // wire 字段）；其余模型不下发任何 reasoning 字段即关闭推理。
+    if req
+        .output_config
+        .as_ref()
+        .and_then(|oc| EffortTier::parse(&oc.effort))
+        == Some(EffortTier::None)
+        && !model_uses_gpt_reasoning_effort(model_id)
     {
         return None;
     }
@@ -2113,6 +2124,8 @@ mod tests {
         // 开放透传：未知但合法的 ID 原样下发，由上游裁决
         assert_eq!(map_model("gpt-4"), Some("gpt-4".to_string()));
         assert_eq!(normalize_model_id("gpt-4-thinking"), "gpt-4");
+        // 272K 仅属 GPT-5.6 系；gpt-4 等透传型号落回通用默认窗口
+        assert_eq!(get_context_window_size("gpt-4"), 200_000);
     }
 
     #[test]
@@ -2573,11 +2586,17 @@ mod tests {
     }
 
     #[test]
-    fn none_effort_falls_back_for_claude() {
-        assert_eq!(
-            normalize_effort_for_model("claude-opus-4.7", "none").as_deref(),
-            Some("high")
+    fn explicit_none_effort_emits_nothing_for_claude_but_reasoning_for_gpt() {
+        // Claude 系：显式 none → 不下发任何 reasoning 字段（关闭推理）
+        let req = minimal_request_with_effort("claude-opus-4.7", "none");
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "Claude 系显式 none 不应下发任何 reasoning 字段"
         );
+
+        // normalize 层面对 GPT-5.6 保留 none（wire 字段生成见
+        // gpt_5_6_effort_uses_reasoning_wire_field）
         assert_eq!(
             normalize_effort_for_model("gpt-5.6-sol", "none").as_deref(),
             Some("none")

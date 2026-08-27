@@ -1749,6 +1749,37 @@ impl MultiTokenManager {
         })
     }
 
+    /// 解析模型的上下文窗口大小。
+    ///
+    /// 优先使用本次实际命中凭据（`credential_id`）缓存的模型列表中该模型的
+    /// `maxInputTokens`（上游按订阅等级下发，同一模型在不同凭据上可能不同；
+    /// 用最后一次成功加载，不要求 TTL 新鲜）。该凭据缓存未覆盖时（冷缓存 /
+    /// 上游缺该字段 / 透传模型不在列表 / `credential_id == 0`）回落硬编码表
+    /// [`crate::anthropic::converter::get_context_window_size`]。不借用其他凭据的
+    /// 缓存：窗口随订阅等级变化，串用同样会错。
+    pub fn context_window_for_credential(&self, credential_id: u64, model: &str) -> i32 {
+        if credential_id != 0 {
+            let mapped = crate::anthropic::converter::normalize_model_id(model);
+            let max_input = self
+                .model_cache
+                .lock()
+                .get(&credential_id)
+                .and_then(|cache| {
+                    cache
+                        .response
+                        .models
+                        .iter()
+                        .find(|m| m.model_id.eq_ignore_ascii_case(&mapped))
+                        .and_then(|m| m.token_limits.as_ref())
+                        .and_then(|limits| limits.max_input_tokens)
+                });
+            if let Some(max_input) = max_input {
+                return max_input as i32;
+            }
+        }
+        crate::anthropic::converter::get_context_window_size(model)
+    }
+
     fn model_cache_generation(&self, id: u64) -> u64 {
         self.model_cache_generations
             .lock()
@@ -2609,25 +2640,9 @@ impl MultiTokenManager {
             }
         };
 
-        // 从文件中查找对应凭据
-        let matched = file_creds
-            .iter()
-            .find(|fc| {
-                if fc.id.is_some() && fc.id == current_cred_id {
-                    return true;
-                }
-                if fc.email.is_some() && fc.email == current_email {
-                    return true;
-                }
-                false
-            })
-            .or_else(|| {
-                if file_creds.len() == 1 && entries_len == 1 {
-                    file_creds.first()
-                } else {
-                    None
-                }
-            });
+        // 从文件中查找对应凭据（与回写路径同口径：id 优先、同 email 多条拒配、单条兜底）
+        let matched =
+            match_file_credential(&file_creds, current_cred_id, &current_email, entries_len);
 
         let file_cred = match matched {
             Some(c) => c,
@@ -3239,21 +3254,38 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                // 并发下另一请求可能先把同一凭据标为自动禁用（TooManyFailures /
+                // TooManyRefreshFailures）；明确的额度耗尽响应必须把它升级为不可自愈的
+                // QuotaExceeded 终态（与 Suspended 升级同范式）。手动禁用与其他
+                // 终态（Suspended/InvalidRefreshToken 等）不覆盖。
+                if !matches!(
+                    entry.disabled_reason,
+                    Some(DisabledReason::TooManyFailures)
+                        | Some(DisabledReason::TooManyRefreshFailures)
+                ) {
+                    return entries.iter().any(|e| !e.disabled);
+                }
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.clear_self_heal_streak();
+                tracing::error!(
+                    "凭据 #{} 已自动禁用，额度耗尽响应将其升级为 QuotaExceeded（不再参与自愈）",
+                    id
+                );
+            } else {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.clear_self_heal_streak();
+                // 设为阈值，便于在管理面板中直观看到该凭据已不可用
+                entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                entry.total_failure_count += 1;
+
+                tracing::error!(
+                    "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT 或 OVERAGE_REQUEST_LIMIT_EXCEEDED），已被禁用",
+                    id
+                );
             }
-
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-            entry.clear_self_heal_streak();
-            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
-            entry.total_failure_count += 1;
-
-            tracing::error!(
-                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT 或 OVERAGE_REQUEST_LIMIT_EXCEEDED），已被禁用",
-                id
-            );
 
             // 切换到优先级最高的可用凭据
             let has_available = if let Some(next) = entries
@@ -3368,18 +3400,35 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                // 并发下另一请求可能先把同一凭据标为自动禁用（TooManyFailures /
+                // TooManyRefreshFailures）；明确的 invalid_grant 响应必须把它升级为不可自愈的
+                // InvalidRefreshToken 终态（与 Suspended 升级同范式）。手动禁用与其他
+                // 终态（Suspended/QuotaExceeded 等）不覆盖。
+                if !matches!(
+                    entry.disabled_reason,
+                    Some(DisabledReason::TooManyFailures)
+                        | Some(DisabledReason::TooManyRefreshFailures)
+                ) {
+                    return entries.iter().any(|e| !e.disabled);
+                }
+                entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.clear_self_heal_streak();
+                tracing::error!(
+                    "凭据 #{} 已自动禁用，invalid_grant 响应将其升级为 InvalidRefreshToken（不再参与自愈）",
+                    id
+                );
+            } else {
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+                entry.clear_self_heal_streak();
+
+                tracing::error!(
+                    "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
+                    id
+                );
             }
-
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
-            entry.clear_self_heal_streak();
-
-            tracing::error!(
-                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
-                id
-            );
 
             let has_available = if let Some(next) = entries
                 .iter()
@@ -3401,7 +3450,11 @@ impl MultiTokenManager {
         };
         if newly_disabled {
             if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} refreshToken 失效禁用状态持久化失败: {}", id, error);
+                tracing::warn!(
+                    "凭据 #{} refreshToken 失效禁用状态持久化失败: {}",
+                    id,
+                    error
+                );
             }
         }
         self.save_stats_debounced();
@@ -5541,6 +5594,31 @@ mod tests {
         );
     }
 
+    fn seed_model_cache_with_limits(
+        manager: &MultiTokenManager,
+        id: u64,
+        model_id: &str,
+        max_input: i64,
+    ) {
+        manager.model_cache.lock().insert(
+            id,
+            ModelCacheEntry {
+                response: ListAvailableModelsResponse {
+                    models: vec![UpstreamModel {
+                        model_id: model_id.to_string(),
+                        model_name: None,
+                        description: None,
+                        token_limits: Some(crate::kiro::model::available_models::TokenLimits {
+                            max_input_tokens: Some(max_input),
+                            max_output_tokens: None,
+                        }),
+                    }],
+                },
+                refreshed_at: Instant::now(),
+            },
+        );
+    }
+
     fn issue51_credentials_path(name: &str) -> (PathBuf, PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5789,6 +5867,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn report_quota_exhausted_upgrades_too_many_failures_and_blocks_self_heal() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 并发场景：凭据 #1 先被另一请求打成可自愈的 TooManyFailures
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(e1.disabled_reason.as_deref(), Some("TooManyFailures"));
+        }
+
+        // 晚到的额度耗尽响应必须升级为 QuotaExceeded 终态
+        manager.report_quota_exhausted(1);
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(
+                e1.disabled_reason.as_deref(),
+                Some("QuotaExceeded"),
+                "TooManyFailures 应升级为 QuotaExceeded，避免被自愈复活"
+            );
+        }
+
+        // 把 #2 也打成 TooManyFailures 制造作用域全灭触发自愈：#1 不得复活，#2 可以
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(2);
+        }
+        assert!(manager.try_self_heal(None, None), "#2 应被自愈");
+        let snapshot = manager.snapshot();
+        let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e1.disabled, "QuotaExceeded 终态不得被自愈复活");
+        assert_eq!(e1.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        let e2 = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!e2.disabled, "TooManyFailures 的 #2 应被自愈复活");
+    }
+
+    #[test]
+    fn report_refresh_token_invalid_upgrades_too_many_failures_and_blocks_self_heal() {
+        let mut config = Config::default();
+        config.self_heal_min_interval_secs = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        // 晚到的 invalid_grant 响应必须升级为 InvalidRefreshToken 终态
+        manager.report_refresh_token_invalid(1);
+        {
+            let snapshot = manager.snapshot();
+            let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(
+                e1.disabled_reason.as_deref(),
+                Some("InvalidRefreshToken"),
+                "TooManyFailures 应升级为 InvalidRefreshToken，避免被自愈复活"
+            );
+        }
+
+        // 自愈不得复活 InvalidRefreshToken 终态
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(2);
+        }
+        assert!(manager.try_self_heal(None, None), "#2 应被自愈");
+        let snapshot = manager.snapshot();
+        let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e1.disabled, "InvalidRefreshToken 终态不得被自愈复活");
+        assert_eq!(e1.disabled_reason.as_deref(), Some("InvalidRefreshToken"));
+        let e2 = snapshot.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(!e2.disabled, "TooManyFailures 的 #2 应被自愈复活");
+    }
+
+    #[test]
+    fn report_quota_exhausted_does_not_override_manual_disable() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.report_quota_exhausted(1);
+        let snapshot = manager.snapshot();
+        let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            e1.disabled_reason.as_deref(),
+            Some("Manual"),
+            "手动禁用不应被额度耗尽响应覆盖"
+        );
+    }
+
+    #[test]
+    fn report_refresh_token_invalid_does_not_override_manual_disable() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.report_refresh_token_invalid(1);
+        let snapshot = manager.snapshot();
+        let e1 = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            e1.disabled_reason.as_deref(),
+            Some("Manual"),
+            "手动禁用不应被 invalid_grant 响应覆盖"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn rpm_exhaustion_does_not_trigger_self_heal() {
         // cred1 健康但 RPM 打满；cred2 已 TooManyFailures。
@@ -5930,9 +6142,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_failover_skips_decode_errors() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -7767,6 +7977,158 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 同 email 多条记录时，exact ID 靠后也必须命中 exact ID（不得串写其他账号 token）
+    #[test]
+    fn test_reload_from_file_prefers_exact_id_over_earlier_same_email() {
+        let path = tmp_creds_path("reload_id_beats_email");
+
+        // 内存凭据：id=2, email=a@x.com
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(2);
+        cred.email = Some("a@x.com".to_string());
+        cred.refresh_token = Some("old_token".repeat(10));
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 文件里同 email 两条：id=1 在前，exact id=2 在后
+        let files = vec![
+            file_cred(1, "a@x.com", "tok_a"),
+            file_cred(2, "a@x.com", "tok_b"),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&files).unwrap()).unwrap();
+
+        assert!(
+            manager.try_reload_credential_from_file(2),
+            "exact ID 存在时 reload 应命中并返回 true"
+        );
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(
+            entry.credentials.refresh_token.as_deref(),
+            Some("tok_b"),
+            "必须命中 exact ID 的 token，而不是靠前的同 email 记录"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 同 email 多条且 id 均未命中时，reload 必须拒绝（不串写、不改写内存 token）
+    #[test]
+    fn test_reload_from_file_rejects_ambiguous_same_email() {
+        let path = tmp_creds_path("reload_ambiguous_email");
+
+        // 内存凭据：id=3, email=a@x.com（文件中不存在该 id）
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(3);
+        cred.email = Some("a@x.com".to_string());
+        cred.refresh_token = Some("old_token".repeat(10));
+        let expected_token = cred.refresh_token.clone();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let files = vec![
+            file_cred(1, "a@x.com", "tok_a"),
+            file_cred(2, "a@x.com", "tok_b"),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&files).unwrap()).unwrap();
+
+        assert!(
+            !manager.try_reload_credential_from_file(3),
+            "同 email 多条且 id 未命中时 reload 应拒绝"
+        );
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == 3).unwrap();
+        assert_eq!(
+            entry.credentials.refresh_token.as_deref(),
+            expected_token.as_deref(),
+            "歧义时内存 token 不得被改写"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── context_window_for_credential ────────────────────────────────────
+
+    #[test]
+    fn context_window_prefers_actual_credential_cache_value() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 同一模型在不同凭据上窗口不同（订阅等级差异）：必须用实际命中的凭据
+        seed_model_cache_with_limits(&manager, 1, "claude-sonnet-4.6", 1_000_000);
+        seed_model_cache_with_limits(&manager, 2, "claude-sonnet-4.6", 200_000);
+        assert_eq!(
+            manager.context_window_for_credential(1, "claude-sonnet-4.6"),
+            1_000_000
+        );
+        assert_eq!(
+            manager.context_window_for_credential(2, "claude-sonnet-4.6"),
+            200_000
+        );
+    }
+
+    #[test]
+    fn context_window_falls_back_to_table_when_credential_cache_misses() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // id=0（请求未走到上游）→ 直接走硬编码表
+        assert_eq!(
+            manager.context_window_for_credential(0, "gpt-5.6-sol"),
+            272_000
+        );
+        // 缓存中模型缺 token_limits 字段 → 回落表
+        seed_model_cache(&manager, 1, &["claude-opus-4.7"]);
+        assert_eq!(
+            manager.context_window_for_credential(1, "claude-opus-4.7"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn context_window_does_not_borrow_other_credentials_cache() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 凭据 1 的缓存窗口 111K；凭据 2 缓存未覆盖 → 回落表，不串用凭据 1 的值
+        seed_model_cache_with_limits(&manager, 1, "my-model", 111_000);
+        assert_eq!(
+            manager.context_window_for_credential(2, "my-model"),
+            200_000
+        );
+        // 透传模型不在任何上游列表：gpt-4 → 通用默认 200K（不再是 272K）
+        assert_eq!(manager.context_window_for_credential(1, "gpt-4"), 200_000);
+    }
+
     /// 未配置 credentials_path 时，reload 返回 false
     #[test]
     fn test_reload_from_file_returns_false_without_path() {
@@ -8119,10 +8481,7 @@ mod tests {
             .discover_models_for_group(Some("g1"))
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            ModelDiscoveryError::NoAvailableCredentials
-        ));
+        assert!(matches!(err, ModelDiscoveryError::NoAvailableCredentials));
     }
 
     #[test]

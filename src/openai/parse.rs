@@ -8,8 +8,7 @@
 
 use axum::http::HeaderMap;
 use axum::{
-    body::{Body, to_bytes},
-    http::StatusCode,
+    body::to_bytes,
     response::{IntoResponse, Json, Response},
 };
 use serde_json::{Value, json};
@@ -358,11 +357,19 @@ pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// 把内部 Anthropic 错误体归一化为 OpenAI `{"error":{message,type}}` 形状。
+/// 把内部 Anthropic 错误响应归一化为 OpenAI `{"error":{message,type}}` 形状。
 ///
 /// 非 JSON 体用 lossy 文本作 message；缺 `error.type` 时补 `server_error`。
-pub(crate) async fn convert_error_body(status: StatusCode, body: Body) -> Response {
-    let bytes = to_bytes(body, MAX_ERROR_BODY).await.unwrap_or_default();
+/// 仅透传 `Retry-After` 头（429 重试语义）；Content-Length 等头与新 body 不符，不复制。
+pub(crate) async fn convert_error_body(inner: Response) -> Response {
+    let status = inner.status();
+    let retry_after = inner
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .cloned();
+    let bytes = to_bytes(inner.into_body(), MAX_ERROR_BODY)
+        .await
+        .unwrap_or_default();
     let parsed = serde_json::from_slice::<Value>(&bytes).ok();
     let message = parsed
         .as_ref()
@@ -375,12 +382,20 @@ pub(crate) async fn convert_error_body(status: StatusCode, body: Body) -> Respon
         .and_then(|v| v.pointer("/error/type"))
         .and_then(Value::as_str)
         .unwrap_or("server_error");
-    (status, Json(openai_error(message, error_type))).into_response()
+    let mut response = (status, Json(openai_error(message, error_type))).into_response();
+    if let Some(value) = retry_after {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
 
     #[test]
     fn parse_anthropic_message_extracts_credit_fields() {
@@ -446,11 +461,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_error_body_normalizes_non_json_and_sets_content_type() {
-        let resp = convert_error_body(
-            StatusCode::TOO_MANY_REQUESTS,
-            Body::from("not-json retry later"),
-        )
-        .await;
+        let inner = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(Body::from("not-json retry later"))
+            .unwrap();
+        let resp = convert_error_body(inner).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let content_type = resp
             .headers()
@@ -474,13 +489,34 @@ mod tests {
             "type": "error",
             "error": {"type": "rate_limit_error", "message": "slow down"}
         });
-        let resp =
-            convert_error_body(StatusCode::TOO_MANY_REQUESTS, Body::from(inner.to_string())).await;
+        let inner = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(Body::from(inner.to_string()))
+            .unwrap();
+        let resp = convert_error_body(inner).await;
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v.get("type").is_none());
         assert_eq!(v["error"]["type"], "rate_limit_error");
         assert_eq!(v["error"]["message"], "slow down");
+    }
+
+    #[tokio::test]
+    async fn convert_error_body_preserves_retry_after() {
+        let inner = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(axum::http::header::RETRY_AFTER, "30")
+            .body(Body::from("slow down"))
+            .unwrap();
+        let resp = convert_error_body(inner).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "429 转换不得丢失 Retry-After"
+        );
     }
 
     #[test]

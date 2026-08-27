@@ -50,10 +50,15 @@ pub struct UsageRecord {
     /// "success" 或 "error"
     pub status: String,
     /// 凭据分桶明细记录（如 WebSearch 多凭据拆分）：只更新 by_credential /
-    /// by_key_credential 的 token/credits，不参与 overall/by_key/by_model 的
-    /// calls 计数，避免一条客户端请求被回放成多次调用。
+    /// by_key_credential 的 token/credits 归因，不参与 overall/by_key/by_model
+    /// 的 calls 计数，也不计凭据维度的 calls/errors。
     #[serde(default)]
     pub credential_detail: bool,
+    /// 请求级凭据标记记录（如 WebSearch 首凭据）：只更新 by_credential /
+    /// by_key_credential 的 calls/errors（不携带 token），使分组时序能取到
+    /// 请求级 calls/errors；token/credit 归因仍由 credential_detail 承担。
+    #[serde(default)]
+    pub credential_request: bool,
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -200,17 +205,22 @@ impl BucketStats {
         }
     }
 
-    /// 凭据明细：累计 token/credits，并给参与凭据记 1 次调用（不计 errors）。
-    ///
-    /// calls 只落在 by_credential / by_key_credential 维度，overall/by_key/by_model
-    /// 仍只靠主记录计数，因此凭据维度的 calls 总和可能大于 overall（多轮各记一次）。
+    /// 凭据明细：只累计 token/credits 归因，不计调用数与 errors。
+    /// 请求级 calls/errors 由 [`Self::add_credential_request`]（首凭据标记）承担。
     fn add_credential_detail(&mut self, rec: &UsageRecord) {
         self.input_tokens += rec.input_tokens;
         self.output_tokens += rec.output_tokens;
         self.cache_creation_tokens += rec.cache_creation_tokens;
         self.cache_read_tokens += rec.cache_read_tokens;
         self.credits += rec.credits;
+    }
+
+    /// 请求级凭据标记：只计 calls/errors，不累计 token（token 由明细记录承担）。
+    fn add_credential_request(&mut self, rec: &UsageRecord) {
         self.calls += 1;
+        if rec.status != "success" {
+            self.errors += 1;
+        }
     }
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
@@ -641,6 +651,25 @@ fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max
 }
 
 fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
+    // 请求级凭据标记记录只更新凭据维度的 calls/errors（不携带 token）
+    if rec.credential_request {
+        if rec.credential_id == 0 {
+            return;
+        }
+        bucket
+            .by_credential
+            .entry(rec.credential_id)
+            .or_default()
+            .add_credential_request(rec);
+        bucket
+            .by_key_credential
+            .entry(rec.key_id)
+            .or_default()
+            .entry(rec.credential_id)
+            .or_default()
+            .add_credential_request(rec);
+        return;
+    }
     // 凭据明细记录只更新凭据维度，不污染 overall/by_key/by_model 的调用数
     if rec.credential_detail {
         if rec.credential_id == 0 {
@@ -771,6 +800,7 @@ mod tests {
             duration_ms: 1500,
             status: "success".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -810,6 +840,7 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -824,6 +855,7 @@ mod tests {
             duration_ms: 200,
             status: "error".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -879,6 +911,7 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -893,6 +926,7 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -943,6 +977,7 @@ mod tests {
             duration_ms: 100,
             status: "error".to_string(),
             credential_detail: false,
+            credential_request: false,
         };
         agg.ingest(&rec);
         let ov = agg.overview();
@@ -966,6 +1001,23 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
             credential_detail: false,
+            credential_request: false,
+        };
+        // 请求级凭据标记：首凭据 7 计 1 次调用（零 token）
+        let marker = |cid: u64, status: &str| UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: cid,
+            model: "m".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: 100,
+            status: status.to_string(),
+            credential_detail: false,
+            credential_request: true,
         };
         // 凭据明细：两个凭据各自的拆分
         let detail = |cid: u64, input: u64, credits: f64| UsageRecord {
@@ -981,8 +1033,10 @@ mod tests {
             duration_ms: 100,
             status: "success".to_string(),
             credential_detail: true,
+            credential_request: false,
         };
         agg.ingest(&main);
+        agg.ingest(&marker(7, "success"));
         agg.ingest(&detail(7, 3, 0.5));
         agg.ingest(&detail(8, 10, 0.25));
 
@@ -991,14 +1045,58 @@ mod tests {
         assert_eq!(ov.today_calls, 1);
         assert_eq!(ov.today_input_tokens, 13);
 
-        // 凭据维度带 token/credits，且每个参与凭据各记 1 次调用
+        // 凭据维度：token/credits 来自明细；请求级 calls 只来自首凭据标记
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
         let by_cred = agg.query_by_credential(window, None, None);
         let cred7 = by_cred.iter().find(|c| c.credential_id == 7).unwrap();
         let cred8 = by_cred.iter().find(|c| c.credential_id == 8).unwrap();
         assert_eq!(cred7.input_tokens, 3);
-        assert_eq!(cred7.calls, 1);
+        assert_eq!(cred7.calls, 1, "请求级 calls 只记在主凭据上");
         assert_eq!(cred8.input_tokens, 10);
-        assert_eq!(cred8.calls, 1);
+        assert_eq!(cred8.calls, 0, "明细不再计调用数");
+    }
+
+    #[test]
+    fn group_timeseries_uses_request_level_marker_not_detail_calls() {
+        let agg = UsageAggregator::new();
+        let rec = |cid: u64, input: u64, status: &str, detail: bool, marker: bool| UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: cid,
+            model: "m".to_string(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: 100,
+            status: status.to_string(),
+            credential_detail: detail,
+            credential_request: marker,
+        };
+        // 一次失败请求，跨同组两个凭据（7 为首凭据）
+        agg.ingest(&rec(0, 13, "error", false, false)); // 聚合主记录
+        agg.ingest(&rec(7, 0, "error", false, true)); // 请求级标记
+        agg.ingest(&rec(7, 3, "error", true, false)); // 明细
+        agg.ingest(&rec(8, 10, "error", true, false)); // 明细
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let group: std::collections::HashSet<u64> = [7, 8].into_iter().collect();
+        let points = agg.query_timeseries(window, None, Some(&group));
+        assert_eq!(
+            points.iter().map(|p| p.calls).sum::<u64>(),
+            1,
+            "一次跨两凭据的请求在分组时序只算一次调用"
+        );
+        assert_eq!(
+            points.iter().map(|p| p.errors).sum::<u64>(),
+            1,
+            "失败请求在分组时序必须计入 errors"
+        );
+        assert_eq!(
+            points.iter().map(|p| p.input_tokens).sum::<u64>(),
+            13,
+            "token 归因来自明细记录"
+        );
     }
 }

@@ -20,9 +20,7 @@ use super::parse::{
     chat_message_from_parsed, chat_usage_json, map_finish_reason, now_ts, parse_anthropic_message,
     parse_sse_frame, take_sse_frames,
 };
-use super::types::{
-    ChatCompletionRequest, OpenAIConversionError, chat_to_anthropic, openai_error,
-};
+use super::types::{ChatCompletionRequest, OpenAIConversionError, chat_to_anthropic, openai_error};
 
 const MAX_COLLECT_BYTES: usize = 32 * 1024 * 1024;
 
@@ -74,13 +72,11 @@ fn openai_status_error(
 }
 
 async fn convert_chat_non_stream_response(response: Response, model: String) -> Response {
-    let status = response.status();
-    let body = response.into_body();
-    if !status.is_success() {
-        return super::parse::convert_error_body(status, body).await;
+    if !response.status().is_success() {
+        return super::parse::convert_error_body(response).await;
     }
 
-    let value = match collect_json_body(body).await {
+    let value = match collect_json_body(response.into_body()).await {
         Ok(value) => value,
         Err(resp) => return resp,
     };
@@ -129,9 +125,8 @@ async fn convert_chat_stream_response(
     model: String,
     include_usage: bool,
 ) -> Response {
-    let status = response.status();
-    if !status.is_success() {
-        return super::parse::convert_error_body(status, response.into_body()).await;
+    if !response.status().is_success() {
+        return super::parse::convert_error_body(response).await;
     }
 
     let stream = transform_anthropic_sse(
@@ -596,7 +591,7 @@ mod tests {
                 tt.starts_with("web_search_"),
                 "type={typ} 归一化后 tool_type={tt} 不满足后端 starts_with(web_search_)"
             );
-            assert_eq!(tools[0].max_uses, Some(8), "type={typ}");
+            assert_eq!(tools[0].max_uses, Some(5), "type={typ}");
         }
     }
 
