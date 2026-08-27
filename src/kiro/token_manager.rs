@@ -149,7 +149,9 @@ fn is_proxy_failover_error(err: &anyhow::Error) -> bool {
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
             return match reqwest_error.status() {
                 Some(status) => ProxyConfig::should_try_next_proxy_status(status.as_u16()),
-                None => true,
+                // decode 是 2xx 后的确定性反序列化失败，换代理重放无效。
+                // None 仍覆盖 connect / timeout 等传输失败。
+                None => !reqwest_error.is_decode(),
             };
         }
     }
@@ -1896,6 +1898,10 @@ impl MultiTokenManager {
                         .throttled_until
                         .map(|until| until > now)
                         .unwrap_or(false)
+                    && !entry
+                        .rate_limited_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
                     && group_matches(&entry.credentials.groups, group)
             })
             .map(|entry| entry.id)
@@ -2025,6 +2031,7 @@ impl MultiTokenManager {
             .filter(|e| {
                 !e.disabled
                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                     && group_matches(&e.credentials.groups, group)
             })
             .count()
@@ -5940,6 +5947,39 @@ mod tests {
         assert!(!is_proxy_failover_error(&invalid));
     }
 
+    #[tokio::test]
+    async fn proxy_failover_skips_decode_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnot",
+                )
+                .await;
+        });
+
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_err();
+        assert!(err.is_decode(), "期望 decode 错误，实际: {err}");
+        assert!(
+            !is_proxy_failover_error(&err.into()),
+            "2xx 后的反序列化失败不应换代理重放"
+        );
+    }
+
     #[test]
     fn cold_start_discovery_error_mapping() {
         let err = cold_start_discovery_error(true, Some("30".to_string()), 3);
@@ -8070,6 +8110,38 @@ mod tests {
             1,
             "g1 少了被禁用的 A"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_credentials_excluded_from_model_discovery_and_group_available() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g1"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count_in_group(Some("g1")), 2);
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(
+            manager.available_count_in_group(Some("g1")),
+            1,
+            "冷却中凭据不应计入分组可用数"
+        );
+        assert_eq!(manager.available_count_in_group(None), 1);
+
+        manager.report_rate_limited(2, StdDuration::from_secs(60));
+        let err = manager
+            .discover_models_for_group(Some("g1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ModelDiscoveryError::NoAvailableCredentials
+        ));
     }
 
     #[test]

@@ -1007,6 +1007,119 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 主流式 SSE 用量恰好一次结算。客户端中途断开时 Drop 按 error/interrupted 记账。
+struct StreamUsageSettlement {
+    hook: UsageRecordHook,
+    tracer: std::sync::Arc<RequestTracer>,
+    credential_id: u64,
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
+    credits: f64,
+    settled: bool,
+}
+
+impl StreamUsageSettlement {
+    fn new(
+        hook: UsageRecordHook,
+        tracer: std::sync::Arc<RequestTracer>,
+        credential_id: u64,
+    ) -> Self {
+        Self {
+            hook,
+            tracer,
+            credential_id,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            settled: false,
+        }
+    }
+
+    fn capture(&mut self, ctx: &StreamContext) {
+        let (input, cache_creation, cache_read) = ctx.resolved_usage();
+        self.input_tokens = input;
+        self.output_tokens = ctx.resolved_output_tokens();
+        self.cache_creation_tokens = cache_creation;
+        self.cache_read_tokens = cache_read;
+        self.credits = ctx.credits;
+    }
+
+    fn finish(
+        &mut self,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        sent_bytes: Option<u64>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.hook.record(
+            self.credential_id,
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_tokens,
+            self.cache_read_tokens,
+            self.credits,
+            usage_status,
+        );
+        self.tracer.finalize(
+            trace_status,
+            error_type,
+            error_message,
+            sent_bytes,
+            TraceUsage {
+                input_tokens: self.input_tokens.max(0) as u64,
+                output_tokens: self.output_tokens.max(0) as u64,
+                cache_creation_tokens: self.cache_creation_tokens.max(0) as u64,
+                cache_read_tokens: self.cache_read_tokens.max(0) as u64,
+                credits: if self.credits.is_finite() && self.credits > 0.0 {
+                    self.credits
+                } else {
+                    0.0
+                },
+            },
+        );
+    }
+
+    fn finish_from_ctx(
+        &mut self,
+        ctx: &StreamContext,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        sent_bytes: Option<u64>,
+    ) {
+        self.capture(ctx);
+        self.finish(
+            usage_status,
+            trace_status,
+            error_type,
+            error_message,
+            sent_bytes,
+        );
+    }
+}
+
+impl Drop for StreamUsageSettlement {
+    fn drop(&mut self) {
+        self.finish(
+            "error",
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("client disconnected before stream completed"),
+            None,
+        );
+    }
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -1025,10 +1138,12 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
+    let mut settlement = StreamUsageSettlement::new(hook, tracer, credential_id);
+    settlement.capture(&ctx);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -1039,7 +1154,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            tracer.mark_first_token();
+                            settlement.tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
@@ -1060,6 +1175,7 @@ fn create_sse_stream(
                                     }
                                 }
                             }
+                            settlement.capture(&ctx);
 
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
@@ -1067,7 +1183,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1077,20 +1193,20 @@ fn create_sse_stream(
                                 "upstream_error",
                                 "Upstream response stream was interrupted",
                             );
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            tracer.finalize(
+                            settlement.finish_from_ctx(
+                                &ctx,
+                                "error",
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
                                 Some(&e.to_string()),
                                 Some(sent_bytes),
-                                stream_trace_usage(&ctx),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
@@ -1099,29 +1215,29 @@ fn create_sse_stream(
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
+                                settlement.finish_from_ctx(
+                                    &ctx,
+                                    "error",
                                     "error",
                                     Some(outcome::BAD_REQUEST),
                                     Some(&message),
                                     None,
-                                    stream_trace_usage(&ctx),
                                 );
                             } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
-                                tracer.finalize(
+                                settlement.finish_from_ctx(
+                                    &ctx,
+                                    "success",
                                     "success",
                                     None,
                                     None,
                                     None,
-                                    stream_trace_usage(&ctx),
                                 );
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                     }
                 }
@@ -1129,7 +1245,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
                 }
             }
         },
@@ -1137,44 +1253,6 @@ fn create_sse_stream(
     .flatten();
 
     initial_stream.chain(processing_stream)
-}
-
-/// 从 StreamContext 提取最终用量并写入 hook
-fn record_stream_usage(
-    hook: &UsageRecordHook,
-    ctx: &StreamContext,
-    credential_id: u64,
-    status: &str,
-) {
-    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
-    // output 用 resolved_output_tokens（metadataEvent 精确值优先），与下发给客户端的
-    // message_delta 及 /cc 缓冲路径的 final_usage 同口径。
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
-    hook.record(
-        credential_id,
-        input,
-        ctx.resolved_output_tokens(),
-        cache_creation,
-        cache_read,
-        ctx.credits,
-        status,
-    );
-}
-
-/// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
-fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
-    TraceUsage {
-        input_tokens: input.max(0) as u64,
-        output_tokens: ctx.resolved_output_tokens().max(0) as u64,
-        cache_creation_tokens: cache_creation.max(0) as u64,
-        cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
-            ctx.credits
-        } else {
-            0.0
-        },
-    }
 }
 
 /// 处理非流式请求
@@ -2379,5 +2457,66 @@ mod tests {
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
             (100, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn receiver_disconnect_settles_accumulated_usage_once() {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+        };
+        {
+            let mut settlement = StreamUsageSettlement::new(
+                hook,
+                std::sync::Arc::new(RequestTracer::noop("test-model")),
+                7,
+            );
+            settlement.input_tokens = 3;
+            settlement.output_tokens = 5;
+            settlement.cache_read_tokens = 7;
+            settlement.cache_creation_tokens = 4;
+            settlement.credits = 0.75;
+        }
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+        assert_eq!(overview.today_input_tokens, 3);
+        assert_eq!(overview.today_output_tokens, 5);
+        assert!((overview.today_credits - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_settlement_finish_does_not_double_count_on_drop() {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+        };
+        let mut settlement = StreamUsageSettlement::new(
+            hook,
+            std::sync::Arc::new(RequestTracer::noop("test-model")),
+            7,
+        );
+        settlement.input_tokens = 3;
+        settlement.output_tokens = 5;
+        settlement.credits = 0.5;
+        settlement.finish("success", "success", None, None, None);
+        drop(settlement);
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 0);
+        assert_eq!(overview.today_input_tokens, 3);
+        assert_eq!(overview.today_output_tokens, 5);
     }
 }
