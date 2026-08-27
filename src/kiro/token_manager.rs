@@ -24,7 +24,7 @@ use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, SOCIAL_PROFILE_ARN};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -626,14 +626,16 @@ fn usage_api_should_fallback(status: u16, had_profile_arn: bool, has_next: bool)
 ///
 /// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
 /// to make this call.`）；BuilderID 占位符已由 `effective_profile_arn` 过滤，
-/// 这类账号只有「不带」一种形态，行为与加此参数前一致。
+/// Social 共享 ARN 上游从未覆盖，这两种账号都只生成「不带」一种形态。
 fn usage_api_attempts<'a>(
     credentials: &'a KiroCredentials,
     candidates: &[&'static str],
 ) -> Vec<(&'static str, Option<&'a str>)> {
     let mut attempts = Vec::with_capacity(candidates.len() * 2);
     for region in candidates {
-        if let Some(arn) = credentials.effective_profile_arn() {
+        if let Some(arn) = credentials.effective_profile_arn()
+            && arn != SOCIAL_PROFILE_ARN
+        {
             attempts.push((*region, Some(arn)));
         }
         attempts.push((*region, None));
@@ -7299,6 +7301,19 @@ mod tests {
         let attempts = usage_api_attempts(&plain, &["us-east-1"]);
         assert_eq!(attempts.len(), 1);
         assert!(attempts[0].1.is_none());
+    }
+
+    #[test]
+    fn usage_api_attempts_social_arn_is_plain_only() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(SOCIAL_PROFILE_ARN.to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let attempts = usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]);
+        assert_eq!(attempts.len(), 2, "social 每区域只应一条无 ARN 请求");
+        assert_eq!(attempts[0], ("us-east-1", None));
+        assert_eq!(attempts[1], ("eu-central-1", None));
     }
 
     #[test]
