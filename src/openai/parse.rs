@@ -105,8 +105,8 @@ pub(crate) struct ParsedResponse {
     pub(crate) cached_tokens: i64,
     pub(crate) completion_tokens: i64,
     /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
-    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
-    /// Responses 路径渲染为 reasoning summary item。
+    /// `kiro_thinking` 带外字段）。chat/completions 路径输出为
+    /// `reasoning_content`，Responses 路径渲染为 reasoning summary item。
     pub(crate) thinking: String,
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
     /// Responses 路径渲染为 web_search_call item。
