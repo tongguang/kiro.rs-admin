@@ -3241,7 +3241,7 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
-        let result = {
+        let (result, newly_disabled) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -3268,7 +3268,7 @@ impl MultiTokenManager {
             );
 
             // 切换到优先级最高的可用凭据
-            if let Some(next) = entries
+            let has_available = if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
                 .min_by_key(|e| e.credentials.priority)
@@ -3283,8 +3283,14 @@ impl MultiTokenManager {
             } else {
                 tracing::error!("所有凭据均已禁用！");
                 false
-            }
+            };
+            (has_available, true)
         };
+        if newly_disabled {
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 额度用尽禁用状态持久化失败: {}", id, error);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -3294,7 +3300,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, newly_disabled) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -3332,7 +3338,7 @@ impl MultiTokenManager {
                 refresh_failure_count
             );
 
-            if let Some(next) = entries
+            let has_available = if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
                 .min_by_key(|e| e.credentials.priority)
@@ -3347,8 +3353,14 @@ impl MultiTokenManager {
             } else {
                 tracing::error!("所有凭据均已禁用！");
                 false
-            }
+            };
+            (has_available, true)
         };
+        if newly_disabled {
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 刷新失败禁用状态持久化失败: {}", id, error);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -3358,7 +3370,7 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
-        let result = {
+        let (result, newly_disabled) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -3381,7 +3393,7 @@ impl MultiTokenManager {
                 id
             );
 
-            if let Some(next) = entries
+            let has_available = if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
                 .min_by_key(|e| e.credentials.priority)
@@ -3396,8 +3408,14 @@ impl MultiTokenManager {
             } else {
                 tracing::error!("所有凭据均已禁用！");
                 false
-            }
+            };
+            (has_available, true)
         };
+        if newly_disabled {
+            if let Err(error) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} refreshToken 失效禁用状态持久化失败: {}", id, error);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -6350,6 +6368,104 @@ mod tests {
         let entry = &restarted.snapshot().entries[0];
         assert!(entry.disabled);
         assert_eq!(entry.disabled_reason.as_deref(), Some("Suspended"));
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quota_exhausted_disable_survives_restart() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+        let (dir, path) = issue51_credentials_path("quota_restart");
+        let mut credential = grouped_cred("quota-token", &[]);
+        credential.id = Some(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credential]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.report_quota_exhausted(1);
+        drop(manager);
+        let loaded = CredentialsConfig::load(&path)
+            .unwrap()
+            .into_sorted_credentials();
+        let restarted =
+            MultiTokenManager::new(Config::default(), loaded, None, Some(path.clone()), true)
+                .unwrap();
+        let entry = &restarted.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_failure_disable_survives_restart() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+        let (dir, path) = issue51_credentials_path("refresh_fail_restart");
+        let mut credential = grouped_cred("refresh-fail-token", &[]);
+        credential.id = Some(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credential]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_refresh_failure(1);
+        }
+        drop(manager);
+        let loaded = CredentialsConfig::load(&path)
+            .unwrap()
+            .into_sorted_credentials();
+        let restarted =
+            MultiTokenManager::new(Config::default(), loaded, None, Some(path.clone()), true)
+                .unwrap();
+        let entry = &restarted.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("TooManyRefreshFailures")
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_token_invalid_disable_survives_restart() {
+        use crate::kiro::model::credentials::CredentialsConfig;
+        let (dir, path) = issue51_credentials_path("invalid_refresh_restart");
+        let mut credential = grouped_cred("invalid-refresh-token", &[]);
+        credential.id = Some(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&credential]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.report_refresh_token_invalid(1);
+        drop(manager);
+        let loaded = CredentialsConfig::load(&path)
+            .unwrap()
+            .into_sorted_credentials();
+        let restarted =
+            MultiTokenManager::new(Config::default(), loaded, None, Some(path.clone()), true)
+                .unwrap();
+        let entry = &restarted.snapshot().entries[0];
+        assert!(entry.disabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("InvalidRefreshToken")
+        );
         drop(restarted);
         std::fs::remove_dir_all(dir).unwrap();
     }
