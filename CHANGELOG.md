@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 > 本阶段包含上游 v0.8.0 分阶段合并（阶段一~三）及 review 修复：动态模型发现与 profileArn 回退、Responses API 全量移植、web_search loop 与 stream.rs 换上游、RPM 原子预留与受控自愈、断流 error 终态、Responses 协议契约对齐等。以下为用户可感知的行为变更。
 
+### 🔧 修复 — ClaudeCode 模式 Edit 工具参数风格
+
+- **识别 `old_str`/`new_str` 风格的 Edit**：不再一律按 Claude Code 的 `old_string`/`new_string` 回写；Anthropic text-editor 风格客户端的 Edit 仍映射为 Kiro `str_replace`，回程按客户端原始键名还原。参数形状无法识别的同名 `Edit` 不再劫持。
+
 ### ⚠️ 行为变更 — Chat 模型名不再启发式改写（对齐上游 v0.8.0）
 
 - **删除 `gpt-*` / `o1` / `o3` / `o4` / `codex` → `claude-sonnet-4.5` 隐式改写**：Chat Completions 的请求模型名原样透传给 Kiro 后端（Kiro 已有真实 gpt-5.6 系列可用）。需要别名时用 Admin UI / `model_mappings.json` 配置显式映射（首次启动默认 seed `gpt-5.5` / `gpt-5.4` → `claude-opus-4.8`，Codex 开箱即用）。**迁移提示**：此前依赖隐式改写使用 `o1` / `o3` / `gpt-4o` 等名字的请求现在会透传给 Kiro，Kiro 不认识的模型名将返回错误，请配置别名映射。

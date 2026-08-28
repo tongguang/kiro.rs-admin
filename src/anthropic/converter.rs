@@ -817,7 +817,11 @@ pub fn convert_request_with_mode(
         .unwrap_or_default();
     // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
     // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
+    // `#` 保留条目只记客户端参数键名（如 str_replace#old），不是工具名。
     for short in tool_name_map.keys() {
+        if short.contains('#') {
+            continue;
+        }
         known_tool_names.insert(short.clone());
     }
 
@@ -1231,8 +1235,76 @@ fn is_claude_code_mode(mode: ToolCompatibilityMode) -> bool {
     mode == ToolCompatibilityMode::ClaudeCode
 }
 
+/// `tool_name_map` 中记录客户端 Edit 原始参数键的保留条目（`#` 不会与真实工具名冲突）。
+const STR_REPLACE_CLIENT_PATH_KEY: &str = "str_replace#path";
+const STR_REPLACE_CLIENT_OLD_KEY: &str = "str_replace#old";
+const STR_REPLACE_CLIENT_NEW_KEY: &str = "str_replace#new";
+
+fn schema_properties(
+    schema: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    schema.get("properties")?.as_object()
+}
+
+fn schema_has_all_keys(props: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    keys.iter().all(|k| props.contains_key(*k))
+}
+
+fn first_present_property<'a>(
+    props: &serde_json::Map<String, serde_json::Value>,
+    candidates: &[&'a str],
+) -> Option<&'a str> {
+    candidates.iter().copied().find(|k| props.contains_key(*k))
+}
+
+/// Edit schema 是否为已知可映射风格：Claude Code（`old_string`/`new_string`）
+/// 或 Anthropic text-editor（`old_str`/`new_str`）。
+fn edit_schema_is_mappable(schema: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    let Some(props) = schema_properties(schema) else {
+        return false;
+    };
+    schema_has_all_keys(props, &["old_string", "new_string"])
+        || schema_has_all_keys(props, &["old_str", "new_str"])
+}
+
+fn should_map_client_tool_to_kiro_builtin(
+    name: &str,
+    schema: &std::collections::BTreeMap<String, serde_json::Value>,
+    mode: ToolCompatibilityMode,
+) -> bool {
+    if !is_claude_code_mode(mode) || claude_code_tool_name_to_kiro(name).is_none() {
+        return false;
+    }
+    if name == "Edit" {
+        edit_schema_is_mappable(schema)
+    } else {
+        true
+    }
+}
+
+fn record_str_replace_client_keys(
+    tool_name_map: &mut HashMap<String, String>,
+    schema: &std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    let Some(props) = schema_properties(schema) else {
+        return;
+    };
+    if let Some(k) = first_present_property(props, &["file_path", "path"]) {
+        tool_name_map.insert(STR_REPLACE_CLIENT_PATH_KEY.to_string(), k.to_string());
+    }
+    if let Some(k) = first_present_property(props, &["old_string", "old_str"]) {
+        tool_name_map.insert(STR_REPLACE_CLIENT_OLD_KEY.to_string(), k.to_string());
+    }
+    if let Some(k) = first_present_property(props, &["new_string", "new_str"]) {
+        tool_name_map.insert(STR_REPLACE_CLIENT_NEW_KEY.to_string(), k.to_string());
+    }
+}
+
 /// 出站工具名映射：ClaudeCode 模式命中内置则改名并记录 `kiro名 → 客户端名`；
 /// 否则回退到长名缩短逻辑（map_tool_name）。
+///
+/// `Edit` 例外：必须先由 `convert_tools` 按 schema 指纹写入 `str_replace` 条目后才改名，
+/// 历史中的 tool_use 跟随同一次请求的劫持决策，避免误伤参数形状不同的同名工具。
 fn map_client_tool_name_to_kiro(
     name: &str,
     tool_name_map: &mut HashMap<String, String>,
@@ -1241,6 +1313,9 @@ fn map_client_tool_name_to_kiro(
     if is_claude_code_mode(mode)
         && let Some(kiro_name) = claude_code_tool_name_to_kiro(name)
     {
+        if name == "Edit" && !tool_name_map.contains_key(kiro_name) {
+            return map_tool_name(name, tool_name_map);
+        }
         tool_name_map
             .entry(kiro_name.to_string())
             .or_insert_with(|| name.to_string());
@@ -1303,12 +1378,12 @@ fn map_tool_input_to_kiro(
             maybe_insert(
                 &mut out,
                 "oldStr",
-                take_first(&obj, &["old_string", "oldStr"]),
+                take_first(&obj, &["old_string", "old_str", "oldStr"]),
             );
             maybe_insert(
                 &mut out,
                 "newStr",
-                take_first(&obj, &["new_string", "newStr"]),
+                take_first(&obj, &["new_string", "new_str", "newStr"]),
             );
         }
         ("Bash", "execute_bash") => {
@@ -1393,7 +1468,11 @@ fn map_tool_input_to_kiro(
 ///
 /// 这是相对参考实现的一处修正：参考以“客户端名”匹配，导致 Raw 模式下客户端自带的、
 /// 恰好叫 `Read` 的工具入参也会被误改写。以 Kiro 名匹配避免了该误伤，且入站无需穿透 mode。
-fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_json::Value {
+fn map_tool_input_from_kiro(
+    kiro_name: &str,
+    input: serde_json::Value,
+    tool_name_map: &HashMap<String, String>,
+) -> serde_json::Value {
     let serde_json::Value::Object(obj) = input else {
         return input;
     };
@@ -1408,20 +1487,28 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
             maybe_insert(&mut out, "content", take_first(&obj, &["text", "content"]));
         }
         "str_replace" => {
+            let path_key = tool_name_map
+                .get(STR_REPLACE_CLIENT_PATH_KEY)
+                .map(String::as_str)
+                .unwrap_or("file_path");
+            let old_key = tool_name_map
+                .get(STR_REPLACE_CLIENT_OLD_KEY)
+                .map(String::as_str)
+                .unwrap_or("old_string");
+            let new_key = tool_name_map
+                .get(STR_REPLACE_CLIENT_NEW_KEY)
+                .map(String::as_str)
+                .unwrap_or("new_string");
+            maybe_insert(&mut out, path_key, take_first(&obj, &["path", "file_path"]));
             maybe_insert(
                 &mut out,
-                "file_path",
-                take_first(&obj, &["path", "file_path"]),
+                old_key,
+                take_first(&obj, &["oldStr", "old_string", "old_str"]),
             );
             maybe_insert(
                 &mut out,
-                "old_string",
-                take_first(&obj, &["oldStr", "old_string"]),
-            );
-            maybe_insert(
-                &mut out,
-                "new_string",
-                take_first(&obj, &["newStr", "new_string"]),
+                new_key,
+                take_first(&obj, &["newStr", "new_string", "new_str"]),
             );
         }
         "execute_bash" => {
@@ -1484,7 +1571,7 @@ pub fn restore_tool_use_for_client(
         .get(kiro_name)
         .cloned()
         .unwrap_or_else(|| kiro_name.to_string());
-    let client_input = map_tool_input_from_kiro(kiro_name, input);
+    let client_input = map_tool_input_from_kiro(kiro_name, input, tool_name_map);
     (client_name, client_input)
 }
 
@@ -1623,15 +1710,20 @@ fn convert_tools(
             continue;
         }
 
+        let is_builtin = should_map_client_tool_to_kiro_builtin(&t.name, &t.input_schema, mode);
+        if is_builtin && t.name == "Edit" {
+            record_str_replace_client_keys(tool_name_map, &t.input_schema);
+            tool_name_map
+                .entry("str_replace".to_string())
+                .or_insert_with(|| t.name.clone());
+        }
+
         let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
         // 按小写名去重（Kiro 工具名大小写不敏感），首个出现者胜出。
         if !seen.insert(mapped_name.to_lowercase()) {
             tracing::debug!("跳过重复的映射工具名: {}", mapped_name);
             continue;
         }
-
-        let is_builtin =
-            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
 
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
@@ -1897,7 +1989,12 @@ fn convert_assistant_message(
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name =
                                     map_client_tool_name_to_kiro(&name, tool_name_map, mode);
-                                let input = map_tool_input_to_kiro(&name, input, mode)?;
+                                // 未改名则不改写入参，避免指纹未命中的同名 Edit 被套 Claude Code 键名。
+                                let input = if mapped_name == name {
+                                    input
+                                } else {
+                                    map_tool_input_to_kiro(&name, input, mode)?
+                                };
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -2789,9 +2886,16 @@ mod tests {
     // ---- Tool Call 双向兼容（ClaudeCode 内置工具名/入参映射）----
 
     fn cc_tool(name: &str) -> super::super::types::Tool {
+        cc_tool_with_properties(name, serde_json::json!({}))
+    }
+
+    fn cc_tool_with_properties(
+        name: &str,
+        properties: serde_json::Value,
+    ) -> super::super::types::Tool {
         let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
-        schema.insert("properties".to_string(), serde_json::json!({}));
+        schema.insert("properties".to_string(), properties);
         super::super::types::Tool {
             name: name.to_string(),
             description: String::new(),
@@ -2800,6 +2904,17 @@ mod tests {
             max_uses: None,
             cache_control: None,
         }
+    }
+
+    fn cc_edit_tool(old_key: &str, new_key: &str) -> super::super::types::Tool {
+        cc_tool_with_properties(
+            "Edit",
+            serde_json::json!({
+                "file_path": {"type": "string"},
+                old_key: {"type": "string"},
+                new_key: {"type": "string"},
+            }),
+        )
     }
 
     #[test]
@@ -2960,6 +3075,252 @@ mod tests {
         assert_eq!(restored["file_path"], serde_json::json!("/a"));
         assert_eq!(restored["offset"], serde_json::json!(10));
         assert_eq!(restored["limit"], serde_json::json!(5)); // 14 - 10 + 1
+    }
+
+    #[test]
+    fn cc_edit_old_str_hijacks_and_restores_client_keys() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_edit_tool("old_str", "new_str")]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(out[0].tool_specification.name, "str_replace");
+        let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
+        assert!(schema.contains("\"oldStr\""), "应替换为 Kiro 内置 schema");
+        assert_eq!(map.get("str_replace").map(|s| s.as_str()), Some("Edit"));
+        assert_eq!(
+            map.get(STR_REPLACE_CLIENT_OLD_KEY).map(|s| s.as_str()),
+            Some("old_str")
+        );
+        assert_eq!(
+            map.get(STR_REPLACE_CLIENT_NEW_KEY).map(|s| s.as_str()),
+            Some("new_str")
+        );
+        assert_eq!(
+            map.get(STR_REPLACE_CLIENT_PATH_KEY).map(|s| s.as_str()),
+            Some("file_path")
+        );
+
+        let kiro = map_tool_input_to_kiro(
+            "Edit",
+            serde_json::json!({
+                "file_path": "/a.txt",
+                "old_str": "line two",
+                "new_str": "line two (replaced)\n"
+            }),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(
+            kiro,
+            serde_json::json!({
+                "path": "/a.txt",
+                "oldStr": "line two",
+                "newStr": "line two (replaced)\n"
+            })
+        );
+
+        let (name, restored) = restore_tool_use_for_client("str_replace", kiro, &map);
+        assert_eq!(name, "Edit");
+        assert_eq!(
+            restored,
+            serde_json::json!({
+                "file_path": "/a.txt",
+                "old_str": "line two",
+                "new_str": "line two (replaced)\n"
+            })
+        );
+    }
+
+    #[test]
+    fn cc_edit_old_string_still_restores_claude_code_keys() {
+        let mut map = HashMap::new();
+        convert_tools(
+            &Some(vec![cc_edit_tool("old_string", "new_string")]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(
+            map.get(STR_REPLACE_CLIENT_OLD_KEY).map(|s| s.as_str()),
+            Some("old_string")
+        );
+        let (name, restored) = restore_tool_use_for_client(
+            "str_replace",
+            serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y"}),
+            &map,
+        );
+        assert_eq!(name, "Edit");
+        assert_eq!(restored["file_path"], serde_json::json!("/a.txt"));
+        assert_eq!(restored["old_string"], serde_json::json!("x"));
+        assert_eq!(restored["new_string"], serde_json::json!("y"));
+        assert!(restored.get("old_str").is_none());
+    }
+
+    #[test]
+    fn cc_edit_unknown_schema_passthrough() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool_with_properties(
+                "Edit",
+                serde_json::json!({
+                    "foo": {"type": "string"},
+                    "bar": {"type": "string"},
+                }),
+            )]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(out[0].tool_specification.name, "Edit", "指纹不匹配则不劫持");
+        let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
+        assert!(schema.contains("\"foo\""), "应保留客户端 schema");
+        assert!(schema.contains("\"bar\""));
+        assert!(!schema.contains("\"oldStr\""));
+        assert!(map.get("str_replace").is_none());
+
+        let input = serde_json::json!({"foo": "a", "bar": "b"});
+        let (name, restored) = restore_tool_use_for_client("Edit", input.clone(), &map);
+        assert_eq!(name, "Edit");
+        assert_eq!(restored, input, "未劫持的 Edit 回程入参不得改写");
+    }
+
+    #[test]
+    fn cc_edit_old_str_history_maps_outbound_input() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("edit the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_edit",
+                            "name": "Edit",
+                            "input": {
+                                "file_path": "/a.txt",
+                                "old_str": "line two",
+                                "new_str": "line two (replaced)\n"
+                            }
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_edit", "content": "ok"}
+                    ]),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: Some(vec![cc_edit_tool("old_str", "new_str")]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(
+            !result.known_tool_names.iter().any(|n| n.contains('#')),
+            "参数键保留条目不得进入 known_tool_names"
+        );
+
+        let history = &result.conversation_state.history;
+        let mut found = false;
+        for msg in history {
+            if let Message::Assistant(a) = msg
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_edit" {
+                        assert_eq!(tu.name, "str_replace");
+                        assert_eq!(tu.input["path"], serde_json::json!("/a.txt"));
+                        assert_eq!(tu.input["oldStr"], serde_json::json!("line two"));
+                        assert_eq!(
+                            tu.input["newStr"],
+                            serde_json::json!("line two (replaced)\n")
+                        );
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "历史中应找到已映射的 Edit tool_use");
+    }
+
+    #[test]
+    fn cc_edit_unknown_schema_history_passthrough() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("edit"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_edit",
+                            "name": "Edit",
+                            "input": {"foo": "a", "bar": "b"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_edit", "content": "ok"}
+                    ]),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: Some(vec![cc_tool_with_properties(
+                "Edit",
+                serde_json::json!({
+                    "foo": {"type": "string"},
+                    "bar": {"type": "string"},
+                }),
+            )]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let mut found = false;
+        for msg in &result.conversation_state.history {
+            if let Message::Assistant(a) = msg
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_edit" {
+                        assert_eq!(tu.name, "Edit");
+                        assert_eq!(tu.input["foo"], serde_json::json!("a"));
+                        assert_eq!(tu.input["bar"], serde_json::json!("b"));
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "指纹不匹配的 Edit 历史入参应原样透传");
     }
 
     /// 优化点回归：入站还原以 **Kiro 名** 匹配，故 Raw 模式下客户端自带、恰好叫
