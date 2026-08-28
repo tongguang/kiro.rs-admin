@@ -12,6 +12,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - **全部 8 个内置工具按 schema 指纹再劫持**：除已有的 Edit（`old_string`/`new_string` 与 `old_str`/`new_str`）外，Write / Bash / Read / Glob / Grep / LS / WebSearch 也必须带 Claude Code 规范键才映射为 Kiro 内置；指纹不匹配则原样透传并打 warn。历史 `tool_use` 跟随同一次请求的劫持决策。
 - **识别 `old_str`/`new_str` 风格的 Edit**：不再一律按 Claude Code 的 `old_string`/`new_string` 回写；Anthropic text-editor 风格客户端的 Edit 仍映射为 Kiro `str_replace`，回程按客户端原始键名还原。
+- **Droid Grep / WebSearch 按互斥键透传**：Grep 含 `glob_pattern` / `case_insensitive`、WebSearch 含 `includeDomains` / `numResults` 等 Droid 专用键时不再映射为 Kiro 内置，避免丢掉过滤参数；仅 `query` 的 Claude Code WebSearch 仍映射。Glob（`patterns`）/ LS（`directory_path`）已知变体由 warn 改为 info。Read 与 Claude Code 同形，不做 Droid 特判。Anthropic 原生 `web_search` + `web_search_*` type 仍走 MCP / loop。
 
 ### ⚠️ 行为变更 — Chat 模型名不再启发式改写（对齐上游 v0.8.0）
 

@@ -1284,13 +1284,36 @@ fn should_map_client_tool_to_kiro_builtin(
     let Some(props) = schema_properties(schema) else {
         return false;
     };
-    match name {
+    let canonical = match name {
         "Write" => schema_has_all_keys(props, &["file_path", "content"]),
         "Bash" => schema_has_all_keys(props, &["command"]),
         "Read" => schema_has_all_keys(props, &["file_path"]),
         "Glob" | "Grep" => schema_has_all_keys(props, &["pattern"]),
         "LS" => schema_has_all_keys(props, &["path"]),
         "WebSearch" => schema_has_all_keys(props, &["query"]),
+        _ => false,
+    };
+    canonical && !is_known_droid_passthrough_variant(name, schema)
+}
+
+/// Droid 公开 schema 的互斥键：有任一即视为已知变体，透传不劫持。
+/// 闸门与日志共用。Read 与 Claude Code 同形不收录；WebSearch 仅独有键透传，仅 `query` 仍映射。
+fn is_known_droid_passthrough_variant(
+    name: &str,
+    schema: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> bool {
+    let Some(props) = schema_properties(schema) else {
+        return false;
+    };
+    match name {
+        "Grep" => first_present_property(props, &["glob_pattern", "case_insensitive"]).is_some(),
+        "WebSearch" => first_present_property(
+            props,
+            &["includeDomains", "excludeDomains", "numResults", "category"],
+        )
+        .is_some(),
+        "Glob" => props.contains_key("patterns"),
+        "LS" => props.contains_key("directory_path"),
         _ => false,
     }
 }
@@ -1755,12 +1778,20 @@ fn convert_tools(
                     .or_insert_with(|| t.name.clone());
             }
         } else if is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some() {
-            tracing::warn!(
-                "Claude Code 兼容模式：工具 {} schema 指纹不匹配，透传不劫持（需要 {}，实际 properties: {}）",
-                t.name,
-                builtin_fingerprint_expected(&t.name),
-                schema_property_key_list(&t.input_schema)
-            );
+            if is_known_droid_passthrough_variant(&t.name, &t.input_schema) {
+                tracing::info!(
+                    "Claude Code 兼容模式：工具 {} 识别为 Droid 变体，透传不劫持（实际 properties: {}）",
+                    t.name,
+                    schema_property_key_list(&t.input_schema)
+                );
+            } else {
+                tracing::warn!(
+                    "Claude Code 兼容模式：工具 {} schema 指纹不匹配，透传不劫持（需要 {}，实际 properties: {}）",
+                    t.name,
+                    builtin_fingerprint_expected(&t.name),
+                    schema_property_key_list(&t.input_schema)
+                );
+            }
         }
 
         let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
@@ -2983,6 +3014,16 @@ mod tests {
         }
     }
 
+    fn cc_tool_with_schema(
+        name: &str,
+        properties: serde_json::Value,
+        required: serde_json::Value,
+    ) -> super::super::types::Tool {
+        let mut tool = cc_tool_with_properties(name, properties);
+        tool.input_schema.insert("required".to_string(), required);
+        tool
+    }
+
     fn cc_edit_tool(old_key: &str, new_key: &str) -> super::super::types::Tool {
         cc_tool_with_properties(
             "Edit",
@@ -3572,6 +3613,221 @@ mod tests {
             }
         }
         assert!(found, "未声明的 Write 历史入参应原样透传");
+    }
+
+    fn droid_grep_properties() -> serde_json::Value {
+        serde_json::json!({
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+            "glob_pattern": {"type": "string"},
+            "output_mode": {"type": "string"},
+            "case_insensitive": {"type": "boolean"},
+        })
+    }
+
+    #[test]
+    fn cc_droid_variants_passthrough_keeps_properties_and_required() {
+        let cases = [
+            (
+                "Grep",
+                droid_grep_properties(),
+                serde_json::json!(["pattern"]),
+                "grep_search",
+            ),
+            (
+                "WebSearch",
+                serde_json::json!({
+                    "query": {"type": "string"},
+                    "category": {"type": "string"},
+                    "numResults": {"type": "integer"},
+                    "includeDomains": {"type": "array"},
+                }),
+                serde_json::json!(["query"]),
+                "web_search",
+            ),
+            (
+                "Glob",
+                serde_json::json!({
+                    "patterns": {"type": "string"},
+                    "excludePatterns": {"type": "array"},
+                    "folder": {"type": "string"},
+                }),
+                serde_json::json!(["patterns"]),
+                "file_search",
+            ),
+            (
+                "LS",
+                serde_json::json!({
+                    "directory_path": {"type": "string"},
+                    "ignorePatterns": {"type": "array"},
+                }),
+                serde_json::json!([]),
+                "list_directory",
+            ),
+        ];
+        for (name, properties, required, kiro) in cases {
+            let mut map = HashMap::new();
+            let expected_keys: Vec<String> =
+                properties.as_object().unwrap().keys().cloned().collect();
+            let out = convert_tools(
+                &Some(vec![cc_tool_with_schema(
+                    name,
+                    properties,
+                    required.clone(),
+                )]),
+                &mut map,
+                ToolCompatibilityMode::ClaudeCode,
+            )
+            .unwrap();
+            assert_eq!(
+                out[0].tool_specification.name, name,
+                "{name} Droid 变体不得改名"
+            );
+            assert!(map.get(kiro).is_none(), "{name} 不得写入 {kiro} 映射");
+            let json = &out[0].tool_specification.input_schema.json;
+            let out_props = json["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} 规范化后应有 properties"));
+            for key in &expected_keys {
+                assert!(
+                    out_props.contains_key(key),
+                    "{name} 应保留 properties.{key}"
+                );
+            }
+            assert_eq!(json["required"], required, "{name} 应保留 required");
+        }
+    }
+
+    #[test]
+    fn cc_droid_grep_history_passthrough() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("search"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_grep",
+                            "name": "Grep",
+                            "input": {
+                                "pattern": "foo",
+                                "glob_pattern": "*.rs",
+                                "case_insensitive": true
+                            }
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_grep", "content": "ok"}
+                    ]),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: Some(vec![cc_tool_with_schema(
+                "Grep",
+                droid_grep_properties(),
+                serde_json::json!(["pattern"]),
+            )]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(result.tool_name_map.get("grep_search").is_none());
+        let mut found = false;
+        for msg in &result.conversation_state.history {
+            if let Message::Assistant(a) = msg
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_grep" {
+                        assert_eq!(tu.name, "Grep");
+                        assert_eq!(tu.input["pattern"], serde_json::json!("foo"));
+                        assert_eq!(tu.input["glob_pattern"], serde_json::json!("*.rs"));
+                        assert_eq!(tu.input["case_insensitive"], serde_json::json!(true));
+                        assert!(tu.input.get("query").is_none());
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "Droid Grep 历史入参应保留客户端键值");
+    }
+
+    #[test]
+    fn cc_canonical_read_grep_websearch_still_map() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![
+                cc_tool_with_properties(
+                    "Read",
+                    serde_json::json!({
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "number"},
+                        "limit": {"type": "number"},
+                    }),
+                ),
+                cc_tool("Grep"),
+                cc_tool("WebSearch"),
+            ]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        let names: Vec<&str> = out
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert_eq!(names, ["read_file", "grep_search", "web_search"]);
+        assert_eq!(map.get("read_file").map(|s| s.as_str()), Some("Read"));
+        assert_eq!(map.get("grep_search").map(|s| s.as_str()), Some("Grep"));
+        assert_eq!(map.get("web_search").map(|s| s.as_str()), Some("WebSearch"));
+    }
+
+    #[test]
+    fn cc_droid_websearch_with_filters_passthrough() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool_with_schema(
+                "WebSearch",
+                serde_json::json!({
+                    "query": {"type": "string"},
+                    "category": {"type": "string"},
+                    "numResults": {"type": "integer"},
+                    "includeDomains": {"type": "array"},
+                }),
+                serde_json::json!(["query"]),
+            )]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].tool_specification.name, "WebSearch",
+            "Droid 过滤键存在时不得改名为 web_search"
+        );
+        assert!(map.get("web_search").is_none());
+        let json = &out[0].tool_specification.input_schema.json;
+        let props = json["properties"].as_object().unwrap();
+        assert!(props.contains_key("query"));
+        assert!(
+            props.contains_key("includeDomains"),
+            "应保留 Droid 过滤参数"
+        );
+        assert_eq!(json["required"], serde_json::json!(["query"]));
     }
 
     /// 优化点回归：入站还原以 **Kiro 名** 匹配，故 Raw 模式下客户端自带、恰好叫
