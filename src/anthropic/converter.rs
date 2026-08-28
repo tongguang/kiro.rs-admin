@@ -1295,6 +1295,31 @@ fn should_map_client_tool_to_kiro_builtin(
     }
 }
 
+fn builtin_fingerprint_expected(name: &str) -> &'static str {
+    match name {
+        "Write" => "file_path,content",
+        "Edit" => "file_path|path + (old_string,new_string | old_str,new_str)",
+        "Bash" => "command",
+        "Read" => "file_path",
+        "Glob" | "Grep" => "pattern",
+        "LS" => "path",
+        "WebSearch" => "query",
+        _ => "",
+    }
+}
+
+fn schema_property_key_list(
+    schema: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> String {
+    match schema_properties(schema) {
+        Some(props) if !props.is_empty() => {
+            let keys: Vec<&str> = props.keys().map(String::as_str).collect();
+            format!("[{}]", keys.join(", "))
+        }
+        _ => "(none)".to_string(),
+    }
+}
+
 fn record_str_replace_client_keys(
     tool_name_map: &mut HashMap<String, String>,
     schema: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -1731,8 +1756,10 @@ fn convert_tools(
             }
         } else if is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some() {
             tracing::warn!(
-                "Claude Code 兼容模式：工具 {} schema 指纹不匹配，透传不劫持",
-                t.name
+                "Claude Code 兼容模式：工具 {} schema 指纹不匹配，透传不劫持（需要 {}，实际 properties: {}）",
+                t.name,
+                builtin_fingerprint_expected(&t.name),
+                schema_property_key_list(&t.input_schema)
             );
         }
 
