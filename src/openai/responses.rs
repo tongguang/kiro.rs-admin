@@ -401,10 +401,10 @@ pub async fn post_responses(
             StreamStorePlan {
                 enabled: store_response,
                 owner_key_id,
-                previous_response_id,
-                metadata: request_metadata,
                 input_items: full_input_items,
             },
+            previous_response_id,
+            request_metadata,
         );
     }
 
@@ -1319,6 +1319,9 @@ struct ResponsesStreamContext {
     /// store=true 时的落库计划：在 `finish()` 发出终态事件前完成保存，
     /// 客户端收到 completed 即停止读取也不会丢存储
     store_plan: Option<StreamStorePlan>,
+    /// 回显字段（与非流式路径同口径）：与 store 无关，终态对象恒携带。
+    previous_response_id: Option<String>,
+    metadata: Option<Value>,
 }
 
 impl ResponsesStreamContext {
@@ -1348,6 +1351,8 @@ impl ResponsesStreamContext {
             saw_message_stop: false,
             terminal: false,
             store_plan: None,
+            previous_response_id: None,
+            metadata: None,
         }
     }
 
@@ -1932,6 +1937,12 @@ impl ResponsesStreamContext {
         if status == "incomplete" {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
+        // 回显字段与 store 无关（对齐非流式路径：previous_response_id 恒写含 null，
+        // metadata 有才写），store=false 的流式终态对象也不再丢字段。
+        response["previous_response_id"] = json!(self.previous_response_id);
+        if let Some(md) = &self.metadata {
+            response["metadata"] = md.clone();
+        }
         response
     }
 
@@ -1957,15 +1968,11 @@ impl ResponsesStreamContext {
             "response.completed"
         };
         self.terminal = true;
-        let mut response = self.response_object(status);
-        // store=true：先补全并落库，再发出终态事件（与非流式路径同口径）。
+        let response = self.response_object(status);
+        // store=true：先落库，再发出终态事件（与非流式路径同口径）。
         // 客户端收到 completed 后停止读取是常态，若等下一次 poll 才保存，
-        // 响应永远不会入库；终态对象本身也需携带 previous_response_id / metadata。
+        // 响应永远不会入库。
         if let Some(store) = &self.store_plan {
-            response["previous_response_id"] = json!(store.previous_response_id);
-            if let Some(md) = &store.metadata {
-                response["metadata"] = md.clone();
-            }
             let mut items = store.input_items.clone();
             if let Some(output) = response.get("output").and_then(Value::as_array) {
                 items.extend(output.iter().cloned());
@@ -1994,8 +2001,6 @@ impl ResponsesStreamContext {
 struct StreamStorePlan {
     enabled: bool,
     owner_key_id: u64,
-    previous_response_id: Option<String>,
-    metadata: Option<Value>,
     input_items: Vec<Value>,
 }
 
@@ -2005,8 +2010,6 @@ impl StreamStorePlan {
         Self {
             enabled: false,
             owner_key_id: 0,
-            previous_response_id: None,
-            metadata: None,
             input_items: Vec::new(),
         }
     }
@@ -2018,8 +2021,13 @@ fn responses_streaming_response(
     tool_kinds: ToolKindMap,
     response_config: ResponsesResponseConfig,
     store_plan: StreamStorePlan,
+    previous_response_id: Option<String>,
+    metadata: Option<Value>,
 ) -> Response {
     let mut context = ResponsesStreamContext::new(model, tool_kinds, response_config);
+    // 回显字段与 store 解耦：store=false 时仅跳过落库，终态对象仍携带它们。
+    context.previous_response_id = previous_response_id;
+    context.metadata = metadata;
     context.store_plan = store_plan.enabled.then_some(store_plan);
     let pending = VecDeque::from(context.initial_events());
     let stream = stream::unfold(
@@ -3575,6 +3583,8 @@ mod tests {
             ToolKindMap::new(),
             ResponsesResponseConfig::default(),
             StreamStorePlan::disabled(),
+            None,
+            None,
         );
         let mut body = response.into_body().into_data_stream();
 
@@ -3607,10 +3617,10 @@ mod tests {
             StreamStorePlan {
                 enabled: true,
                 owner_key_id: 7,
-                previous_response_id: Some("resp_prev_1".to_string()),
-                metadata: Some(json!({"k": "v"})),
                 input_items: vec![json!({"type": "message", "role": "user", "content": "hi"})],
             },
+            Some("resp_prev_1".to_string()),
+            Some(json!({"k": "v"})),
         );
         let mut body = response.into_body().into_data_stream();
 
@@ -3655,6 +3665,59 @@ mod tests {
         assert_eq!(
             stored.items.first(),
             Some(&json!({"type": "message", "role": "user", "content": "hi"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_store_false_still_echoes_metadata_and_previous_response_id() {
+        let upstream = stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))])
+        .chain(stream::pending());
+        let response = responses_streaming_response(
+            Body::from_stream(upstream),
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+            StreamStorePlan::disabled(),
+            Some("resp_prev_2".to_string()),
+            Some(json!({"k": "v"})),
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut output = String::new();
+        while !output.contains("event: response.completed") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+                .await
+                .expect("response.completed must arrive")
+                .expect("stream must emit response.completed")
+                .unwrap();
+            output.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        drop(body);
+
+        // store=false：终态对象仍回显 previous_response_id / metadata（与非流式同口径）
+        let completed_frame = output
+            .split("\n\n")
+            .find(|frame| frame.contains("event: response.completed"))
+            .expect("completed event frame");
+        let data_line = completed_frame
+            .lines()
+            .find(|line| line.starts_with("data:"))
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(
+            payload["response"]["previous_response_id"],
+            json!("resp_prev_2")
+        );
+        assert_eq!(payload["response"]["metadata"], json!({"k": "v"}));
+        let resp_id = payload["response"]["id"].as_str().unwrap().to_string();
+
+        // 但不落库
+        assert!(
+            load_owned_response(&resp_id, 7).is_none(),
+            "store=false 的响应不得入库"
         );
     }
 

@@ -31,6 +31,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **web_search 建连窗口断连记账**：首轮上游建连等待期间客户端断开也按 interrupted 恰好记账一次并 finalize trace，此前该窗口的请求完全漏记。
 - **代理 failover / 模型发现过滤**：JSON decode 失败不再换代理重放；`rate_limited_until` 冷却中的凭据不进模型发现与分组可用计数。
 
+### 🔧 修复 — web_search 预算 / Responses 回显 / 断连记账
+
+- **超 `max_uses` 返回 `max_uses_exceeded` 错误块**：搜索预算耗尽的 web_search 调用不再伪装成"搜索了无结果"的空结果数组，按 Anthropic 官方协议呈现 `{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}`，模型可区分"超预算未执行"与"无结果"；流式下被跳过的调用同步补发 `server_tool_use` + 错误结果块，此前该调用在 SSE 流中彻底消失。
+- **Responses 流式 `store=false` 不再丢字段**：`response.completed` 终态对象与非流式同口径，恒回显 `previous_response_id`（无则为 null）与 `metadata`，此前这两个字段随 `store_plan` 一起被丢弃；store=false 仍不落库。
+- **web_search 流式断连不再漏记当前 provider 轮次**：`decode_round` 随 metadata/contextUsage/metering 事件渐进更新在途用量快照，客户端断连取消 future 时由结算兜底并入，当前轮的 token/credits 正常进入 usage_log、按凭据明细与 trace，此前只记录已完成轮次、进行中的轮次整体丢失。
+
 ### 📚 说明 — 自愈 streak 现状口径
 
 - 自愈按**凭据单槽 + 单模型标签**维护连续轮数；同模型成功才清零，换模型不会重置也不会继续自愈。

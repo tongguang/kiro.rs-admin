@@ -290,12 +290,16 @@ fn accumulate_tool_usages(
     (out, None)
 }
 
-/// Buffer-decode one round of the upstream streaming response
+/// Buffer-decode one round of the upstream streaming response.
+///
+/// `settlement` 的在途快照随事件渐进更新：客户端断连导致本轮 future 被 drop 时，
+/// 已观测到的用量/credits 仍可由 settlement 兜底记账（不漏记当前 provider 轮次）。
 async fn decode_round(
     response: reqwest::Response,
     context_window_size: i32,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
+    settlement: &mut WebSearchUsageSettlement,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -349,18 +353,22 @@ async fn decode_round(
                 Event::Metadata(metadata) => {
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
-                        provider_token_usage = Some(usage.sanitized());
+                        let usage = usage.sanitized();
+                        settlement.capture_in_flight_usage(usage);
+                        provider_token_usage = Some(usage);
                     }
                 }
                 Event::ContextUsage(cu) => {
                     let window = context_window_size;
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                    settlement.capture_in_flight_context_input(actual);
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
                 Event::Metering(m) => {
+                    settlement.add_in_flight_credits(m.usage);
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
@@ -516,6 +524,7 @@ async fn finish_round(
     fallback_input_tokens: i32,
     context_window_size: i32,
     tracer: &RequestTracer,
+    settlement: &mut WebSearchUsageSettlement,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let StartedRound {
         tool_name_map,
@@ -523,11 +532,13 @@ async fn finish_round(
         call_result,
     } = started;
     let credential_id = call_result.credential_id;
+    settlement.begin_in_flight(credential_id, fallback_input_tokens);
     let mut outcome = decode_round(
         call_result.response,
         context_window_size,
         &tool_name_map,
         tracer,
+        settlement,
     )
     .await;
     outcome.known_tool_names = known_tool_names;
@@ -561,6 +572,7 @@ async fn run_round(
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    settlement: &mut WebSearchUsageSettlement,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let started = start_round(
         provider,
@@ -575,7 +587,14 @@ async fn run_round(
     let context_window_size = provider
         .token_manager()
         .context_window_for_credential(started.call_result.credential_id, &payload.model);
-    finish_round(started, fallback_input_tokens, context_window_size, tracer).await
+    finish_round(
+        started,
+        fallback_input_tokens,
+        context_window_size,
+        tracer,
+        settlement,
+    )
+    .await
 }
 
 /// Feeds one round of assistant(text + web_search tool_use) + user(tool_result) back into payload.messages,
@@ -585,7 +604,7 @@ async fn run_round(
 fn append_search_round(
     payload: &mut MessagesRequest,
     round: &RoundOutcome,
-    searched: &[Option<WebSearchResults>],
+    searched: &[SearchOutcome],
     presentation: &mut Vec<Value>,
 ) {
     // assistant: text + this round's web_search tool_use (Kiro history requires tool_use<->tool_result pairing)
@@ -603,7 +622,13 @@ fn append_search_round(
 
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
-    for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
+    for (tu, outcome) in round.tool_uses.iter().zip(searched.iter()) {
+        // 继续路径的预算由 should_search_round 整轮把关，这里只会出现 Searched；
+        // 其它变体按无结果兜底。
+        let results: &Option<WebSearchResults> = match outcome {
+            SearchOutcome::Searched(r) => r,
+            _ => &None,
+        };
         let query = tool_query(tu).unwrap_or_default();
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
@@ -649,6 +674,31 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
             })
             .collect(),
         None => vec![],
+    }
+}
+
+/// 一个 web_search 调用在一轮中的最终去向（flush 路径逐调用对齐 `tool_uses`）。
+enum SearchOutcome {
+    /// 非 web_search 的 client 工具占位（`build_flush_content` 不读该槽位）。
+    NotApplicable,
+    /// 已执行：Some=有结果，None=MCP 无结果或查询非法（与真实"无结果"同口径，空数组）。
+    Searched(Option<WebSearchResults>),
+    /// 搜索预算（客户端 max_uses）耗尽，未执行。
+    BudgetExceeded,
+}
+
+/// 渲染 `web_search_tool_result` 的 content：已执行为 `web_search_result` 数组
+/// （无结果为空数组）；预算耗尽按 Anthropic 官方协议渲染 error 对象
+/// `{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}`，
+/// 让模型能区分"超预算未执行"与"搜索了无结果"，而不是误当成后者继续回答。
+fn build_flush_result_content(outcome: &SearchOutcome) -> Value {
+    match outcome {
+        SearchOutcome::Searched(results) => json!(build_result_block(results)),
+        SearchOutcome::BudgetExceeded => json!({
+            "type": "web_search_tool_result_error",
+            "error_code": "max_uses_exceeded"
+        }),
+        SearchOutcome::NotApplicable => json!([]),
     }
 }
 
@@ -712,9 +762,9 @@ fn resolve_flush_stop_reason(
 ///   presentation pair (NEVER a raw `tool_use`, which the Codex host rejects);
 /// - client tools (exec, get_time, ...) are returned verbatim as raw `tool_use`.
 ///
-/// `searched` corresponds one-to-one (same order) to `tool_uses`; entries for
-/// web_search carry the already-completed search results, client-tool entries
-/// are ignored (typically None).
+/// `searched` corresponds one-to-one (same order) to `tool_uses`; web_search
+/// 槽位携带 [`SearchOutcome`]（已执行结果 / 预算耗尽），client 工具槽位为
+/// [`SearchOutcome::NotApplicable`]（忽略）。
 ///
 /// `known_tool_names` is the set of tool names declared by the current request
 /// (client short/long names). It is used to run the SAME `<invoke>` text-leak fault
@@ -742,7 +792,7 @@ fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
     tool_uses: &[CompletedToolUse],
-    searched: &[Option<WebSearchResults>],
+    searched: &[SearchOutcome],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
@@ -807,10 +857,11 @@ fn build_flush_content(
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
                 "input": {"query": query}
             }));
-            let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
+            static NONE_OUTCOME: SearchOutcome = SearchOutcome::NotApplicable;
+            let outcome = searched.get(idx).unwrap_or(&NONE_OUTCOME);
             content.push(json!({
                 "type": "web_search_tool_result",
-                "content": build_result_block(results)
+                "content": build_flush_result_content(outcome)
             }));
         } else {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
@@ -842,7 +893,9 @@ fn record_aggregated_usage(
 /// Cancellation-safe, exactly-once accounting for the multi-round search loop.
 /// The snapshot is updated after every completed provider round, so cancelling
 /// a later MCP/provider await still records all usage and trace attempts already
-/// observed.
+/// observed. The round currently being decoded is tracked separately in
+/// `in_flight` (updated per stream event) and merged by `finish` on cancellation,
+/// so a client disconnect no longer drops the in-progress provider round.
 struct WebSearchUsageSettlement {
     hook: UsageRecordHook,
     tracer: Option<Arc<RequestTracer>>,
@@ -852,7 +905,22 @@ struct WebSearchUsageSettlement {
     by_credential: std::collections::HashMap<u64, (TokenUsage, f64)>,
     /// 首个非 0 凭据：请求级 calls/errors 的归属（HashMap 无序，需单独跟踪）。
     first_credential: Option<u64>,
+    /// 当前 provider 轮次的在途快照：decode_round 每收到 metadata/contextUsage/
+    /// metering 事件即更新；轮次结算（成功/失败）后清空。取消时由 finish 兜底并入。
+    in_flight: Option<InFlightRound>,
     settled: bool,
+}
+
+/// 进行中的 provider 轮次的渐进用量快照。
+struct InFlightRound {
+    credential_id: u64,
+    fallback_input_tokens: i32,
+    /// contextUsageEvent 推算的输入 token
+    context_input_tokens: Option<i32>,
+    /// metadataEvent.tokenUsage 精确快照
+    provider_usage: Option<TokenUsage>,
+    /// meteringEvent 累计 credits
+    credits: f64,
 }
 
 impl WebSearchUsageSettlement {
@@ -864,6 +932,7 @@ impl WebSearchUsageSettlement {
             credits: 0.0,
             by_credential: std::collections::HashMap::new(),
             first_credential: None,
+            in_flight: None,
             settled: false,
         }
     }
@@ -877,8 +946,60 @@ impl WebSearchUsageSettlement {
             credits: 0.0,
             by_credential: std::collections::HashMap::new(),
             first_credential: None,
+            in_flight: None,
             settled: false,
         }
+    }
+
+    /// 开始跟踪一个即将解码的 provider 轮次。
+    fn begin_in_flight(&mut self, credential_id: u64, fallback_input_tokens: i32) {
+        self.in_flight = Some(InFlightRound {
+            credential_id,
+            fallback_input_tokens,
+            context_input_tokens: None,
+            provider_usage: None,
+            credits: 0.0,
+        });
+    }
+
+    fn capture_in_flight_usage(&mut self, usage: TokenUsage) {
+        if let Some(inf) = &mut self.in_flight {
+            inf.provider_usage = Some(usage.sanitized());
+        }
+    }
+
+    fn capture_in_flight_context_input(&mut self, tokens: i32) {
+        if let Some(inf) = &mut self.in_flight {
+            inf.context_input_tokens = Some(tokens);
+        }
+    }
+
+    fn add_in_flight_credits(&mut self, credits: f64) {
+        if let Some(inf) = &mut self.in_flight {
+            inf.credits += credits;
+        }
+    }
+
+    /// 轮次已结算（成功 add / 失败 settle_round_failure）：丢弃在途快照。
+    fn clear_in_flight(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// 把未结算的在途轮次并入聚合（恰好一次；无在途轮时无操作）。
+    /// 无 provider 精确快照时回退 contextUsage/输入估算，output 记 0
+    /// （部分输出文本不做估算；真实成本主要由 credits 承载）。
+    fn commit_in_flight(&mut self) {
+        let Some(inf) = self.in_flight.take() else {
+            return;
+        };
+        let usage = inf.provider_usage.unwrap_or(TokenUsage {
+            uncached_input_tokens: inf
+                .context_input_tokens
+                .unwrap_or(inf.fallback_input_tokens)
+                .max(0),
+            ..TokenUsage::default()
+        });
+        self.add(inf.credential_id, usage, inf.credits);
     }
 
     fn add(&mut self, credential_id: u64, usage: TokenUsage, credits: f64) {
@@ -918,6 +1039,9 @@ impl WebSearchUsageSettlement {
         if self.settled {
             return;
         }
+        // 取消（客户端断连）场景：当前 provider 轮次的在途快照尚未结算，
+        // 先并入再写聚合，避免漏记进行中的轮次；正常路径快照已清空，此处无操作。
+        self.commit_in_flight();
         // 总请求只记一次（credential_id=0，不算入凭据分布），保证
         // overall/by_key/by_model 的 calls 不因多轮而放大。
         record_aggregated_usage(&self.hook, 0, self.usage, self.credits, usage_status);
@@ -1043,11 +1167,7 @@ impl WebSearchSseEmitter {
         .await;
     }
 
-    async fn complete_search(
-        &mut self,
-        pending: PendingWebSearch,
-        results: &Option<WebSearchResults>,
-    ) {
+    async fn complete_search(&mut self, pending: PendingWebSearch, outcome: &SearchOutcome) {
         self.active_blocks.remove(&pending.block_index);
         self.send(SseEvent::new(
             "content_block_stop",
@@ -1068,7 +1188,7 @@ impl WebSearchSseEmitter {
                 "index": result_index,
                 "content_block": {
                     "type": "web_search_tool_result",
-                    "content": build_result_block(results)
+                    "content": build_flush_result_content(outcome)
                 }
             }),
         ))
@@ -1294,7 +1414,7 @@ async fn execute_web_search(
     group: Option<&str>,
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
-) -> anyhow::Result<Option<WebSearchResults>> {
+) -> anyhow::Result<SearchOutcome> {
     let query = tool_query(tool_use);
     let pending = if let Some(emitter) = emitter.as_deref_mut() {
         Some(emitter.begin_search(query.as_deref().unwrap_or("")).await)
@@ -1330,10 +1450,11 @@ async fn execute_web_search(
         None
     };
 
+    let outcome = SearchOutcome::Searched(result);
     if let (Some(emitter), Some(pending)) = (emitter.as_deref_mut(), pending) {
-        emitter.complete_search(pending, &result).await;
+        emitter.complete_search(pending, &outcome).await;
     }
-    Ok(result)
+    Ok(outcome)
 }
 
 fn aggregated_trace_usage(usage: TokenUsage, credits: f64) -> TraceUsage {
@@ -1372,6 +1493,8 @@ fn settle_round_failure(
     failure: RoundFailure,
     settlement: &mut WebSearchUsageSettlement,
 ) -> Response {
+    // failure 已携带本轮解析后的用量（含部分输出估算），丢弃在途快照避免双计。
+    settlement.clear_in_flight();
     settlement.add(failure.credential_id, failure.token_usage, failure.credits);
     settlement.finish(
         "error",
@@ -1521,6 +1644,7 @@ async fn run_web_search_loop_inner(
                     round_fallback_input_tokens,
                     context_window_size,
                     tracer.as_ref(),
+                    &mut settlement,
                 )
                 .await
             } else {
@@ -1531,11 +1655,15 @@ async fn run_web_search_loop_inner(
                     tracer.as_ref(),
                     group.as_deref(),
                     tool_compatibility_mode,
+                    &mut settlement,
                 )
                 .await
             } {
                 Ok(v) => v,
                 Err(failure) => {
+                    // failure 已携带本轮解析后的用量（含部分输出估算），
+                    // 丢弃在途快照避免 finish 双计。
+                    settlement.clear_in_flight();
                     settlement.add(failure.credential_id, failure.token_usage, failure.credits);
                     settlement.finish(
                         "error",
@@ -1551,6 +1679,8 @@ async fn run_web_search_loop_inner(
                 round.resolved_token_usage(round_fallback_input_tokens),
                 round.credits,
             );
+            // 本轮已按完整口径（含输出估算）结算，丢弃在途快照避免 finish 双计。
+            settlement.clear_in_flight();
             // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
             if let Some(ref m) = round.last_metering {
@@ -1609,8 +1739,7 @@ async fn run_web_search_loop_inner(
         if should_search_round(round_idx, &round.tool_uses, search_uses, search_budget) {
             search_uses += round.tool_uses.len();
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
-            let mut searched: Vec<Option<WebSearchResults>> =
-                Vec::with_capacity(round.tool_uses.len());
+            let mut searched: Vec<SearchOutcome> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 match execute_web_search(
                     &provider,
@@ -1653,10 +1782,12 @@ async fn run_web_search_loop_inner(
         // in this final round here, then build the flushed content with web_search
         // presented as server_tool_use + web_search_tool_result while client tools
         // (exec, etc.) are returned verbatim.
-        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
+        let mut searched: Vec<SearchOutcome> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
-            // 预算已耗尽的 web_search 不再执行：产出空结果块（仍走
-            // server_tool_use + web_search_tool_result 呈现，INVARIANT 不破）
+            // 预算已耗尽的 web_search 不再执行，但协议上仍呈现这次调用：
+            // 产出 max_uses_exceeded 错误结果块（仍走 server_tool_use +
+            // web_search_tool_result 呈现，INVARIANT 不破），不再伪装成
+            // "搜索了无结果"；流式下同步补发 SSE，否则该调用会在流中彻底消失。
             if tu.name == "web_search" && search_uses < search_budget {
                 search_uses += 1;
                 match execute_web_search(
@@ -1682,8 +1813,18 @@ async fn run_web_search_loop_inner(
                         return map_provider_error(e);
                     }
                 }
+            } else if tu.name == "web_search" {
+                if let Some(emitter) = emitter.as_deref_mut() {
+                    let pending = emitter
+                        .begin_search(tool_query(tu).as_deref().unwrap_or(""))
+                        .await;
+                    emitter
+                        .complete_search(pending, &SearchOutcome::BudgetExceeded)
+                        .await;
+                }
+                searched.push(SearchOutcome::BudgetExceeded);
             } else {
-                searched.push(None);
+                searched.push(SearchOutcome::NotApplicable);
             }
         }
         let content = build_flush_content(
@@ -2251,7 +2392,9 @@ mod tests {
         assert!(receiver.try_recv().is_err(), "search remains in progress");
 
         let results = fake_results("Rust 2026");
-        emitter.complete_search(pending, &results).await;
+        emitter
+            .complete_search(pending, &SearchOutcome::Searched(results))
+            .await;
         let mut events = started;
         events.extend(drain_sse(&mut receiver));
 
@@ -2499,6 +2642,90 @@ mod tests {
         settlement.add(1, TokenUsage::default(), 0.5);
         settlement.add(2, TokenUsage::default(), 0.25);
         assert!((settlement.credits() - 0.75).abs() < 1e-9);
+    }
+
+    fn test_hook(aggregator: &Arc<crate::admin::usage_stats::UsageAggregator>) -> UsageRecordHook {
+        UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn cancel_merges_in_flight_round_with_provider_snapshot() {
+        // 客户端在 decode 中途断连：当前轮的精确快照/credits 必须随 Drop 兜底入账，
+        // 不再漏记当前 provider 轮次。
+        let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        {
+            let mut settlement = WebSearchUsageSettlement::without_trace(test_hook(&aggregator));
+            settlement.begin_in_flight(7, 100);
+            settlement.capture_in_flight_usage(TokenUsage {
+                uncached_input_tokens: 11,
+                output_tokens: 13,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+            });
+            settlement.add_in_flight_credits(0.5);
+            // 模拟取消：未完成结算直接 drop
+        }
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+        assert_eq!(overview.today_input_tokens, 11);
+        assert_eq!(overview.today_output_tokens, 13);
+        assert!((overview.today_credits - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cancel_merges_in_flight_round_without_provider_snapshot() {
+        // 快照未到时回退 contextUsage / 输入估算，output 记 0。
+        let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        {
+            let mut settlement = WebSearchUsageSettlement::without_trace(test_hook(&aggregator));
+            settlement.begin_in_flight(7, 100);
+            settlement.capture_in_flight_context_input(120);
+            settlement.add_in_flight_credits(0.25);
+        }
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_input_tokens, 120);
+        assert_eq!(overview.today_output_tokens, 0);
+        assert!((overview.today_credits - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settled_round_clears_in_flight_snapshot_without_double_counting() {
+        // 正常完成（add + clear）后再 finish：在途快照不得重复入账。
+        let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let mut settlement = WebSearchUsageSettlement::without_trace(test_hook(&aggregator));
+        settlement.begin_in_flight(7, 100);
+        settlement.capture_in_flight_usage(TokenUsage {
+            uncached_input_tokens: 11,
+            output_tokens: 13,
+            ..TokenUsage::default()
+        });
+        settlement.add_in_flight_credits(0.5);
+        settlement.add(
+            7,
+            TokenUsage {
+                uncached_input_tokens: 11,
+                output_tokens: 13,
+                ..TokenUsage::default()
+            },
+            0.5,
+        );
+        settlement.clear_in_flight();
+        settlement.finish("success", "success", None, None);
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 0);
+        assert_eq!(overview.today_input_tokens, 11);
+        assert_eq!(overview.today_output_tokens, 13);
+        assert!((overview.today_credits - 0.5).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -2865,6 +3092,78 @@ mod tests {
         assert!(build_result_block(&None).is_empty());
     }
 
+    // ---- SearchOutcome: budget-exhausted calls must surface max_uses_exceeded ----
+
+    #[test]
+    fn budget_exceeded_result_is_error_object_not_empty_array() {
+        // 对齐 Anthropic 官方协议：超 max_uses 的调用返回
+        // {"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}，
+        // 而不是与"搜索了无结果"混淆的空数组。
+        let content = build_flush_result_content(&SearchOutcome::BudgetExceeded);
+        assert_eq!(content["type"], "web_search_tool_result_error");
+        assert_eq!(content["error_code"], "max_uses_exceeded");
+        // 已执行但无结果仍是空数组（两种语义不混淆）
+        assert_eq!(
+            build_flush_result_content(&SearchOutcome::Searched(None)),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn flush_content_budget_exceeded_presents_error_result() {
+        let tool_uses = vec![tu("web_search"), tu("web_search")];
+        let searched = vec![
+            SearchOutcome::Searched(fake_results("q1")),
+            SearchOutcome::BudgetExceeded,
+        ];
+        let content =
+            build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let results: Vec<&Value> = content
+            .iter()
+            .filter(|c| c["type"] == "web_search_tool_result")
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0]["content"].is_array(),
+            "executed search keeps the result array"
+        );
+        assert_eq!(
+            results[1]["content"],
+            json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}),
+            "budget-skipped search must present the max_uses_exceeded error"
+        );
+        // server_tool_use 呈现不变（INVARIANT：不出现裸 web_search tool_use）
+        assert!(!content
+            .iter()
+            .any(|c| c["type"] == "tool_use" && c["name"] == "web_search"));
+    }
+
+    #[tokio::test]
+    async fn emitter_streams_budget_exceeded_error_block() {
+        // 流式下被预算跳过的调用也必须可见：server_tool_use + error 结果块，
+        // 此前该调用在 SSE 流中彻底消失。
+        let (sender, mut receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
+        let mut emitter = WebSearchSseEmitter::new(sender);
+
+        let pending = emitter.begin_search("rust 2026").await;
+        emitter
+            .complete_search(pending, &SearchOutcome::BudgetExceeded)
+            .await;
+        let events = drain_sse(&mut receiver);
+
+        let result_start = events
+            .iter()
+            .find(|(event, data)| {
+                event == "content_block_start"
+                    && data["content_block"]["type"] == "web_search_tool_result"
+            })
+            .expect("budget-exceeded search must still emit a result block");
+        assert_eq!(
+            result_start.1["content_block"]["content"],
+            json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"})
+        );
+    }
+
     // ---- search-failure pass-through: an Err from the MCP call must map to an error response, never silently become a 200 "No results found" ----
 
     #[test]
@@ -2965,7 +3264,10 @@ mod tests {
     #[test]
     fn flush_content_mixed_round_never_emits_raw_web_search() {
         let tool_uses = vec![tu("web_search"), tu("exec")];
-        let searched = vec![fake_results("rust 2026"), None];
+        let searched = vec![
+            SearchOutcome::Searched(fake_results("rust 2026")),
+            SearchOutcome::NotApplicable,
+        ];
         let content = build_flush_content(
             Vec::new(),
             "answer",
@@ -3013,7 +3315,7 @@ mod tests {
     #[test]
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
-        let searched: Vec<Option<WebSearchResults>> = vec![None];
+        let searched = vec![SearchOutcome::NotApplicable];
         let content = build_flush_content(
             Vec::new(),
             "",
@@ -3411,7 +3713,7 @@ mod tests {
         // A final round that is only web_search (e.g. round limit hit) must present
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
-        let searched = vec![fake_results("q")];
+        let searched = vec![SearchOutcome::Searched(fake_results("q"))];
         let content =
             build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
