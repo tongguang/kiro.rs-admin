@@ -890,7 +890,7 @@ pub fn convert_request_with_mode(
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
+        tracing::info!("工具映射表已建立: {} 项", tool_name_map.len());
     }
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
