@@ -129,12 +129,23 @@ pub fn chat_to_anthropic(
     let (thinking, output_config) =
         openai_reasoning_to_anthropic(req.reasoning_effort.as_deref(), req.reasoning.as_ref());
 
-    let tools = convert_openai_tools(&req.tools);
+    let tool_choice = convert_tool_choice(req.tool_choice.as_ref());
+    // tool_choice:none 是显式禁止工具调用（判定口径与 Responses 路径一致）：
+    // 不能把声明的工具继续转发给上游，也不能触发内部 web_search agentic loop。
+    let tool_choice_none = tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice.get("type").and_then(Value::as_str) == Some("none"));
+    let tools = if tool_choice_none {
+        None
+    } else {
+        convert_openai_tools(&req.tools)
+    };
     // OpenAI/Codex 客户端带 web_search 时强制走 agentic loop：纯快速路径恒返回 SSE 且
     // 只吐原始 web_search_tool_result 块，OpenAI 层既无法解析（非流式 502）也无法合成答案。
-    let force_web_search_loop = tools
-        .as_ref()
-        .is_some_and(|list| list.iter().any(|t| t.name == "web_search"));
+    let force_web_search_loop = !tool_choice_none
+        && tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t.name == "web_search"));
 
     Ok(ConvertedOpenAIRequest {
         anthropic: MessagesRequest {
@@ -148,7 +159,7 @@ pub fn chat_to_anthropic(
             stream: req.stream,
             system,
             tools,
-            tool_choice: convert_tool_choice(req.tool_choice.as_ref()),
+            tool_choice,
             thinking,
             output_config,
             metadata,

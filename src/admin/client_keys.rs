@@ -91,6 +91,33 @@ impl ClientKeyManager {
         }
     }
 
+    /// 加载失败时备份损坏文件并以空数据启动，但保留路径，
+    /// 保证后续修改仍能落盘重建文件。
+    pub fn load_or_empty<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "加载客户端 Key 失败，备份损坏文件并以空数据启动 ({}): {}",
+                    path.display(),
+                    e
+                );
+                if path.exists() {
+                    let _ = std::fs::rename(path, path.with_extension("json.bak"));
+                }
+                Self {
+                    inner: RwLock::new(Inner {
+                        entries: HashMap::new(),
+                        by_key: HashMap::new(),
+                        next_id: 1,
+                    }),
+                    path: Some(path.to_path_buf()),
+                }
+            }
+        }
+    }
+
     /// 从文件加载（不存在时返回空管理器）
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -668,5 +695,31 @@ mod tests {
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
         assert!(mgr.is_system(0));
+    }
+
+    /// 损坏文件：load_or_empty 备份为 .bak、以空数据启动，
+    /// 且后续修改能重新落盘重建原文件（path 不丢失）。
+    #[test]
+    fn load_or_empty_backs_up_corrupt_file_and_keeps_persisting() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro_test_client_keys_corrupt_{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bak = path.with_extension("json.bak");
+        std::fs::write(&path, "{ not valid json").unwrap();
+
+        let mgr = ClientKeyManager::load_or_empty(&path);
+        assert!(bak.exists(), "损坏文件必须备份为 .bak");
+        assert!(!path.exists(), "原路径已被备份移走");
+        assert!(mgr.list().is_empty(), "必须以空数据启动");
+
+        // 后续修改重新生成合法 JSON
+        let entry = mgr.create("rebuilt".to_string(), None, None);
+        let reloaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(reloaded.list().len(), 1);
+        assert_eq!(reloaded.list()[0].key, entry.key);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
     }
 }

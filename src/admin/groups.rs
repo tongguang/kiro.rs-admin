@@ -49,6 +49,31 @@ impl GroupManager {
         }
     }
 
+    /// 加载失败时备份损坏文件并以空数据启动，但保留路径，
+    /// 保证后续修改仍能落盘重建文件。
+    pub fn load_or_empty<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "加载分组注册表失败，备份损坏文件并以空数据启动 ({}): {}",
+                    path.display(),
+                    e
+                );
+                if path.exists() {
+                    let _ = std::fs::rename(path, path.with_extension("json.bak"));
+                }
+                Self {
+                    inner: RwLock::new(Inner {
+                        entries: std::collections::HashMap::new(),
+                    }),
+                    path: Some(path.to_path_buf()),
+                }
+            }
+        }
+    }
+
     /// 从 `groups.json` 加载（不存在时返回空管理器）
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -379,5 +404,31 @@ mod tests {
         assert_eq!(list[1].name, "beta");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 损坏文件：load_or_empty 备份为 .bak、以空数据启动，
+    /// 且后续修改能重新落盘重建原文件（path 不丢失）。
+    #[test]
+    fn load_or_empty_backs_up_corrupt_file_and_keeps_persisting() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro_test_groups_corrupt_{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bak = path.with_extension("json.bak");
+        std::fs::write(&path, "{ not valid json").unwrap();
+
+        let mgr = GroupManager::load_or_empty(&path);
+        assert!(bak.exists(), "损坏文件必须备份为 .bak");
+        assert!(!path.exists(), "原路径已被备份移走");
+        assert!(mgr.list().is_empty(), "必须以空数据启动");
+
+        // 后续修改重新生成合法 JSON
+        mgr.create("rebuilt".into(), None).unwrap();
+        let reloaded = GroupManager::load(&path).unwrap();
+        assert_eq!(reloaded.list().len(), 1);
+        assert_eq!(reloaded.list()[0].name, "rebuilt");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
     }
 }

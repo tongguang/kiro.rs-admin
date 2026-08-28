@@ -1447,6 +1447,9 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 上游 Kiro 错误帧 (error_code, error_message)。一旦收到，收尾必须以 error
+    /// 终态结束（不发 message_delta/message_stop），上层据此把本次请求记为 error。
+    upstream_error: Option<(String, String)>,
 }
 
 impl StreamContext {
@@ -1480,6 +1483,11 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    /// 是否收到过上游 Kiro 错误帧。收到后收尾走 error 终态，记账记 error。
+    pub fn has_upstream_error(&self) -> bool {
+        self.upstream_error.is_some()
     }
 
     /// 创建 StreamContext
@@ -1524,6 +1532,7 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            upstream_error: None,
         }
     }
 
@@ -1648,6 +1657,8 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                // 错误帧不能吞：记下来，收尾改走 error 终态，记账记 error。
+                self.upstream_error = Some((error_code.clone(), error_message.clone()));
                 Vec::new()
             }
             Event::Exception {
@@ -2448,6 +2459,12 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        // 上游已下发错误帧：直接以 error 终态结束，不 flush 缓冲、不发
+        // message_delta/message_stop，避免下游把失败响应误判为正常完成。
+        if let Some((code, msg)) = self.upstream_error.clone() {
+            return self.generate_error_events(&code, &msg);
+        }
+
         let mut events = Vec::new();
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
@@ -2736,6 +2753,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 是否收到过上游 Kiro 错误帧（转发内部 StreamContext 的判定）。
+    pub fn has_upstream_error(&self) -> bool {
+        self.inner.has_upstream_error()
     }
 }
 
@@ -5577,5 +5599,65 @@ mod tests {
             .unwrap()
             .data["message"]["usage"];
         assert_eq!(start_usage["input_tokens"], json!(3));
+    }
+
+    #[test]
+    fn upstream_error_event_forces_error_terminal_without_message_stop() {
+        // 上游 Kiro 错误帧不能吞：缓冲路径收尾必须补发 error 终态，
+        // 不发 message_delta / message_stop 假成功帧。
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_and_buffer(&Event::Error {
+            error_code: "overloaded_error".to_string(),
+            error_message: "Upstream is overloaded".to_string(),
+        });
+        assert!(ctx.has_upstream_error());
+
+        let events = ctx.finish_and_get_all_events();
+
+        let error_event = events
+            .iter()
+            .find(|event| event.event == "error")
+            .expect("上游错误帧必须补发 error 终态");
+        assert_eq!(
+            error_event.data["error"]["type"],
+            json!("overloaded_error")
+        );
+        assert!(
+            !events.iter().any(|event| event.event == "message_stop"),
+            "上游错误帧不得发送 message_stop 正常终态"
+        );
+        assert!(
+            !events.iter().any(|event| event.event == "message_delta"),
+            "上游错误帧不得发送 message_delta 正常终态"
+        );
+    }
+
+    #[test]
+    fn realtime_stream_upstream_error_event_forces_error_terminal() {
+        // 实时路径同理：generate_final_events 在上游错误帧后只能产出 error 终态。
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_kiro_event(&Event::Error {
+            error_code: "overloaded_error".to_string(),
+            error_message: "Upstream is overloaded".to_string(),
+        });
+        assert!(ctx.has_upstream_error());
+
+        let events = ctx.generate_final_events();
+
+        assert!(events.iter().any(|event| event.event == "error"));
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+        assert!(!events.iter().any(|event| event.event == "message_delta"));
     }
 }

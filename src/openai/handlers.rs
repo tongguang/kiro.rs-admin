@@ -146,6 +146,8 @@ trait AnthropicSseTranslator {
     fn handle_event(&mut self, event: &str, data: Value) -> Vec<Bytes>;
     fn finish(&mut self) -> Vec<Bytes>;
     fn abort(&mut self, message: &str) -> Vec<Bytes>;
+    /// 是否已收尾（message_stop / error / abort 之后为 true）
+    fn is_done(&self) -> bool;
 }
 
 fn transform_anthropic_sse<T>(
@@ -211,8 +213,17 @@ where
                                     .into_iter()
                                     .map(Ok),
                             );
-                        } else {
+                        } else if translator.is_done() {
+                            // 已由 message_stop / error 事件收尾，finish() 幂等返回空
                             out.extend(translator.finish().into_iter().map(Ok));
+                        } else {
+                            // 上游截断（未发 message_stop）不能伪装成 stop + [DONE]
+                            out.extend(
+                                translator
+                                    .abort("upstream stream ended before message_stop")
+                                    .into_iter()
+                                    .map(Ok),
+                            );
                         }
                         if out.is_empty() {
                             return None;
@@ -414,10 +425,19 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
             self.stop_reason.as_deref().unwrap_or("end_turn"),
             self.saw_tool_calls,
         );
-        let usage = self
-            .include_usage
-            .then(|| self.usage.clone().unwrap_or_else(|| json!(null)));
-        out.push(self.chunk(json!({}), Some(finish_reason), usage));
+        // OpenAI 契约：finish chunk 的 usage 恒为 null；include_usage 时
+        // 在 [DONE] 前单独发一个 choices: [] 的 usage chunk。
+        out.push(self.chunk(json!({}), Some(finish_reason), None));
+        if self.include_usage {
+            out.push(chat_data_sse(json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "usage": self.usage.clone().unwrap_or_else(|| json!(null)),
+            })));
+        }
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
     }
@@ -427,6 +447,10 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
             "message": message,
             "type": "server_error",
         }))
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -675,6 +699,39 @@ mod tests {
         assert_eq!(msgs[3].role, "user"); // 这是"总结"，与上一条 tool_result user 相邻是允许的
     }
 
+    /// tool_choice:none 是显式禁止工具调用：声明的 web_search/function 工具一律
+    /// 不下发，force_web_search_loop 关闭；tool_choice 照常映射为 {"type":"none"} 转发。
+    #[test]
+    fn chat_request_tool_choice_none_strips_tools() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "查一下今天的新闻"}],
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "none"
+        }))
+        .unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
+        assert!(converted.anthropic.tools.is_none());
+        assert!(!converted.anthropic.force_web_search_loop);
+        assert_eq!(converted.anthropic.tool_choice, Some(json!({"type": "none"})));
+    }
+
+    /// tool_choice:auto 时行为不变：工具保留，web_search 仍触发 agentic loop。
+    #[test]
+    fn chat_request_tool_choice_auto_keeps_tools() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "查一下今天的新闻"}],
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+        let converted = chat_to_anthropic(&req, None).unwrap();
+        assert_eq!(converted.anthropic.tools.unwrap()[0].name, "web_search");
+        assert!(converted.anthropic.force_web_search_loop);
+        assert_eq!(converted.anthropic.tool_choice, Some(json!({"type": "auto"})));
+    }
+
     /// chat completions 流式：纯文本。验证首个 chunk 带 role=assistant，
     /// 文本以 delta.content 增量下发，末尾 chunk 带 finish_reason=stop，
     /// 且不请求 usage 时不夹带 usage 对象，最后以 [DONE] 收尾。
@@ -747,14 +804,86 @@ mod tests {
             .find_map(|c| c["choices"][0]["finish_reason"].as_str());
         assert_eq!(finish, Some("tool_calls"));
 
-        // include_usage：末尾带 OpenAI chat 口径 usage（prompt/completion/total）
-        let usage = chunks
-            .iter()
-            .find_map(|c| (!c["usage"].is_null()).then(|| c["usage"].clone()))
-            .expect("usage present when include_usage=true");
+        // include_usage：OpenAI 契约要求 [DONE] 前单独发一个 choices: [] 的
+        // usage chunk，finish chunk 的 usage 必须为 null。
+        assert_eq!(chunks.last().unwrap(), &Value::Null);
+        let usage_chunk = &chunks[chunks.len() - 2];
+        assert_eq!(usage_chunk["choices"], json!([]));
+        assert_eq!(usage_chunk["object"], "chat.completion.chunk");
+        let usage = &usage_chunk["usage"];
         assert_eq!(usage["prompt_tokens"], json!(12)); // 10 + 2 cache_read
         assert_eq!(usage["completion_tokens"], json!(4));
         assert_eq!(usage["total_tokens"], json!(16));
         assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(2));
+
+        // finish chunk（带 finish_reason 的那个）usage 恒为 null，
+        // 其余 chunk 也不允许夹带 usage
+        let finish_chunk = chunks
+            .iter()
+            .find(|c| !c["choices"][0]["finish_reason"].is_null())
+            .expect("finish chunk present");
+        assert!(finish_chunk["usage"].is_null());
+        assert!(
+            chunks
+                .iter()
+                .filter(|c| !c.is_null())
+                .all(|c| c["usage"].is_null() || c["choices"] == json!([]))
+        );
+    }
+
+    /// include_usage=false 时不得发出独立的 choices: [] usage chunk。
+    #[test]
+    fn chat_stream_without_include_usage_has_no_usage_chunk() {
+        let upstream = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let chunks = run_chat_translator(upstream, false);
+
+        assert_eq!(chunks.last().unwrap(), &Value::Null);
+        assert!(chunks.iter().all(|c| c["usage"].is_null()));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.is_null() || c["choices"] != json!([]))
+        );
+        // 倒数第二帧就是 finish chunk
+        let finish = &chunks[chunks.len() - 2];
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 上游截断（EOF 前没有 message_stop）必须报错收尾，
+    /// 不能伪装成 finish_reason=stop + [DONE]。
+    #[tokio::test]
+    async fn chat_stream_aborts_on_upstream_eof_before_message_stop() {
+        use axum::body::Body;
+        use futures::StreamExt;
+        use std::convert::Infallible;
+
+        let upstream = futures::stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        ))]);
+        let stream = super::transform_anthropic_sse(
+            Body::from_stream(upstream),
+            ChatStreamTranslator::new("gpt-4o".to_string(), false),
+        );
+        let out: Vec<Bytes> = stream.map(|r| r.unwrap()).collect().await;
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<String>();
+
+        assert!(joined.contains("\"error\""), "截断必须输出 error: {joined}");
+        assert!(
+            joined.contains("upstream stream ended before message_stop"),
+            "{joined}"
+        );
+        assert!(joined.contains("data: [DONE]"), "{joined}");
+        assert!(
+            !joined.contains("\"finish_reason\":\"stop\""),
+            "截断不能伪装成 stop: {joined}"
+        );
     }
 }

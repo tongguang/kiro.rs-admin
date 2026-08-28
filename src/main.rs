@@ -227,16 +227,9 @@ async fn main() {
         .cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
-    let client_key_manager = std::sync::Arc::new(
-        admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
-            tracing::warn!(
-                "加载客户端 Key 失败 ({}): {}",
-                client_keys_path.display(),
-                e
-            );
-            admin::ClientKeyManager::new()
-        }),
-    );
+    let client_key_manager = std::sync::Arc::new(admin::ClientKeyManager::load_or_empty(
+        &client_keys_path,
+    ));
     let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
         cache_dir.clone(),
         config.usage_log_retention_days as i64,
@@ -248,11 +241,7 @@ async fn main() {
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
     let groups_path = admin::groups::default_path_in(&cache_dir);
-    let group_manager =
-        std::sync::Arc::new(admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
-            tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
-            admin::GroupManager::new()
-        }));
+    let group_manager = std::sync::Arc::new(admin::GroupManager::load_or_empty(&groups_path));
     {
         let mut all_used: Vec<String> = token_manager.list_credential_groups();
         all_used.extend(client_key_manager.used_group_names());

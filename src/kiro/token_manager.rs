@@ -2589,6 +2589,17 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    /// 治理状态（禁用/自愈等）持久化：失败立即重试一次，仍失败提级 error!。
+    /// 不改 report_* 签名——调用方处于请求错误处理路径，向上传播会掩盖原始上游错误。
+    fn persist_governance(&self, context: &str) {
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("{}: 持久化失败，重试一次: {}", context, e);
+            if let Err(e) = self.persist_credentials() {
+                tracing::error!("{}: 持久化重试仍失败，治理状态重启后将丢失: {}", context, e);
+            }
+        }
+    }
+
     /// 尝试从凭据文件重新加载指定凭据的 Token
     ///
     /// 当 refreshToken 失效 (invalid_grant) 时，检查源文件是否已被其他客户端更新
@@ -2664,10 +2675,9 @@ impl MultiTokenManager {
                 entry.credentials.refresh_token = new_refresh_token;
                 entry.credentials.access_token = new_access_token;
                 entry.credentials.expires_at = new_expires_at;
-                entry.disabled = false;
-                entry.disabled_reason = None;
+                // 只回写 token 三元组：reload 可能撞上刷新期间被并发禁用
+                // （额度/封禁/管理员）的凭据，不能改变治理状态。
                 entry.refresh_failure_count = 0;
-                entry.failure_count = 0;
             }
         }
 
@@ -2829,9 +2839,10 @@ impl MultiTokenManager {
         true
     }
 
-    /// 当选择阶段无任何可用凭据时，计算「仅因 RPM 打满而不可用」的凭据中
-    /// 最早恢复秒数（Retry-After 口径）。返回 `None` 表示不是 RPM 打满场景
-    /// （例如全部禁用/冷却/模型分组不匹配），调用方按原有错误路径处理。
+    /// 当选择阶段无任何可用凭据时，计算「仅因临时限流/冷却而不可用」的凭据中
+    /// 最早恢复秒数（Retry-After 口径）。覆盖三类冷却：`throttled_until`、
+    /// `rate_limited_until`、RPM 窗口。返回 `None` 表示不是纯冷却场景
+    /// （例如全部禁用/模型分组不匹配），调用方按原有错误路径处理。
     ///
     /// 刻意不使用调用方的请求内排除集：被本请求抢占排除（`request_throttled_ids`）
     /// 的凭据往往正是「仅 RPM 打满」的凭据，漏算会把限流误报成 502「所有凭据
@@ -2847,22 +2858,28 @@ impl MultiTokenManager {
         let mut earliest: Option<u64> = None;
         for e in entries {
             if e.disabled
-                || e.throttled_until.map(|t| t > now).unwrap_or(false)
-                || e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 || !credential_matches_request(&e.credentials, model, group)
                 || self.cached_model_support(e.id, model) == CachedModelSupport::Unsupported
             {
                 continue;
             }
-            match rpm_window_retry_after(e, now) {
-                Some(retry_after) => {
-                    earliest = Some(
-                        earliest
-                            .map(|cur: u64| cur.min(retry_after))
-                            .unwrap_or(retry_after),
-                    );
+            // 三类冷却各自的恢复秒数，取仍生效者中的最小值
+            let mut retry_after: Option<u64> = None;
+            for candidate in [
+                cooldown_remaining_ms(e.throttled_until, now).map(|ms| ms.div_ceil(1000)),
+                cooldown_remaining_ms(e.rate_limited_until, now).map(|ms| ms.div_ceil(1000)),
+                rpm_window_retry_after(e, now),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                retry_after = Some(retry_after.map_or(candidate, |cur: u64| cur.min(candidate)));
+            }
+            match retry_after {
+                Some(secs) => {
+                    earliest = Some(earliest.map_or(secs, |cur: u64| cur.min(secs)));
                 }
-                // 不限速或窗口未满却未被选中：不是纯 RPM 打满场景
+                // 三类冷却均未生效却未被选中：不是纯冷却场景
                 None => return None,
             }
         }
@@ -2931,9 +2948,7 @@ impl MultiTokenManager {
             }
         };
         if reset_persisted_self_heal {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} 成功后持久化自愈状态失败: {}", id, error);
-            }
+            self.persist_governance(&format!("凭据 #{} 成功后持久化自愈状态", id));
         }
         self.save_stats_debounced();
     }
@@ -2998,9 +3013,7 @@ impl MultiTokenManager {
             (entries.iter().any(|e| !e.disabled), disabled_now)
         };
         if newly_disabled {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} 自动禁用状态持久化失败: {}", id, error);
-            }
+            self.persist_governance(&format!("凭据 #{} 自动禁用状态", id));
         }
         self.save_stats_debounced();
         result
@@ -3096,9 +3109,7 @@ impl MultiTokenManager {
             }
             has_remaining
         };
-        if let Err(error) = self.persist_credentials() {
-            tracing::warn!("凭据 #{} 封禁状态持久化失败: {}", id, error);
-        }
+        self.persist_governance(&format!("凭据 #{} 封禁状态", id));
         self.save_stats_debounced();
         result
     }
@@ -3231,9 +3242,7 @@ impl MultiTokenManager {
             recovered = ?recovered,
             "当前请求作用域无可用凭据，执行受控自愈"
         );
-        if let Err(error) = self.persist_credentials() {
-            tracing::warn!("自愈状态持久化失败: {}", error);
-        }
+        self.persist_governance("自愈状态");
         true
     }
 
@@ -3307,9 +3316,7 @@ impl MultiTokenManager {
             (has_available, true)
         };
         if newly_disabled {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} 额度用尽禁用状态持久化失败: {}", id, error);
-            }
+            self.persist_governance(&format!("凭据 #{} 额度用尽禁用状态", id));
         }
         self.save_stats_debounced();
         result
@@ -3377,9 +3384,7 @@ impl MultiTokenManager {
             (has_available, true)
         };
         if newly_disabled {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} 刷新失败禁用状态持久化失败: {}", id, error);
-            }
+            self.persist_governance(&format!("凭据 #{} 刷新失败禁用状态", id));
         }
         self.save_stats_debounced();
         result
@@ -3449,13 +3454,7 @@ impl MultiTokenManager {
             (has_available, true)
         };
         if newly_disabled {
-            if let Err(error) = self.persist_credentials() {
-                tracing::warn!(
-                    "凭据 #{} refreshToken 失效禁用状态持久化失败: {}",
-                    id,
-                    error
-                );
-            }
+            self.persist_governance(&format!("凭据 #{} refreshToken 失效禁用状态", id));
         }
         self.save_stats_debounced();
         result
@@ -4448,9 +4447,15 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
+        // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化。
+        // 新凭据的 token 三元组以内存为准落盘：新 ID 不在磁盘上，否则合并逻辑
+        // 会按「唯一同 email」回退把磁盘旧账号的 token 复制到新凭据。
         self.is_multiple_format.store(true, Ordering::Relaxed);
-        self.persist_credentials()?;
+        if let Err(e) = self.persist_credentials_for_token_ids(&HashSet::from([new_id])) {
+            // 写盘失败回滚内存凭据，避免内存/磁盘不一致
+            self.entries.lock().retain(|entry| entry.id != new_id);
+            return Err(e);
+        }
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -7146,6 +7151,80 @@ mod tests {
     }
 
     #[test]
+    fn test_rpm_retry_after_covers_cooldown_credentials() {
+        // throttled/rate_limited 冷却中的凭据也是「临时不可用」，应参与
+        // Retry-After 计算并取最早恢复秒数，而非被跳过导致误报 502。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        {
+            let mut entries = manager.entries.lock();
+            let a = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            a.throttled_until = Some(now + StdDuration::from_secs(30));
+            let b = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            b.rate_limited_until = Some(now + StdDuration::from_secs(10));
+        }
+
+        let entries = manager.entries.lock();
+        let retry_after = manager.rpm_retry_after_secs(&entries[..], None, None, now);
+        assert_eq!(retry_after, Some(10), "应取所有冷却凭据中的最短恢复秒数");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cooldown_credentials_yield_rate_limit_not_all_disabled() {
+        // 全部凭据处于临时冷却时，acquire 必须返回带 Retry-After 的 429，
+        // 而不是「所有凭据均已禁用」的 502。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("cd-a", &[]), grouped_cred("cd-b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let now = Instant::now();
+            let a = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            a.throttled_until = Some(now + StdDuration::from_secs(30));
+            let b = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            b.throttled_until = Some(now + StdDuration::from_secs(10));
+        }
+
+        let err = match manager.acquire_context(None, None).await {
+            Ok(_) => panic!("全部凭据冷却中不应成功获取上下文"),
+            Err(err) => err,
+        };
+        let rate_limit = err
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("冷却场景应返回类型化 429 而非 502");
+        let retry_after: u64 = rate_limit
+            .retry_after()
+            .expect("应带 Retry-After")
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=10).contains(&retry_after),
+            "Retry-After 应为最短冷却恢复秒数，实际 {}",
+            retry_after
+        );
+
+        let snapshot = manager.snapshot();
+        assert!(
+            snapshot.entries.iter().all(|e| !e.disabled),
+            "临时冷却不得禁用凭据"
+        );
+    }
+
+    #[test]
     fn test_usage_api_should_fallback_rules() {
         // 403 恒回退（无论是否带 ARN）；带 ARN 的 400/401 形态拒绝同样回退
         assert!(usage_api_should_fallback(403, false, true));
@@ -7821,6 +7900,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 同 email 场景：add_credential 落盘时新凭据的 token 以内存为准，
+    /// 不得被磁盘上同 email 旧账号的 token 覆盖（新 ID 不在磁盘，按
+    /// 「唯一同 email」回退匹配会串写）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_does_not_inherit_disk_token_by_email() {
+        let path = tmp_creds_path("add_cred_no_token_mix");
+
+        // 磁盘已有同 email 的旧凭据 A（旧 token）
+        let mut cred_a = KiroCredentials::default();
+        cred_a.id = Some(1);
+        cred_a.kiro_api_key = Some("ksk_old_a".to_string());
+        cred_a.auth_method = Some("api_key".to_string());
+        cred_a.email = Some("a@x.com".to_string());
+        cred_a.access_token = Some("old_access".to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&[&cred_a]).unwrap()).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred_a],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 加入同 email 的新凭据 B（新 token）
+        let mut cred_b = KiroCredentials::default();
+        cred_b.kiro_api_key = Some("ksk_new_b".to_string());
+        cred_b.auth_method = Some("api_key".to_string());
+        cred_b.email = Some("a@x.com".to_string());
+        cred_b.access_token = Some("new_access".to_string());
+        let new_id = manager.add_credential(cred_b).await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let disk: Vec<KiroCredentials> = serde_json::from_str(&content).unwrap();
+        let disk_b = disk.iter().find(|c| c.id == Some(new_id)).unwrap();
+        assert_eq!(
+            disk_b.access_token.as_deref(),
+            Some("new_access"),
+            "新凭据落盘必须保留自己的 token，不得串写同 email 旧账号的 token"
+        );
+        let disk_a = disk.iter().find(|c| c.id == Some(1)).unwrap();
+        assert_eq!(disk_a.access_token.as_deref(), Some("old_access"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// add_credential 写盘失败时必须回滚内存凭据，避免内存/磁盘不一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_rolls_back_on_persist_failure() {
+        let path = tmp_creds_path("add_cred_rollback");
+        std::fs::write(&path, "[]").unwrap();
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap();
+
+        // 只读文件使 persist 失败
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_rollback".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let result = manager.add_credential(cred).await;
+        assert!(result.is_err(), "persist 失败时 add_credential 应返回 Err");
+
+        let snapshot = manager.snapshot();
+        assert!(
+            snapshot.entries.is_empty(),
+            "persist 失败后内存不得残留新凭据，实际 {} 条",
+            snapshot.entries.len()
+        );
+
+        // 恢复可写以便清理
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── 并发去重（TOCTOU 回归守卫） ───────────────────────────────────────────
 
     /// 并发添加多个相同的 API Key 凭据，必须只插入一条。
@@ -7911,7 +8072,9 @@ mod tests {
         assert_eq!(hit.refresh_token.as_deref(), Some("tok_a"));
     }
 
-    /// 文件中有新 refreshToken 时，reload 返回 true 并更新内存凭据
+    /// 文件中有新 refreshToken 时，reload 返回 true 并更新 token 三元组；
+    /// 但不得改变治理状态（disabled/disabled_reason/failure_count），
+    /// 仅清零 refresh_failure_count。
     #[test]
     fn test_reload_from_file_succeeds_when_token_rotated() {
         let path = tmp_creds_path("reload_rotated");
@@ -7932,6 +8095,16 @@ mod tests {
         )
         .unwrap();
 
+        // 把凭据置为禁用并累积失败计数（模拟 reload 前已被治理禁用）
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            e.disabled = true;
+            e.disabled_reason = Some(DisabledReason::Manual);
+            e.failure_count = 3;
+            e.refresh_failure_count = 2;
+        }
+
         // 模拟 IDE rotation：文件写入新 token
         let mut updated_cred = KiroCredentials::default();
         updated_cred.id = Some(1);
@@ -7945,8 +8118,74 @@ mod tests {
 
         let snapshot = manager.snapshot();
         let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
-        assert!(!entry.disabled, "reload 后凭据应重新启用");
-        assert_eq!(entry.failure_count, 0);
+        // token 三元组已更新
+        let creds = manager
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .credentials
+            .clone();
+        assert_eq!(
+            creds.refresh_token.as_deref(),
+            Some("rotated_token_bbbb".repeat(10).as_str())
+        );
+        assert_eq!(creds.access_token.as_deref(), Some("new_access"));
+        // 治理状态保持原值，仅 refresh_failure_count 归零
+        assert!(entry.disabled, "reload 不得改变禁用状态");
+        assert_eq!(entry.disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(entry.failure_count, 3, "reload 不得清零 failure_count");
+        assert_eq!(entry.refresh_failure_count, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 竞态回归：凭据在刷新期间被并发禁用（额度/封禁/管理员），
+    /// 随后的 reload 命中新 token 也绝不能复活该凭据。
+    #[test]
+    fn test_reload_from_file_preserves_concurrent_disable() {
+        let path = tmp_creds_path("reload_preserves_disable");
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("original_token_cccc".repeat(10));
+        let initial_json = serde_json::to_vec_pretty(&[&cred]).unwrap();
+        std::fs::write(&path, &initial_json).unwrap();
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 刷新进行中被并发禁用（额度用尽）
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            e.disabled = true;
+            e.disabled_reason = Some(DisabledReason::QuotaExceeded);
+        }
+
+        // 文件中已被其他客户端轮换出新 token
+        let mut updated_cred = KiroCredentials::default();
+        updated_cred.id = Some(1);
+        updated_cred.refresh_token = Some("rotated_token_dddd".repeat(10));
+        let updated_json = serde_json::to_vec_pretty(&[&updated_cred]).unwrap();
+        std::fs::write(&path, &updated_json).unwrap();
+
+        assert!(
+            manager.try_reload_credential_from_file(1),
+            "reload 应命中新 token"
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry.disabled, "reload 不得复活被并发禁用的凭据");
+        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
 
         let _ = std::fs::remove_file(&path);
     }

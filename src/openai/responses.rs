@@ -1999,6 +1999,20 @@ impl ResponsesStreamContext {
             "code": error_type,
             "message": message,
         });
+        // store=true：与 finish() 同口径，response.failed 发出前先落库，
+        // 否则客户端拿着 response.created 的 ID 去 GET 会 404。
+        if let Some(store) = &self.store_plan {
+            let mut items = store.input_items.clone();
+            if let Some(output) = response.get("output").and_then(Value::as_array) {
+                items.extend(output.iter().cloned());
+            }
+            save_response(
+                response["id"].as_str().unwrap_or_default().to_string(),
+                store.owner_key_id,
+                response.clone(),
+                items,
+            );
+        }
         self.emit("response.failed", json!({ "response": response }))
     }
 }
@@ -3671,6 +3685,103 @@ mod tests {
             stored.items.first(),
             Some(&json!({"type": "message", "role": "user", "content": "hi"}))
         );
+    }
+
+    /// store=true 的流式失败（上游截断未发 message_stop）也必须落库：
+    /// 客户端已收到 response.created 的 ID，之后 GET 不能 404。
+    #[tokio::test]
+    async fn streaming_fail_saves_response_when_store_enabled() {
+        let upstream = stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        ))]);
+        let response = responses_streaming_response(
+            Body::from_stream(upstream),
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+            StreamStorePlan {
+                enabled: true,
+                owner_key_id: 7,
+                input_items: vec![json!({"type": "message", "role": "user", "content": "hi"})],
+            },
+            None,
+            None,
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut output = String::new();
+        while !output.contains("event: response.failed") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+                .await
+                .expect("response.failed must arrive")
+                .expect("stream must emit response.failed")
+                .unwrap();
+            output.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        drop(body);
+
+        let failed_frame = output
+            .split("\n\n")
+            .find(|frame| frame.contains("event: response.failed"))
+            .expect("failed event frame");
+        let data_line = failed_frame
+            .lines()
+            .find(|line| line.starts_with("data:"))
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
+        let resp_id = payload["response"]["id"].as_str().unwrap().to_string();
+
+        let stored =
+            load_owned_response(&resp_id, 7).expect("store=true 的 failed 响应必须入库");
+        assert_eq!(stored.response["status"], json!("failed"));
+        assert_eq!(
+            stored.items.first(),
+            Some(&json!({"type": "message", "role": "user", "content": "hi"}))
+        );
+    }
+
+    /// store=false 时流式失败不落库。
+    #[tokio::test]
+    async fn streaming_fail_not_saved_when_store_disabled() {
+        let upstream = stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        ))]);
+        let response = responses_streaming_response(
+            Body::from_stream(upstream),
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+            StreamStorePlan::disabled(),
+            None,
+            None,
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut output = String::new();
+        while !output.contains("event: response.failed") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+                .await
+                .expect("response.failed must arrive")
+                .expect("stream must emit response.failed")
+                .unwrap();
+            output.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        drop(body);
+
+        let failed_frame = output
+            .split("\n\n")
+            .find(|frame| frame.contains("event: response.failed"))
+            .expect("failed event frame");
+        let data_line = failed_frame
+            .lines()
+            .find(|line| line.starts_with("data:"))
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
+        let resp_id = payload["response"]["id"].as_str().unwrap().to_string();
+
+        assert!(load_owned_response(&resp_id, 0).is_none());
     }
 
     #[tokio::test]
