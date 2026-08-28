@@ -2647,22 +2647,13 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_stream_client_disconnect_settles_once_as_error() {
-        // /cc 缓冲流：客户端在终端分支前断开（流被 drop），
-        // StreamUsageSettlement 的 Drop 必须恰好以 error 记账一次。
+        // /cc 缓冲流：客户端在首个上游 chunk 前断开（流被 drop），
+        // StreamUsageSettlement 的 Drop 必须恰好以 error 记账一次，
+        // 且创建时同步的 fallback 估算用量不丢。
         let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
-        let hook = UsageRecordHook {
-            recorder: None,
-            aggregator: Some(aggregator.clone()),
-            client_keys: None,
-            key_id: 0,
-            model: "test-model".to_string(),
-            started_at: Instant::now(),
-        };
-        // 上游 body：一个 chunk 后挂起，保证流永远走不到终端分支
-        let body_stream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
-            b"garbage",
-        ))])
-        .chain(stream::pending());
+        // 上游 body 永久 pending：保证走不到任何 chunk 分支（chunk 分支本身
+        // 会同步用量，混入 chunk 就守不住"创建即初始化"这条路径）。
+        let body_stream = stream::pending::<Result<Bytes, std::io::Error>>();
         let response: reqwest::Response =
             http::Response::new(reqwest::Body::wrap_stream(body_stream)).into();
         let ctx = BufferedStreamContext::new(
@@ -2675,19 +2666,13 @@ mod tests {
         let mut sse = Box::pin(create_buffered_sse_stream(
             response,
             ctx,
-            hook,
+            test_hook(&aggregator),
             7,
             std::sync::Arc::new(RequestTracer::noop("test-model")),
         ));
 
-        // 消费 ping（interval 首次 tick 立即触发），随后 body 挂起、不再有产出
+        // 消费 ping（interval 首次 tick 立即触发），随后客户端断开：流被 drop
         assert!(sse.next().await.is_some());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), sse.next())
-                .await
-                .is_err()
-        );
-        // 客户端断开：流被 drop
         drop(sse);
 
         let overview = aggregator.overview();
