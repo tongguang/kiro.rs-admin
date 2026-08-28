@@ -225,6 +225,24 @@ fn should_search_round(
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS && uses_so_far + tool_uses.len() <= budget
 }
 
+/// flush 前的回灌判定：纯 web_search 轮（无客户端工具）、尚未回灌过、且仍有
+/// 剩余迭代时，先把本轮搜索的结果/错误作为 tool_result 喂回模型，追加一轮最终
+/// 生成。混合轮必须返回客户端工具（模型在下一客户端回合随 assistant 消息回显
+/// 自然看到错误块），不回灌；一次性标志保证回灌后模型仍执着搜索时按正常 flush
+/// 结束，不会循环。`round_idx == MAX_WEB_SEARCH_ROUNDS` 时仍允许回灌：循环上界
+/// 为此预留了一个额外轮次（搜索轮次硬上限不变，最终生成轮不执行搜索）。
+fn should_feed_back_search_results(
+    tool_uses: &[CompletedToolUse],
+    client_uses_empty: bool,
+    feedback_done: bool,
+    round_idx: usize,
+) -> bool {
+    client_uses_empty
+        && !feedback_done
+        && round_idx <= MAX_WEB_SEARCH_ROUNDS
+        && tool_uses.iter().any(|t| t.name == "web_search")
+}
+
 /// Whether the request is the continuation immediately following a tool result.
 fn last_message_has_tool_result(payload: &MessagesRequest) -> bool {
     let Some(last) = payload.messages.last() else {
@@ -623,14 +641,21 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, outcome) in round.tool_uses.iter().zip(searched.iter()) {
-        // 继续路径的预算由 should_search_round 整轮把关，这里只会出现 Searched；
-        // 其它变体按无结果兜底。
+        // 继续路径的预算由 should_search_round 整轮把关，只会出现 Searched；
+        // 回灌路径（flush 前喂回）可能出现 BudgetExceeded。
         let results: &Option<WebSearchResults> = match outcome {
             SearchOutcome::Searched(r) => r,
             _ => &None,
         };
         let query = tool_query(tu).unwrap_or_default();
-        let summary = websearch::generate_search_summary(&query, results);
+        // 预算耗尽的调用对模型也必须可区分：回灌错误说明（并引导其基于已有
+        // 信息作答），而不是伪装成 "No results found"。
+        let summary = match outcome {
+            SearchOutcome::BudgetExceeded => format!(
+                "Web search for \"{query}\" was not executed: the web_search max_uses budget has been exhausted. Please answer the user with the information already available."
+            ),
+            _ => websearch::generate_search_summary(&query, results),
+        };
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
         }));
@@ -641,10 +666,11 @@ fn append_search_round(
             "type": "server_tool_use", "id": srv_id, "name": "web_search",
             "input": {"query": query}
         }));
-        // Contract A: web_search_tool_result has only type + content (no tool_use_id), consistent with generate_websearch_events
+        // Contract A: web_search_tool_result has only type + content (no tool_use_id)；
+        // 预算耗尽时为官方协议的 error 对象（content 允许结果数组或错误对象）。
         presentation.push(json!({
             "type": "web_search_tool_result",
-            "content": build_result_block(results)
+            "content": build_flush_result_content(outcome)
         }));
     }
     payload.messages.push(Message {
@@ -1623,8 +1649,13 @@ async fn run_web_search_loop_inner(
     // 搜索次数预算：客户端声明的 max_uses（默认 5），硬上限 10
     let search_budget = web_search_budget(payload.tools.as_deref());
     let mut search_uses = 0usize;
+    // 一次性回灌标志：纯搜索轮 flush 前把结果/错误喂回模型追加一轮最终生成
+    let mut error_feedback_done = false;
 
-    for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
+    // 上界 MAX+1：搜索轮次硬上限仍为 MAX_WEB_SEARCH_ROUNDS（should_search_round
+    // 把关）；多出的 1 轮预留给预算错误回灌后的最终生成（该轮不执行搜索，只能
+    // 经回灌 continue 进入）。
+    for round_idx in 0..=(MAX_WEB_SEARCH_ROUNDS + 1) {
         let mut empty_retries = 0usize;
         let round = loop {
             let round_fallback_input_tokens = token::count_all_tokens(
@@ -1826,6 +1857,20 @@ async fn run_web_search_loop_inner(
             } else {
                 searched.push(SearchOutcome::NotApplicable);
             }
+        }
+        // 结果/错误回灌：纯 web_search 轮在 flush 前先把本轮搜索的结果与
+        // max_uses_exceeded 错误作为 tool_result 喂回模型，追加一轮最终生成，
+        // 让模型看到预算耗尽并产出最终回答（对齐 Anthropic server-side
+        // web_search 行为），避免客户端只拿到搜索调用块而没有回答。
+        if should_feed_back_search_results(
+            &round.tool_uses,
+            client_uses.is_empty(),
+            error_feedback_done,
+            round_idx,
+        ) {
+            append_search_round(&mut payload, &round, &searched, &mut presentation);
+            error_feedback_done = true;
+            continue;
         }
         let content = build_flush_content(
             presentation.clone(),
@@ -3095,6 +3140,96 @@ mod tests {
     // ---- SearchOutcome: budget-exhausted calls must surface max_uses_exceeded ----
 
     #[test]
+    fn feed_back_gate_pure_search_round_triggers_once() {
+        let searches = vec![tu("web_search")];
+        // 纯搜索轮 + 未回灌 + 轮次有余量 → 触发
+        assert!(should_feed_back_search_results(&searches, true, false, 0));
+        // 已回灌过 → 不重复触发（最终生成轮仍搜索则正常 flush 结束）
+        assert!(!should_feed_back_search_results(&searches, true, true, 0));
+        // 搜索轮次硬上限处仍允许回灌：循环预留了一个额外的最终生成轮，
+        // max_uses 顶到硬上限时也能拿到最终回答
+        assert!(should_feed_back_search_results(
+            &searches,
+            true,
+            false,
+            MAX_WEB_SEARCH_ROUNDS
+        ));
+        // 预留轮已用尽（最终生成轮本身）→ 直接 flush
+        assert!(!should_feed_back_search_results(
+            &searches,
+            true,
+            false,
+            MAX_WEB_SEARCH_ROUNDS + 1
+        ));
+    }
+
+    #[test]
+    fn feed_back_gate_skips_mixed_round_and_empty_round() {
+        // 混合轮（含客户端工具）：客户端工具必须返回，不回灌
+        assert!(!should_feed_back_search_results(
+            &[tu("web_search"), tu("exec")],
+            false,
+            false,
+            0
+        ));
+        // 空轮无搜索可回灌
+        assert!(!should_feed_back_search_results(&[], true, false, 0));
+    }
+
+    #[test]
+    fn append_search_round_feeds_budget_exceeded_error_to_model() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "hi"}));
+        let round = round_outcome("", vec![tu("web_search")]);
+        let mut presentation = Vec::new();
+        append_search_round(
+            &mut payload,
+            &round,
+            &[SearchOutcome::BudgetExceeded],
+            &mut presentation,
+        );
+
+        // 喂回模型的 tool_result 必须说明预算耗尽，而不是伪装 "No results found"
+        let user = payload.messages.last().expect("user tool_result message");
+        let content = user.content[0]["content"].as_str().unwrap();
+        assert!(content.contains("max_uses"), "content={content}");
+        assert!(!content.contains("No results found"), "content={content}");
+
+        // 呈现块为官方协议 error 对象
+        let result_block = presentation
+            .iter()
+            .find(|b| b["type"] == "web_search_tool_result")
+            .expect("presentation must contain the result block");
+        assert_eq!(
+            result_block["content"],
+            json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"})
+        );
+    }
+
+    #[test]
+    fn append_search_round_searched_path_unchanged() {
+        let mut payload = payload_with_last_block(json!({"type": "text", "text": "hi"}));
+        let round = round_outcome("", vec![tu("web_search")]);
+        let mut presentation = Vec::new();
+        append_search_round(
+            &mut payload,
+            &round,
+            &[SearchOutcome::Searched(fake_results("rust 2026"))],
+            &mut presentation,
+        );
+        let user = payload.messages.last().unwrap();
+        let content = user.content[0]["content"].as_str().unwrap();
+        assert!(content.contains("search results"), "content={content}");
+        let result_block = presentation
+            .iter()
+            .find(|b| b["type"] == "web_search_tool_result")
+            .unwrap();
+        assert!(
+            result_block["content"].is_array(),
+            "executed search keeps the result array"
+        );
+    }
+
+    #[test]
     fn budget_exceeded_result_is_error_object_not_empty_array() {
         // 对齐 Anthropic 官方协议：超 max_uses 的调用返回
         // {"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}，
@@ -3133,9 +3268,11 @@ mod tests {
             "budget-skipped search must present the max_uses_exceeded error"
         );
         // server_tool_use 呈现不变（INVARIANT：不出现裸 web_search tool_use）
-        assert!(!content
-            .iter()
-            .any(|c| c["type"] == "tool_use" && c["name"] == "web_search"));
+        assert!(
+            !content
+                .iter()
+                .any(|c| c["type"] == "tool_use" && c["name"] == "web_search")
+        );
     }
 
     #[tokio::test]

@@ -484,7 +484,6 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 | `glm-*` | 原样透传 |
 | `qwen*` | 原样透传 |
 | `claude-<family>-<major>-<minor>` | 自动归一化为 `claude-<family>-<major>.<minor>` |
-| `fable`（任意） | `claude-fable-5` |
 | `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
 | `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
 | `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
@@ -493,7 +492,6 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 | `opus` + `4-7` / `4.7` | `claude-opus-4.7` |
 | `opus` + `4-6` / `4.6` | `claude-opus-4.6` |
 | `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
-| 任意 `haiku` | `claude-haiku-4.5` |
 
 未命中显式规则的模型会去掉 `-thinking` 后缀后透传给上游，避免 Kiro 新模型发布后必须立即改代码；是否真正可用由 Kiro 返回结果决定。
 

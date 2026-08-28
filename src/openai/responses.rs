@@ -1357,7 +1357,7 @@ impl ResponsesStreamContext {
     }
 
     fn initial_events(&mut self) -> Vec<Bytes> {
-        let response = json!({
+        let mut response = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
@@ -1365,6 +1365,11 @@ impl ResponsesStreamContext {
             "model": self.model,
             "output": [],
         });
+        // 与 response_object() 同口径：回显字段与 store 无关，初始事件也携带。
+        response["previous_response_id"] = json!(self.previous_response_id);
+        if let Some(md) = &self.metadata {
+            response["metadata"] = md.clone();
+        }
         vec![
             self.emit("response.created", json!({ "response": response.clone() })),
             self.emit("response.in_progress", json!({ "response": response })),
@@ -3695,6 +3700,23 @@ mod tests {
             output.push_str(std::str::from_utf8(&chunk).unwrap());
         }
         drop(body);
+
+        // 初始事件（response.created / response.in_progress）同样携带回显字段
+        let created_frame = output
+            .split("\n\n")
+            .find(|frame| frame.contains("event: response.created"))
+            .expect("created event frame");
+        let created_line = created_frame
+            .lines()
+            .find(|line| line.starts_with("data:"))
+            .unwrap();
+        let created: Value =
+            serde_json::from_str(created_line.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(
+            created["response"]["previous_response_id"],
+            json!("resp_prev_2")
+        );
+        assert_eq!(created["response"]["metadata"], json!({"k": "v"}));
 
         // store=false：终态对象仍回显 previous_response_id / metadata（与非流式同口径）
         let completed_frame = output

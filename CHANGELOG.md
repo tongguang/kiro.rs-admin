@@ -33,8 +33,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 🔧 修复 — web_search 预算 / Responses 回显 / 断连记账
 
-- **超 `max_uses` 返回 `max_uses_exceeded` 错误块**：搜索预算耗尽的 web_search 调用不再伪装成"搜索了无结果"的空结果数组，按 Anthropic 官方协议呈现 `{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}`，模型可区分"超预算未执行"与"无结果"；流式下被跳过的调用同步补发 `server_tool_use` + 错误结果块，此前该调用在 SSE 流中彻底消失。
-- **Responses 流式 `store=false` 不再丢字段**：`response.completed` 终态对象与非流式同口径，恒回显 `previous_response_id`（无则为 null）与 `metadata`，此前这两个字段随 `store_plan` 一起被丢弃；store=false 仍不落库。
+- **超 `max_uses` 返回 `max_uses_exceeded` 错误块**：搜索预算耗尽的 web_search 调用不再伪装成"搜索了无结果"的空结果数组，按 Anthropic 官方协议呈现 `{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}`；纯搜索轮在 flush 前把本轮搜索的结果与错误作为 tool_result **回灌模型**，追加一轮最终生成，模型可区分"超预算未执行"与"无结果"并产出最终回答（此前客户端只拿到搜索调用块、没有回答；模型仍执着搜索时按错误块正常结束，不会循环）；流式下被跳过的调用同步补发 `server_tool_use` + 错误结果块，此前该调用在 SSE 流中彻底消失。
+- **Responses 流式 `store=false` 不再丢字段**：`response.created` / `response.in_progress` 初始事件与 `response.completed` 终态对象均与非流式同口径，恒回显 `previous_response_id`（无则为 null）与 `metadata`，此前这两个字段随 `store_plan` 一起被丢弃；store=false 仍不落库。
 - **web_search 流式断连不再漏记当前 provider 轮次**：`decode_round` 随 metadata/contextUsage/metering 事件渐进更新在途用量快照，客户端断连取消 future 时由结算兜底并入，当前轮的 token/credits 正常进入 usage_log、按凭据明细与 trace，此前只记录已完成轮次、进行中的轮次整体丢失。
 
 ### 📚 说明 — 自愈 streak 现状口径
