@@ -1258,15 +1258,18 @@ fn first_present_property<'a>(
 }
 
 /// Edit schema 是否为已知可映射风格：Claude Code（`old_string`/`new_string`）
-/// 或 Anthropic text-editor（`old_str`/`new_str`）。
+/// 或 Anthropic text-editor（`old_str`/`new_str`），且路径键为 `file_path` 或 `path`。
 fn edit_schema_is_mappable(schema: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
     let Some(props) = schema_properties(schema) else {
         return false;
     };
-    schema_has_all_keys(props, &["old_string", "new_string"])
-        || schema_has_all_keys(props, &["old_str", "new_str"])
+    first_present_property(props, &["file_path", "path"]).is_some()
+        && (schema_has_all_keys(props, &["old_string", "new_string"])
+            || schema_has_all_keys(props, &["old_str", "new_str"]))
 }
 
+/// Claude Code 规范键指纹：出站取参且回程按固定键还原，缺任一关键键则不劫持。
+/// `Edit` 因已记录客户端键名，额外允许 `old_str`/`new_str` 与 `path`。
 fn should_map_client_tool_to_kiro_builtin(
     name: &str,
     schema: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -1276,9 +1279,19 @@ fn should_map_client_tool_to_kiro_builtin(
         return false;
     }
     if name == "Edit" {
-        edit_schema_is_mappable(schema)
-    } else {
-        true
+        return edit_schema_is_mappable(schema);
+    }
+    let Some(props) = schema_properties(schema) else {
+        return false;
+    };
+    match name {
+        "Write" => schema_has_all_keys(props, &["file_path", "content"]),
+        "Bash" => schema_has_all_keys(props, &["command"]),
+        "Read" => schema_has_all_keys(props, &["file_path"]),
+        "Glob" | "Grep" => schema_has_all_keys(props, &["pattern"]),
+        "LS" => schema_has_all_keys(props, &["path"]),
+        "WebSearch" => schema_has_all_keys(props, &["query"]),
+        _ => false,
     }
 }
 
@@ -1300,10 +1313,9 @@ fn record_str_replace_client_keys(
     }
 }
 
-/// 出站工具名映射：ClaudeCode 模式命中内置则改名并记录 `kiro名 → 客户端名`；
+/// 出站工具名映射：ClaudeCode 模式且 `convert_tools` 已按 schema 指纹写入 kiro 条目才改名；
 /// 否则回退到长名缩短逻辑（map_tool_name）。
 ///
-/// `Edit` 例外：必须先由 `convert_tools` 按 schema 指纹写入 `str_replace` 条目后才改名，
 /// 历史中的 tool_use 跟随同一次请求的劫持决策，避免误伤参数形状不同的同名工具。
 fn map_client_tool_name_to_kiro(
     name: &str,
@@ -1313,12 +1325,9 @@ fn map_client_tool_name_to_kiro(
     if is_claude_code_mode(mode)
         && let Some(kiro_name) = claude_code_tool_name_to_kiro(name)
     {
-        if name == "Edit" && !tool_name_map.contains_key(kiro_name) {
+        if !tool_name_map.contains_key(kiro_name) {
             return map_tool_name(name, tool_name_map);
         }
-        tool_name_map
-            .entry(kiro_name.to_string())
-            .or_insert_with(|| name.to_string());
         return kiro_name.to_string();
     }
     map_tool_name(name, tool_name_map)
@@ -1711,11 +1720,20 @@ fn convert_tools(
         }
 
         let is_builtin = should_map_client_tool_to_kiro_builtin(&t.name, &t.input_schema, mode);
-        if is_builtin && t.name == "Edit" {
-            record_str_replace_client_keys(tool_name_map, &t.input_schema);
-            tool_name_map
-                .entry("str_replace".to_string())
-                .or_insert_with(|| t.name.clone());
+        if is_builtin {
+            if t.name == "Edit" {
+                record_str_replace_client_keys(tool_name_map, &t.input_schema);
+            }
+            if let Some(kiro_name) = claude_code_tool_name_to_kiro(&t.name) {
+                tool_name_map
+                    .entry(kiro_name.to_string())
+                    .or_insert_with(|| t.name.clone());
+            }
+        } else if is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some() {
+            tracing::warn!(
+                "Claude Code 兼容模式：工具 {} schema 指纹不匹配，透传不劫持",
+                t.name
+            );
         }
 
         let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
@@ -1729,12 +1747,17 @@ fn convert_tools(
             kiro_builtin_tool_description(&mapped_name, &t.description)
         } else {
             let mut description = t.description.clone();
-            // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
+            // Raw 模式保留旧的 Write/Edit/Bash 后缀。ClaudeCode 下未劫持的工具不追加，
+            // 避免诱导模型使用 schema 中不存在的参数。
+            let suffix = if is_claude_code_mode(mode) {
+                ""
+            } else {
+                match t.name.as_str() {
+                    "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                    "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                    "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
+                    _ => "",
+                }
             };
             if !suffix.is_empty() {
                 description.push('\n');
@@ -1989,7 +2012,7 @@ fn convert_assistant_message(
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name =
                                     map_client_tool_name_to_kiro(&name, tool_name_map, mode);
-                                // 未改名则不改写入参，避免指纹未命中的同名 Edit 被套 Claude Code 键名。
+                                // 未改名则不改写入参，避免指纹未命中的同名内置工具被套 Claude Code 键名。
                                 let input = if mapped_name == name {
                                     input
                                 } else {
@@ -2886,7 +2909,34 @@ mod tests {
     // ---- Tool Call 双向兼容（ClaudeCode 内置工具名/入参映射）----
 
     fn cc_tool(name: &str) -> super::super::types::Tool {
-        cc_tool_with_properties(name, serde_json::json!({}))
+        let properties = match name {
+            "Write" => serde_json::json!({
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            }),
+            "Edit" => serde_json::json!({
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            }),
+            "Bash" => serde_json::json!({
+                "command": {"type": "string"},
+            }),
+            "Read" => serde_json::json!({
+                "file_path": {"type": "string"},
+            }),
+            "Glob" | "Grep" => serde_json::json!({
+                "pattern": {"type": "string"},
+            }),
+            "LS" => serde_json::json!({
+                "path": {"type": "string"},
+            }),
+            "WebSearch" => serde_json::json!({
+                "query": {"type": "string"},
+            }),
+            _ => serde_json::json!({}),
+        };
+        cc_tool_with_properties(name, properties)
     }
 
     fn cc_tool_with_properties(
@@ -2948,6 +2998,33 @@ mod tests {
             assert!(kiro_builtin_tool_schema(k).is_some(), "{k} 应有内置 schema");
         }
         assert!(kiro_builtin_tool_schema("fs_append").is_none());
+    }
+
+    #[test]
+    fn cc_all_builtins_map_when_fingerprint_matches() {
+        for (client, kiro) in [
+            ("Write", "fs_write"),
+            ("Edit", "str_replace"),
+            ("Bash", "execute_bash"),
+            ("Read", "read_file"),
+            ("Glob", "file_search"),
+            ("Grep", "grep_search"),
+            ("LS", "list_directory"),
+            ("WebSearch", "web_search"),
+        ] {
+            let mut map = HashMap::new();
+            let out = convert_tools(
+                &Some(vec![cc_tool(client)]),
+                &mut map,
+                ToolCompatibilityMode::ClaudeCode,
+            )
+            .unwrap();
+            assert_eq!(
+                out[0].tool_specification.name, kiro,
+                "{client} 规范指纹应映射为 {kiro}"
+            );
+            assert_eq!(map.get(kiro).map(|s| s.as_str()), Some(client));
+        }
     }
 
     #[test]
@@ -3162,19 +3239,29 @@ mod tests {
     #[test]
     fn cc_edit_unknown_schema_passthrough() {
         let mut map = HashMap::new();
+        let mut tool = cc_tool_with_properties(
+            "Edit",
+            serde_json::json!({
+                "foo": {"type": "string"},
+                "bar": {"type": "string"},
+            }),
+        );
+        tool.description = "custom unmatched edit".to_string();
         let out = convert_tools(
-            &Some(vec![cc_tool_with_properties(
-                "Edit",
-                serde_json::json!({
-                    "foo": {"type": "string"},
-                    "bar": {"type": "string"},
-                }),
-            )]),
+            &Some(vec![tool]),
             &mut map,
             ToolCompatibilityMode::ClaudeCode,
         )
         .unwrap();
         assert_eq!(out[0].tool_specification.name, "Edit", "指纹不匹配则不劫持");
+        assert_eq!(
+            out[0].tool_specification.description, "custom unmatched edit",
+            "未劫持的 Edit 应保留原描述"
+        );
+        assert!(
+            !out[0].tool_specification.description.contains("new_string"),
+            "不得追加 Claude Code Edit 后缀"
+        );
         let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
         assert!(schema.contains("\"foo\""), "应保留客户端 schema");
         assert!(schema.contains("\"bar\""));
@@ -3185,6 +3272,41 @@ mod tests {
         let (name, restored) = restore_tool_use_for_client("Edit", input.clone(), &map);
         assert_eq!(name, "Edit");
         assert_eq!(restored, input, "未劫持的 Edit 回程入参不得改写");
+    }
+
+    #[test]
+    fn cc_edit_unsupported_path_key_passthrough() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool_with_properties(
+                "Edit",
+                serde_json::json!({
+                    "target_path": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                }),
+            )]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].tool_specification.name, "Edit",
+            "路径键不是 file_path/path 时不劫持"
+        );
+        let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
+        assert!(schema.contains("\"target_path\""));
+        assert!(!schema.contains("\"oldStr\""));
+        assert!(map.get("str_replace").is_none());
+
+        let input = serde_json::json!({
+            "target_path": "/a.txt",
+            "old_str": "x",
+            "new_str": "y"
+        });
+        let (name, restored) = restore_tool_use_for_client("Edit", input.clone(), &map);
+        assert_eq!(name, "Edit");
+        assert_eq!(restored, input, "不支持的路径键不得被改写成 file_path");
     }
 
     #[test]
@@ -3321,6 +3443,108 @@ mod tests {
             }
         }
         assert!(found, "指纹不匹配的 Edit 历史入参应原样透传");
+    }
+
+    #[test]
+    fn cc_write_mismatched_schema_passthrough() {
+        let mut map = HashMap::new();
+        let mut tool = cc_tool_with_properties(
+            "Write",
+            serde_json::json!({
+                "path": {"type": "string"},
+                "contents": {"type": "string"},
+            }),
+        );
+        tool.description = "custom unmatched write".to_string();
+        let out = convert_tools(
+            &Some(vec![tool]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].tool_specification.name, "Write",
+            "路径/内容键不是 file_path/content 时不劫持"
+        );
+        assert_eq!(
+            out[0].tool_specification.description, "custom unmatched write",
+            "未劫持的 Write 应保留原描述"
+        );
+        let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
+        assert!(schema.contains("\"path\""));
+        assert!(schema.contains("\"contents\""));
+        assert!(
+            !schema.contains("\"text\""),
+            "不得替换为 Kiro fs_write schema"
+        );
+        assert!(map.get("fs_write").is_none());
+    }
+
+    #[test]
+    fn cc_write_undeclared_history_passthrough() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("write the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_write",
+                            "name": "Write",
+                            "input": {
+                                "file_path": "/a.txt",
+                                "content": "hello"
+                            }
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_write", "content": "ok"}
+                    ]),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        assert!(
+            result.tool_name_map.get("fs_write").is_none(),
+            "未声明的 Write 不得写入 fs_write 映射"
+        );
+        let mut found = false;
+        for msg in &result.conversation_state.history {
+            if let Message::Assistant(a) = msg
+                && let Some(ref tool_uses) = a.assistant_response_message.tool_uses
+            {
+                for tu in tool_uses {
+                    if tu.tool_use_id == "toolu_write" {
+                        assert_eq!(tu.name, "Write");
+                        assert_eq!(tu.input["file_path"], serde_json::json!("/a.txt"));
+                        assert_eq!(tu.input["content"], serde_json::json!("hello"));
+                        assert!(tu.input.get("path").is_none());
+                        assert!(tu.input.get("text").is_none());
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "未声明的 Write 历史入参应原样透传");
     }
 
     /// 优化点回归：入站还原以 **Kiro 名** 匹配，故 Raw 模式下客户端自带、恰好叫
