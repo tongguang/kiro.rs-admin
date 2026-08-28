@@ -713,7 +713,10 @@ mod tests {
         let converted = chat_to_anthropic(&req, None).unwrap();
         assert!(converted.anthropic.tools.is_none());
         assert!(!converted.anthropic.force_web_search_loop);
-        assert_eq!(converted.anthropic.tool_choice, Some(json!({"type": "none"})));
+        assert_eq!(
+            converted.anthropic.tool_choice,
+            Some(json!({"type": "none"}))
+        );
     }
 
     /// tool_choice:auto 时行为不变：工具保留，web_search 仍触发 agentic loop。
@@ -729,7 +732,10 @@ mod tests {
         let converted = chat_to_anthropic(&req, None).unwrap();
         assert_eq!(converted.anthropic.tools.unwrap()[0].name, "web_search");
         assert!(converted.anthropic.force_web_search_loop);
-        assert_eq!(converted.anthropic.tool_choice, Some(json!({"type": "auto"})));
+        assert_eq!(
+            converted.anthropic.tool_choice,
+            Some(json!({"type": "auto"}))
+        );
     }
 
     /// chat completions 流式：纯文本。验证首个 chunk 带 role=assistant，

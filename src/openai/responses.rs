@@ -3732,8 +3732,7 @@ mod tests {
             serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
         let resp_id = payload["response"]["id"].as_str().unwrap().to_string();
 
-        let stored =
-            load_owned_response(&resp_id, 7).expect("store=true 的 failed 响应必须入库");
+        let stored = load_owned_response(&resp_id, 7).expect("store=true 的 failed 响应必须入库");
         assert_eq!(stored.response["status"], json!("failed"));
         assert_eq!(
             stored.items.first(),

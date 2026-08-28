@@ -1490,6 +1490,12 @@ impl StreamContext {
         self.upstream_error.is_some()
     }
 
+    /// 上游错误帧的 (error_code, error_message)，供流处理层在解码到错误帧时
+    /// 立即生成 error 终态并结算，而不是干等 HTTP EOF。
+    pub fn upstream_error(&self) -> Option<&(String, String)> {
+        self.upstream_error.as_ref()
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -2758,6 +2764,11 @@ impl BufferedStreamContext {
     /// 是否收到过上游 Kiro 错误帧（转发内部 StreamContext 的判定）。
     pub fn has_upstream_error(&self) -> bool {
         self.inner.has_upstream_error()
+    }
+
+    /// 上游错误帧内容（转发内部 StreamContext）。
+    pub fn upstream_error(&self) -> Option<&(String, String)> {
+        self.inner.upstream_error()
     }
 }
 
@@ -5624,10 +5635,7 @@ mod tests {
             .iter()
             .find(|event| event.event == "error")
             .expect("上游错误帧必须补发 error 终态");
-        assert_eq!(
-            error_event.data["error"]["type"],
-            json!("overloaded_error")
-        );
+        assert_eq!(error_event.data["error"]["type"], json!("overloaded_error"));
         assert!(
             !events.iter().any(|event| event.event == "message_stop"),
             "上游错误帧不得发送 message_stop 正常终态"

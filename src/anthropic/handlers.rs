@@ -1219,6 +1219,25 @@ fn create_sse_stream(
                             }
                             settlement.capture(&ctx);
 
+                            // 上游错误帧：立即补 error 终态并结算，
+                            // 不等 HTTP EOF（上游可能发完错误帧仍保持连接）。
+                            if let Some((code, msg)) = ctx.upstream_error().cloned() {
+                                events.extend(ctx.generate_error_events(&code, &msg));
+                                settlement.finish_from_ctx(
+                                    &ctx,
+                                    "error",
+                                    "error",
+                                    Some(outcome::UNKNOWN),
+                                    Some(&msg),
+                                    Some(sent_bytes),
+                                );
+                                let bytes: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                            }
+
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
@@ -2092,7 +2111,15 @@ fn create_buffered_sse_stream(
     let body_stream = response.bytes_stream();
     // 与 /v1 实时路径同款恰好一次结算：客户端断开（流被 drop）时由
     // StreamUsageSettlement 的 Drop 以 error/interrupted 兜底记账。
-    let settlement = StreamUsageSettlement::new(hook, tracer, credential_id);
+    let mut settlement = StreamUsageSettlement::new(hook, tracer, credential_id);
+    // 创建即同步初始用量（fallback 估算等）：interval 首 tick 立即触发，
+    // 客户端在首个 chunk 前断开时 Drop 也能带出已有用量，而不是记 0。
+    let (i, o, cc, cr, credits) = ctx.final_usage();
+    settlement.input_tokens = i;
+    settlement.output_tokens = o;
+    settlement.cache_creation_tokens = cc;
+    settlement.cache_read_tokens = cr;
+    settlement.credits = credits;
 
     stream::unfold(
         (
@@ -2153,6 +2180,23 @@ fn create_buffered_sse_stream(
                                 settlement.cache_creation_tokens = cc;
                                 settlement.cache_read_tokens = cr;
                                 settlement.credits = credits;
+                                // 上游错误帧：立即以 error 终态收尾并结算，
+                                // 不等 HTTP EOF（上游可能发完错误帧仍保持连接）。
+                                if let Some((code, msg)) = ctx.upstream_error().cloned() {
+                                    let all_events = ctx.finish_with_error_events(&code, &msg);
+                                    settlement.finish(
+                                        "error",
+                                        "error",
+                                        Some(outcome::UNKNOWN),
+                                        Some(&msg),
+                                        Some(sent_bytes),
+                                    );
+                                    let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
@@ -2615,9 +2659,10 @@ mod tests {
             started_at: Instant::now(),
         };
         // 上游 body：一个 chunk 后挂起，保证流永远走不到终端分支
-        let body_stream =
-            stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"garbage"))])
-                .chain(stream::pending());
+        let body_stream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"garbage",
+        ))])
+        .chain(stream::pending());
         let response: reqwest::Response =
             http::Response::new(reqwest::Body::wrap_stream(body_stream)).into();
         let ctx = BufferedStreamContext::new(
@@ -2644,6 +2689,160 @@ mod tests {
         );
         // 客户端断开：流被 drop
         drop(sse);
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+        // 首个 chunk 前断开也要带走创建时的 fallback 估算，而不是记 0
+        assert_eq!(overview.today_input_tokens, 10);
+    }
+
+    /// 构造一个合法的 AWS event-stream 错误帧（:message-type=error）。
+    fn error_frame_bytes(code: &str, message: &str) -> Bytes {
+        use crate::kiro::parser::crc::crc32;
+        let mut headers = Vec::new();
+        let mut push_header = |name: &str, value: &str| {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7u8); // HeaderValueType::String
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        };
+        push_header(":message-type", "error");
+        push_header(":error-code", code);
+        let payload = message.as_bytes();
+        let total_length = (12 + headers.len() + payload.len() + 4) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&buf);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(&headers);
+        buf.extend_from_slice(payload);
+        let message_crc = crc32(&buf);
+        buf.extend_from_slice(&message_crc.to_be_bytes());
+        Bytes::from(buf)
+    }
+
+    fn test_hook(
+        aggregator: &std::sync::Arc<crate::admin::usage_stats::UsageAggregator>,
+    ) -> UsageRecordHook {
+        UsageRecordHook {
+            recorder: None,
+            aggregator: Some(aggregator.clone()),
+            client_keys: None,
+            key_id: 0,
+            model: "test-model".to_string(),
+            started_at: Instant::now(),
+        }
+    }
+
+    /// 错误帧后上游保持连接不断开：实时流必须立即产出 error 终态并结算，
+    /// 不得干等 HTTP EOF。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtime_stream_upstream_error_terminates_immediately() {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let body_stream = stream::iter(vec![Ok::<_, std::io::Error>(error_frame_bytes(
+            "overloaded_error",
+            "Upstream is overloaded",
+        ))])
+        .chain(stream::pending());
+        let response: reqwest::Response =
+            http::Response::new(reqwest::Body::wrap_stream(body_stream)).into();
+        let ctx = StreamContext::new_with_thinking(
+            "test-model",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut sse = Box::pin(create_sse_stream(
+            response,
+            ctx,
+            Vec::new(),
+            test_hook(&aggregator),
+            7,
+            std::sync::Arc::new(RequestTracer::noop("test-model")),
+        ));
+
+        // 首帧可能是 ping（首 tick 立即触发），逐帧收集直到看到 error
+        let mut saw_error = false;
+        let mut debug_items = Vec::new();
+        for _ in 0..5 {
+            let item = tokio::time::timeout(Duration::from_secs(1), sse.next())
+                .await
+                .expect("错误帧后应立即产出 error 终态，而不是干等 EOF")
+                .expect("流不应在 error 终态前结束")
+                .unwrap();
+            let text = String::from_utf8_lossy(&item).to_string();
+            debug_items.push(text.clone());
+            assert!(
+                !text.contains("message_stop"),
+                "上游错误帧不得发送 message_stop"
+            );
+            if text.contains("event: error") {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "应产出 error 事件，实际帧: {:?}", debug_items);
+        // 流已终结
+        assert!(sse.next().await.is_none());
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+    }
+
+    /// 错误帧后上游保持连接不断开：/cc 缓冲流同样立即产出 error 终态并结算。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_stream_upstream_error_terminates_immediately() {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let body_stream = stream::iter(vec![Ok::<_, std::io::Error>(error_frame_bytes(
+            "overloaded_error",
+            "Upstream is overloaded",
+        ))])
+        .chain(stream::pending());
+        let response: reqwest::Response =
+            http::Response::new(reqwest::Body::wrap_stream(body_stream)).into();
+        let ctx = BufferedStreamContext::new(
+            "test-model",
+            10,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut sse = Box::pin(create_buffered_sse_stream(
+            response,
+            ctx,
+            test_hook(&aggregator),
+            7,
+            std::sync::Arc::new(RequestTracer::noop("test-model")),
+        ));
+
+        // 缓冲流终端批次会先补 message_start 等初始事件，再发 error 终态；
+        // ping 也可能穿插（biased select）。逐帧收集直到看到 error。
+        let mut saw_error = false;
+        let mut debug_items = Vec::new();
+        for _ in 0..5 {
+            let item = tokio::time::timeout(Duration::from_secs(1), sse.next())
+                .await
+                .expect("错误帧后应立即产出 error 终态，而不是干等 EOF")
+                .expect("流不应在 error 终态前结束")
+                .unwrap();
+            let text = String::from_utf8_lossy(&item).to_string();
+            debug_items.push(text.clone());
+            assert!(
+                !text.contains("message_stop"),
+                "上游错误帧不得发送 message_stop"
+            );
+            if text.contains("event: error") {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "应产出 error 事件，实际帧: {:?}", debug_items);
+        assert!(sse.next().await.is_none());
 
         let overview = aggregator.overview();
         assert_eq!(overview.today_calls, 1);

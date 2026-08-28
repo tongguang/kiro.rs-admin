@@ -2841,7 +2841,9 @@ impl MultiTokenManager {
 
     /// 当选择阶段无任何可用凭据时，计算「仅因临时限流/冷却而不可用」的凭据中
     /// 最早恢复秒数（Retry-After 口径）。覆盖三类冷却：`throttled_until`、
-    /// `rate_limited_until`、RPM 窗口。返回 `None` 表示不是纯冷却场景
+    /// `rate_limited_until`、RPM 窗口。同一凭据有多类冷却时取最晚解除（max，
+    /// 所有限制解除才可用），再跨凭据取最早恢复（min）。
+    /// 返回 `None` 表示不是纯冷却场景
     /// （例如全部禁用/模型分组不匹配），调用方按原有错误路径处理。
     ///
     /// 刻意不使用调用方的请求内排除集：被本请求抢占排除（`request_throttled_ids`）
@@ -2863,7 +2865,8 @@ impl MultiTokenManager {
             {
                 continue;
             }
-            // 三类冷却各自的恢复秒数，取仍生效者中的最小值
+            // 同一凭据须等所有限制解除才可用：取仍生效冷却中的最大值；
+            // 跨凭据再在下方取最早恢复（min）。
             let mut retry_after: Option<u64> = None;
             for candidate in [
                 cooldown_remaining_ms(e.throttled_until, now).map(|ms| ms.div_ceil(1000)),
@@ -2873,7 +2876,7 @@ impl MultiTokenManager {
             .into_iter()
             .flatten()
             {
-                retry_after = Some(retry_after.map_or(candidate, |cur: u64| cur.min(candidate)));
+                retry_after = Some(retry_after.map_or(candidate, |cur: u64| cur.max(candidate)));
             }
             match retry_after {
                 Some(secs) => {
@@ -7177,6 +7180,39 @@ mod tests {
         assert_eq!(retry_after, Some(10), "应取所有冷却凭据中的最短恢复秒数");
     }
 
+    #[test]
+    fn test_rpm_retry_after_waits_for_all_cooldowns_on_same_credential() {
+        // 同一凭据同时有多类冷却时，须等所有限制解除（取 max），
+        // 取最短会让客户端在凭据仍冷却时徒劳重试。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        {
+            let mut entries = manager.entries.lock();
+            let a = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            a.throttled_until = Some(now + StdDuration::from_secs(30));
+            // RPM 窗口打满，最早请求在 55 秒前：窗口 5 秒后恢复
+            a.credentials.rpm_limit = 1;
+            a.recent_requests
+                .push_back(now - StdDuration::from_secs(55));
+        }
+
+        let entries = manager.entries.lock();
+        let retry_after = manager.rpm_retry_after_secs(&entries[..], None, None, now);
+        assert_eq!(
+            retry_after,
+            Some(30),
+            "同一凭据多类冷却须取最晚恢复秒数，而不是最短的 RPM 5 秒"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cooldown_credentials_yield_rate_limit_not_all_disabled() {
         // 全部凭据处于临时冷却时，acquire 必须返回带 Retry-After 的 429，
@@ -7950,17 +7986,18 @@ mod tests {
     /// add_credential 写盘失败时必须回滚内存凭据，避免内存/磁盘不一致。
     #[tokio::test(flavor = "multi_thread")]
     async fn test_add_credential_rolls_back_on_persist_failure() {
-        let path = tmp_creds_path("add_cred_rollback");
-        std::fs::write(&path, "[]").unwrap();
+        // 父目录不存在使写临时文件必然失败。不用只读文件：Linux 上 rename
+        // 只看目录写权限，可以替换只读文件，无法确定性制造失败。
+        let path = std::env::temp_dir()
+            .join(format!(
+                "kiro_rs_no_such_dir_{}_add_cred_rollback",
+                std::process::id()
+            ))
+            .join("credentials.json");
 
         let manager =
             MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
                 .unwrap();
-
-        // 只读文件使 persist 失败
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms).unwrap();
 
         let mut cred = KiroCredentials::default();
         cred.kiro_api_key = Some("ksk_rollback".to_string());
@@ -7974,12 +8011,6 @@ mod tests {
             "persist 失败后内存不得残留新凭据，实际 {} 条",
             snapshot.entries.len()
         );
-
-        // 恢复可写以便清理
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(&path, perms).unwrap();
-        let _ = std::fs::remove_file(&path);
     }
 
     // ── 并发去重（TOCTOU 回归守卫） ───────────────────────────────────────────

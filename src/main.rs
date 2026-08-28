@@ -227,9 +227,8 @@ async fn main() {
         .cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
-    let client_key_manager = std::sync::Arc::new(admin::ClientKeyManager::load_or_empty(
-        &client_keys_path,
-    ));
+    let client_key_manager =
+        std::sync::Arc::new(admin::ClientKeyManager::load_or_empty(&client_keys_path));
     let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
         cache_dir.clone(),
         config.usage_log_retention_days as i64,
