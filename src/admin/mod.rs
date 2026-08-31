@@ -16,7 +16,6 @@
 //! let admin_router = create_admin_router(admin_state);
 //! ```
 
-mod binary_update;
 pub mod client_keys;
 mod error;
 pub mod groups;

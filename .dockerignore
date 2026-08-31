@@ -68,10 +68,6 @@ traces.db-shm
 traces.db-wal
 data/
 
-# 在线更新产物（GitHub Releases 二进制暂存 + 备份）
-*.staged-*
-*.backup
-
 # 环境变量与本地秘钥
 .env
 .env.*

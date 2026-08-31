@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
-  Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
+  Activity, RefreshCw, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Gauge, Shuffle,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -21,17 +21,15 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
   useRetryPolicy, useSetRetryPolicy,
 } from '@/hooks/use-credentials'
-import { useUpdateCheck } from '@/hooks/use-update-check'
 import {
   updateAdminKey, type LoadBalancingMode, LB_LABEL, nextLbMode,
   type RetryMode, type RetryPolicy, type RetryPolicyConfig,
 } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
-import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { ModelMappingsDialog } from '@/components/model-mappings-dialog'
 
 /**
- * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
+ * 顶栏右侧通用工具栏：负载均衡切换、刷新、设置（Key 管理）。
  *
  * 与原 Dashboard 中的工具按钮等价，但全局 Tab 都可访问。刷新按钮会失效
  * 凭据/客户端 Key/统计三类查询，覆盖三个 Tab 的主要数据源。
@@ -48,9 +46,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
   const { data: retryPolicy, isLoading: isLoadingRetry } = useRetryPolicy()
   const { mutate: setRetryPolicy, isPending: isSettingRetry } = useSetRetryPolicy()
-  const { data: updateCheck } = useUpdateCheck()
-
-  const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelMappingsOpen, setModelMappingsOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
@@ -120,7 +115,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     isSettingRetry,
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
-    openImageUpdate: () => setImageUpdateOpen(true),
     openModelMappings: () => setModelMappingsOpen(true),
     openKeyDialog,
     retryPolicy,
@@ -133,7 +127,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
         },
       ),
     throttleConfig,
-    updateCheck,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
         onSuccess: () =>
@@ -145,7 +138,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   return (
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
-      <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <ModelMappingsDialog open={modelMappingsOpen} onOpenChange={setModelMappingsOpen} />
 
       <Dialog
@@ -253,13 +245,11 @@ interface ToolControls {
   isSettingRetry: boolean
   isSettingThrottle: boolean
   loadBalancingMode?: LoadBalancingMode
-  openImageUpdate: () => void
   openModelMappings: () => void
   openKeyDialog: () => void
   retryPolicy?: RetryPolicyConfig
   setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
-  updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
 }
 
@@ -276,7 +266,6 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onChangeCooldown={controls.updateCooldown}
       />
       <RefreshButton onRefresh={controls.handleRefresh} />
-      <ImageUpdateButton controls={controls} />
       <KeySettingsMenu
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenModelMappings={controls.openModelMappings}
@@ -314,9 +303,6 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openImageUpdate}>
-          <UploadCloud />镜像在线更新
         </DropdownMenuItem>
         <RetryCompactItems controls={controls} />
         <ThrottleCompactItems {...throttleProps} />
@@ -635,21 +621,6 @@ function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
   )
 }
 
-function ImageUpdateButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      onClick={controls.openImageUpdate}
-      title={imageUpdateTitle(controls.updateCheck)}
-      className="relative"
-    >
-      <UploadCloud className="h-4 w-4" />
-      {controls.updateCheck?.hasUpdate && <UpdateDot />}
-    </Button>
-  )
-}
-
 function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenModelMappings,
@@ -675,20 +646,6 @@ function KeySettingsMenu({
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-  )
-}
-
-function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {
-  if (!updateCheck?.hasUpdate) return '镜像在线更新'
-  return `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
-}
-
-function UpdateDot() {
-  return (
-    <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
-      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-      <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
-    </span>
   )
 }
 

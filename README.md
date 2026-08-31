@@ -3,7 +3,7 @@
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 兼容代理。它把
-`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens` 等 Anthropic 风格请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
+`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens` 等 Anthropic 风格请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池和请求日志。
 
 项目当前的核心目标是：让 Claude Code、Anthropic SDK 或其它兼容 Anthropic API 的客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
 
@@ -24,7 +24,7 @@
 - [Admin UI](#admin-ui)
 - [代理和 Region](#proxy-region)
 - [负载均衡与故障转移](#load-balancing-failover)
-- [在线更新和发布](#updates-release)
+- [发布](#release)
 - [开发](#development)
 - [目录结构](#project-structure)
 - [License](#license)
@@ -75,7 +75,6 @@
 - 客户端 Key 分发：Admin 面板生成 `csk_*` Key，支持独立启停和统计。
 - **Admin UI**：概览、凭据管理、客户端 Key、分组、请求日志等视图，支持隐私模式、批量导入 / 导出、响应测试、模型拉取、运行时策略配置。
 - 代理能力：全局代理、凭据级代理、代理池、健康检查、自动停用、直连兜底、粘性会话 / 轮询 / 最小负载分配。
-- **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
 - **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
 
 <a id="quick-start"></a>
@@ -254,7 +253,6 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 | `/api/admin/proxy-pool` | 代理池 |
 | `/api/admin/config/*` | 运行时配置 |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
-| `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
 
 Admin API 鉴权同样支持：
 
@@ -309,9 +307,6 @@ Admin API 鉴权同样支持：
 | `countTokensApiUrl` | 无 | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | 无 | 外部 count_tokens API Key |
 | `countTokensAuthType` | `x-api-key` | `x-api-key` 或 `bearer` |
-| `githubToken` | 无 | 在线更新访问 GitHub API 时使用，降低 rate limit 风险 |
-| `updateAutoApply` | `false` | 是否每天自动检查并应用新版本 |
-| `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
 
 <a id="credentials"></a>
 ## 🔐 凭据
@@ -674,7 +669,6 @@ Admin 还提供：
 - 全局代理设置、凭据级代理、代理池健康检查、自动停用和批量分配。
 - 凭据负载均衡、代理负载均衡、普通 429 重试策略、账号级风控故障转移配置。
 - trace / usage log 保留策略。
-- 在线更新、自动更新和回退。
 
 <a id="proxy-region"></a>
 ## 代理和 Region
@@ -751,8 +745,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
 
-<a id="updates-release"></a>
-## 在线更新和发布
+<a id="release"></a>
+## 发布
 
 发布 tag `vX.Y.Z` 会触发 Release workflow：
 
@@ -767,8 +761,6 @@ Docker 镜像：
 - `zyphrzero/kiro-rs:<version>`
 - `zyphrzero/kiro-rs:latest`
 - `zyphrzero/kiro-rs:beta`（master beta 构建）
-
-容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
 
 <a id="development"></a>
 ## 开发
@@ -805,7 +797,7 @@ git diff --check
 ├── src/
 │   ├── anthropic/      # Anthropic API 兼容层
 │   ├── kiro/           # Kiro / Amazon Q 上游、token、endpoint、event-stream
-│   ├── admin/          # Admin API、用量、trace、代理池、在线更新
+│   ├── admin/          # Admin API、用量、trace、代理池
 │   ├── admin_ui/       # 嵌入式 Admin UI 静态资源路由
 │   ├── model/          # CLI 参数和 config.json 模型
 │   ├── common/         # 通用鉴权工具
