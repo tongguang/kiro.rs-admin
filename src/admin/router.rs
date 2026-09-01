@@ -13,10 +13,9 @@ use super::{
         batch_add_proxies, batch_import_credentials, check_all_proxies, check_proxy,
         check_proxy_url, clear_throttle, clear_traces, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
-        delete_credential, delete_group, delete_model_mapping, delete_proxy,
-        disable_quota_exceeded, enable_overage_all, export_credentials, force_refresh_token,
-        get_account_throttle_config, get_all_credentials, get_credential_balance,
-        get_credential_models, get_global_proxy, get_load_balancing_mode,
+        delete_credential, delete_group, delete_model_mapping, delete_proxy, export_credentials,
+        force_refresh_token, get_account_throttle_config, get_all_credentials,
+        get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode,
         get_log_governance_config, get_proxy_balancing_mode, get_proxy_pool, get_retry_policy,
         get_self_heal_config, list_client_keys, list_groups, list_model_mappings, list_traces,
         poll_idc_login, poll_idc_relogin, poll_social_login, poll_social_relogin,
@@ -79,11 +78,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset-stats", post(reset_success_count))
         .route("/credentials/reset-stats", post(reset_all_success_count))
         .route("/credentials/batch-import", post(batch_import_credentials))
-        .route(
-            "/credentials/disable-quota-exceeded",
-            post(disable_quota_exceeded),
-        )
-        .route("/credentials/overage/enable-all", post(enable_overage_all))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))

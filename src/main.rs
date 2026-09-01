@@ -200,6 +200,8 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     // 启动后异步预热各凭据的可用模型缓存（/v1/models 动态聚合使用）
     token_manager.start_model_cache_warmer();
+    // Token 保鲜：每 5 分钟刷新快过期的 token（过期窗口 10 分钟，足以兜住）
+    token_manager.start_token_keepalive(std::time::Duration::from_secs(300));
     let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
     let proxy_pool = Arc::new(admin::proxy_pool::ProxyPoolManager::new(
         proxy_pool_path,
@@ -349,10 +351,10 @@ async fn main() {
                 model_mapping_manager.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
+            // 启动余额后台刷新调度器（每天一次兜底；余额仅用于展示，需要最新值时手动刷新）
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+                .start_balance_refresher(std::time::Duration::from_secs(86400));
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

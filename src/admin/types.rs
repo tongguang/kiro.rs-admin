@@ -452,17 +452,7 @@ pub struct CredentialResponseTestResponse {
     pub error: Option<String>,
 }
 
-// ============ 一键超额 ============
-
-/// 一键超额禁用结果
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuotaExceededResult {
-    /// 已被禁用的凭据 ID 列表
-    pub disabled_ids: Vec<u64>,
-    /// 跳过的凭据 ID 列表（如禁用失败、缓存缺失等）
-    pub skipped_ids: Vec<u64>,
-}
+// ============ 超额开关 ============
 
 /// 设置单个凭据的超额开关
 #[derive(Debug, Deserialize)]
@@ -470,20 +460,6 @@ pub struct QuotaExceededResult {
 pub struct SetOverageRequest {
     /// true 开启超额；false 关闭
     pub enabled: bool,
-}
-
-/// 一键开启超额结果
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnableOverageAllResult {
-    /// 成功开启的凭据 ID 列表
-    pub enabled_ids: Vec<u64>,
-    /// 跳过（不可开启 / 已开启 / 缓存缺失）
-    pub skipped_ids: Vec<u64>,
-    /// 调用失败的凭据 ID 列表
-    pub failed_ids: Vec<u64>,
-    /// 失败原因（与 failed_ids 一一对应）
-    pub failure_messages: Vec<String>,
 }
 
 // ============ 负载均衡配置 ============

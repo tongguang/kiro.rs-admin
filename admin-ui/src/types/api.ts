@@ -42,7 +42,7 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
-  /** 后端缓存的最近一次余额（5 分钟内） */
+  /** 后端缓存的最近一次余额（展示用，后台每天兜底刷新） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number

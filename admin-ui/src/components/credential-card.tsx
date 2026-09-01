@@ -71,6 +71,8 @@ interface CredentialCardProps {
   selected: boolean;
   onToggleSelect: () => void;
   balance: BalanceResponse | null;
+  /** 余额数据的采集时间（Unix 秒）；后台每天兜底刷新，需要最新值请手动刷新 */
+  balanceUpdatedAt?: number | null;
   loadingBalance: boolean;
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
@@ -90,6 +92,17 @@ function formatLastUsed(lastUsedAt: string | null): string {
   if (diff < 0) return "刚刚";
   const s = Math.floor(diff / 1000);
   if (s < 60) return `${s} 秒前`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.floor(h / 24)} 天前`;
+}
+
+/** 余额采集时间（Unix 秒）转相对时间，用于提示数据新鲜度 */
+function formatBalanceAge(updatedAt: number): string {
+  const s = Math.floor(Date.now() / 1000 - updatedAt);
+  if (s < 60) return "刚刚";
   const m = Math.floor(s / 60);
   if (m < 60) return `${m} 分钟前`;
   const h = Math.floor(m / 60);
@@ -210,6 +223,7 @@ export function CredentialCard({
   selected,
   onToggleSelect,
   balance,
+  balanceUpdatedAt,
   loadingBalance,
   onRefreshBalance,
   failureStats,
@@ -1124,11 +1138,18 @@ export function CredentialCard({
                     </span>
                   </div>
                 </div>
-                <div className="break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                  下次重置：
-                  <span className="font-medium text-foreground">
-                    {formatResetDate(balance.nextResetAt)}
+                <div className="flex flex-wrap items-center justify-between gap-x-2 break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
+                  <span>
+                    下次重置：
+                    <span className="font-medium text-foreground">
+                      {formatResetDate(balance.nextResetAt)}
+                    </span>
                   </span>
+                  {balanceUpdatedAt != null && (
+                    <span title="余额为缓存值，需要最新数据请刷新">
+                      更新于 {formatBalanceAge(balanceUpdatedAt)}
+                    </span>
+                  )}
                 </div>
               </div>
             ) : (

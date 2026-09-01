@@ -173,13 +173,6 @@ pub async fn test_credential_response(
     }
 }
 
-/// POST /api/admin/credentials/disable-quota-exceeded
-/// 一键禁用所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
-pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {
-    let result = state.service.disable_quota_exceeded();
-    Json(result).into_response()
-}
-
 /// POST /api/admin/credentials/:id/overage
 /// 开启或关闭指定凭据的超额能力
 pub async fn set_credential_overage(
@@ -196,13 +189,6 @@ pub async fn set_credential_overage(
         .into_response(),
         Err(e) => e.into_http_response(),
     }
-}
-
-/// POST /api/admin/credentials/overage/enable-all
-/// 一键开启所有"可开启超额且当前未开启"凭据的超额（基于 balance_cache 判断）
-pub async fn enable_overage_all(State(state): State<AdminState>) -> impl IntoResponse {
-    let result = state.service.enable_overage_for_all_capable().await;
-    Json(result).into_response()
 }
 
 /// POST /api/admin/credentials

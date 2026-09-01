@@ -29,20 +29,28 @@ use super::types::{
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CompleteSocialLoginRequest,
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
-    ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse,
-    SelfHealConfigResponse, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
-    SetSelfHealConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
-    StartSocialLoginResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    CredentialsStatusResponse, ExportedAccount, ExportedCredentials, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
+    ProxyPoolResponse, RetryPolicyResponse, SelfHealConfigResponse,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetProxyBalancingModeRequest, SetRetryPolicyRequest, SetSelfHealConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
-/// 余额缓存过期时间（秒），5 分钟
-const BALANCE_CACHE_TTL_SECS: i64 = 300;
-
 const DEFAULT_RESPONSE_TEST_MODEL: &str = "claude-sonnet-4-6";
+
+/// 给后台调度间隔加 ±10% 随机抖动，避免多实例在同一时刻集中打上游
+fn jittered(interval: std::time::Duration) -> std::time::Duration {
+    let base = interval.as_secs();
+    if base == 0 {
+        return interval;
+    }
+    let span = (base / 10).max(1);
+    let offset = fastrand::u64(0..=span * 2);
+    std::time::Duration::from_secs(base.saturating_sub(span).saturating_add(offset))
+}
 
 fn normalize_import_email(raw_email: Option<String>, access_token: Option<&str>) -> Option<String> {
     raw_email
@@ -403,15 +411,14 @@ impl AdminService {
             let cache = self.balance_cache.lock();
             cache.clone()
         };
-        let now_ts = Utc::now().timestamp() as f64;
-
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
+                // 余额仅用于展示：有缓存就展示最后已知值，由前端按
+                // balance_updated_at 提示新鲜度，不再因过期而清空。
                 let (balance, balance_updated_at) = balance_snapshot
                     .get(&entry.id)
-                    .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
 
@@ -489,60 +496,6 @@ impl AdminService {
         }
     }
 
-    /// 一键禁用所有"已超额"的凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
-    ///
-    /// 数据来源是 `balance_cache`，所以前端在调用前最好先触发一次"查询信息"
-    /// 或等待后台调度器完成首次刷新。返回 (禁用数量, 跳过数量, 已超额未禁用名单)。
-    pub fn disable_quota_exceeded(&self) -> QuotaExceededResult {
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
-        let cache_snapshot: HashMap<u64, CachedBalance> = {
-            let cache = self.balance_cache.lock();
-            cache.clone()
-        };
-        let now_ts = Utc::now().timestamp() as f64;
-
-        let mut disabled_ids: Vec<u64> = Vec::new();
-        let mut skipped_ids: Vec<u64> = Vec::new();
-        let mut switched_current = false;
-
-        for entry in snapshot.entries.iter() {
-            if entry.disabled {
-                continue;
-            }
-            let cached = match cache_snapshot.get(&entry.id) {
-                Some(c) if (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64 => c,
-                _ => continue,
-            };
-            let exceeded = cached.data.remaining <= 0.0 || cached.data.usage_percentage >= 100.0;
-            if !exceeded {
-                continue;
-            }
-            match self.token_manager.disable_quota_exceeded(entry.id) {
-                Ok(()) => {
-                    disabled_ids.push(entry.id);
-                    if entry.id == current_id {
-                        switched_current = true;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("一键超额：禁用凭据 #{} 失败: {}", entry.id, e);
-                    skipped_ids.push(entry.id);
-                }
-            }
-        }
-
-        if switched_current {
-            let _ = self.token_manager.switch_to_next();
-        }
-
-        QuotaExceededResult {
-            disabled_ids,
-            skipped_ids,
-        }
-    }
-
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
@@ -586,21 +539,8 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id.unwrap_or(0)))
     }
 
-    /// 获取凭据余额（带缓存）
+    /// 获取凭据余额：始终实时查询上游（手动刷新语义），并写回缓存
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
-                }
-            }
-        }
-
-        // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
@@ -755,7 +695,7 @@ impl AdminService {
     /// 启动余额后台刷新调度器
     ///
     /// - 启动后立刻执行一次刷新
-    /// - 之后按 `interval` 周期循环刷新
+    /// - 之后按 `interval` ±10% 的随机间隔循环刷新，避免多实例长期同点打上游
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
         let svc = Arc::clone(self);
@@ -765,13 +705,15 @@ impl AdminService {
             loop {
                 let started = std::time::Instant::now();
                 let (ok, err) = svc.refresh_all_balances().await;
+                let next = jittered(interval);
                 tracing::info!(
-                    "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s",
+                    "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s，下次约 {:.1}h 后",
                     ok,
                     err,
-                    started.elapsed().as_secs_f32()
+                    started.elapsed().as_secs_f32(),
+                    next.as_secs_f32() / 3600.0
                 );
-                tokio::time::sleep(interval).await;
+                tokio::time::sleep(next).await;
             }
         });
     }
@@ -1437,83 +1379,6 @@ impl AdminService {
             })
     }
 
-    /// 一键开启所有"可开启超额且当前未开启"凭据的超额
-    /// 数据来源是 balance_cache（5 分钟有效）；若缓存缺失或 capable 状态未知则乐观尝试，
-    /// 由上游 setUserPreference 接口本身决定是否成功（不支持的订阅会返回 4xx 失败）。
-    pub async fn enable_overage_for_all_capable(&self) -> EnableOverageAllResult {
-        let snapshot = self.token_manager.snapshot();
-        let cache_snapshot: HashMap<u64, CachedBalance> = {
-            let cache = self.balance_cache.lock();
-            cache.clone()
-        };
-        let now_ts = Utc::now().timestamp() as f64;
-
-        // 选出需要操作的 ID 列表
-        let mut targets: Vec<u64> = Vec::new();
-        let mut skipped: Vec<u64> = Vec::new();
-        for entry in snapshot.entries.iter() {
-            if entry.disabled {
-                skipped.push(entry.id);
-                continue;
-            }
-            let cached = cache_snapshot
-                .get(&entry.id)
-                .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64);
-
-            match cached {
-                // 缓存命中：明确不可开启，跳过
-                Some(c) if c.data.overage_capable == Some(false) => {
-                    skipped.push(entry.id);
-                    continue;
-                }
-                // 缓存命中：明确已开启，跳过
-                Some(c) if c.data.overage_enabled == Some(true) => {
-                    skipped.push(entry.id);
-                    continue;
-                }
-                // 其它（缓存缺失 / 状态未知 / 明确可开启未开启）— 乐观尝试
-                _ => targets.push(entry.id),
-            }
-        }
-
-        let mut enabled_ids: Vec<u64> = Vec::new();
-        let mut failed_ids: Vec<u64> = Vec::new();
-        let mut failure_messages: Vec<String> = Vec::new();
-
-        for id in targets {
-            match self
-                .token_manager
-                .set_user_preference_for(id, "ENABLED")
-                .await
-            {
-                Ok(()) => {
-                    enabled_ids.push(id);
-                    // 失效本地缓存
-                    let mut cache = self.balance_cache.lock();
-                    cache.remove(&id);
-                }
-                Err(e) => {
-                    tracing::warn!("一键开启超额：凭据 #{} 失败: {}", id, e);
-                    failed_ids.push(id);
-                    failure_messages.push(e.to_string());
-                }
-            }
-            // 节流
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        if !enabled_ids.is_empty() {
-            self.save_balance_cache();
-        }
-
-        EnableOverageAllResult {
-            enabled_ids,
-            skipped_ids: skipped,
-            failed_ids,
-            failure_messages,
-        }
-    }
-
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -1571,17 +1436,10 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
+        // 全部加载：余额仅用于展示，重启后先显示最后已知值，
+        // 新鲜度由前端按 cached_at 提示，不再按 TTL 丢弃。
         map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v)))
             .collect()
     }
 
@@ -2800,6 +2658,15 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jittered_interval_stays_within_ten_percent() {
+        let base = std::time::Duration::from_secs(86400);
+        for _ in 0..200 {
+            let secs = jittered(base).as_secs();
+            assert!((77760..=95040).contains(&secs), "抖动后间隔越界: {secs}");
+        }
+    }
 
     #[test]
     fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {

@@ -2032,6 +2032,52 @@ impl MultiTokenManager {
         });
     }
 
+    /// 后台刷新所有快过期的 OAuth token，返回 (刷新成功数, 刷新失败数)。
+    ///
+    /// 判断条件与请求路径完全一致（已过期或 10 分钟内过期），刷新走
+    /// `try_ensure_token`，由它负责双重检查锁与刷新后持久化。
+    /// 失败只记日志：后台保鲜是 best-effort，不参与失败计数与自动禁用。
+    pub async fn refresh_expiring_tokens(&self) -> (usize, usize) {
+        let targets: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled && !e.credentials.is_api_key_credential())
+                .filter(|e| {
+                    is_token_expired(&e.credentials) || is_token_expiring_soon(&e.credentials)
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        let mut refreshed = 0usize;
+        let mut failed = 0usize;
+        for (id, credentials) in targets {
+            match self.try_ensure_token(id, &credentials).await {
+                Ok(_) => refreshed += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("凭据 #{} 后台 Token 保鲜失败: {}", id, e);
+                }
+            }
+        }
+        (refreshed, failed)
+    }
+
+    /// 启动 Token 保鲜调度器：周期性刷新快过期的 token，避免请求路径上才发现过期。
+    pub fn start_token_keepalive(self: &Arc<Self>, interval: StdDuration) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let (refreshed, failed) = manager.refresh_expiring_tokens().await;
+                if refreshed > 0 || failed > 0 {
+                    tracing::info!("Token 保鲜完成：刷新成功 {}，失败 {}", refreshed, failed);
+                }
+            }
+        });
+    }
+
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
@@ -3735,23 +3781,6 @@ impl MultiTokenManager {
         entry.throttled_until = None;
         entry.rate_limited_until = None;
         tracing::info!("凭据 #{} 临时冷却已被手动解除", id);
-        Ok(())
-    }
-
-    /// 以"额度已用尽"为原因禁用凭据（Admin 一键超额功能）
-    ///
-    /// 与手动禁用不同，原因记录为 `QuotaExceeded`，便于自愈逻辑识别。
-    pub fn disable_quota_exceeded(&self, id: u64) -> anyhow::Result<()> {
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
-        }
-        self.persist_credentials()?;
         Ok(())
     }
 

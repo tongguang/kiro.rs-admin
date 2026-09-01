@@ -319,31 +319,9 @@ export async function resetAllSuccessCount(): Promise<SuccessResponse> {
   return data
 }
 
-// 一键禁用所有"已超额"凭据
-export interface QuotaExceededResult {
-  disabledIds: number[]
-  skippedIds: number[]
-}
-export async function disableQuotaExceeded(): Promise<QuotaExceededResult> {
-  const { data } = await api.post<QuotaExceededResult>('/credentials/disable-quota-exceeded')
-  return data
-}
-
 // 设置单个凭据的超额开关
 export async function setCredentialOverage(id: number, enabled: boolean): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/overage`, { enabled })
-  return data
-}
-
-// 一键开启所有可开启超额的凭据
-export interface EnableOverageAllResult {
-  enabledIds: number[]
-  skippedIds: number[]
-  failedIds: number[]
-  failureMessages: string[]
-}
-export async function enableOverageForAllCapable(): Promise<EnableOverageAllResult> {
-  const { data } = await api.post<EnableOverageAllResult>('/credentials/overage/enable-all')
   return data
 }
 
