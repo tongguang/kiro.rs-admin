@@ -122,6 +122,13 @@ function formatResetDate(ts: number | null): string {
   return new Date(ts * 1000).toLocaleString("zh-CN");
 }
 
+function formatExpiresAt(expiresAt: string | null): string {
+  if (!expiresAt) return "未知";
+  const date = new Date(expiresAt);
+  if (isNaN(date.getTime())) return "未知";
+  return date.toLocaleString("zh-CN");
+}
+
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
 function formatThrottleCountdown(secs: number): string {
   const total = Math.max(0, Math.floor(secs));
@@ -1057,6 +1064,12 @@ export function CredentialCard({
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">
                 {formatLastUsed(credential.lastUsedAt)}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">Token 失效</dt>
+              <dd className="min-w-0 truncate text-right font-medium tabular-nums">
+                {formatExpiresAt(credential.expiresAt)}
               </dd>
             </div>
             {credential.maskedApiKey && (
