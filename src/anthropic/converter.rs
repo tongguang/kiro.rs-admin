@@ -1520,11 +1520,10 @@ fn map_tool_input_to_kiro(
     Ok(serde_json::Value::Object(out))
 }
 
-/// 入站入参还原（Kiro 内置工具入参键 → Anthropic）。**以 Kiro 名匹配**，故自动只在
-/// 出站确实映射过（ClaudeCode）时生效；Raw 模式 / 长名缩短 / 透传工具一律直通。
+/// 入站入参还原（Kiro 内置工具入参键 → Anthropic），以 Kiro 名匹配。
 ///
-/// 这是相对参考实现的一处修正：参考以“客户端名”匹配，导致 Raw 模式下客户端自带的、
-/// 恰好叫 `Read` 的工具入参也会被误改写。以 Kiro 名匹配避免了该误伤，且入站无需穿透 mode。
+/// 前提：调用方已确认 `tool_name_map` 含该 Kiro 名条目（即出站确实劫持过）。仅凭名字
+/// 不足以判断——客户端自带工具可能恰好与 Kiro 内置同名（如 Hermes 的 `read_file`）。
 fn map_tool_input_from_kiro(
     kiro_name: &str,
     input: serde_json::Value,
@@ -1618,18 +1617,20 @@ fn map_tool_input_from_kiro(
 }
 
 /// 入站还原工具名 + 入参给客户端。名字从 `tool_name_map`（kiro名→客户端名）还原；
-/// 入参按 kiro_name 反向重写（对非内置 / 长名缩短是 no-op）。
+/// 入参按 kiro_name 反向重写（对长名缩短是 no-op）。map 无条目说明出站未改名，名字与入参
+/// 原样返回，避免误改写与 Kiro 内置同名的客户端工具。
 pub fn restore_tool_use_for_client(
     kiro_name: &str,
     input: serde_json::Value,
     tool_name_map: &HashMap<String, String>,
 ) -> (String, serde_json::Value) {
-    let client_name = tool_name_map
-        .get(kiro_name)
-        .cloned()
-        .unwrap_or_else(|| kiro_name.to_string());
-    let client_input = map_tool_input_from_kiro(kiro_name, input, tool_name_map);
-    (client_name, client_input)
+    match tool_name_map.get(kiro_name) {
+        Some(client_name) => (
+            client_name.clone(),
+            map_tool_input_from_kiro(kiro_name, input, tool_name_map),
+        ),
+        None => (kiro_name.to_string(), input),
+    }
 }
 
 fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
@@ -3842,6 +3843,60 @@ mod tests {
             restored, input,
             "客户端自带 Read 工具在 Raw 下入参必须原样保留（不被误映射）"
         );
+    }
+
+    /// 客户端自带工具与 Kiro 内置同名（如 Hermes 的 read_file）且出站未劫持时，
+    /// 回程名字与入参必须原样保留。
+    #[test]
+    fn cc_inbound_restore_skips_unmapped_kiro_named_client_tools() {
+        let map = HashMap::new();
+        for (name, input) in [
+            (
+                "read_file",
+                serde_json::json!({"path": "/a", "offset": 3, "limit": 5}),
+            ),
+            (
+                "execute_bash",
+                serde_json::json!({"command": "ls", "workdir": "/tmp"}),
+            ),
+            (
+                "fs_write",
+                serde_json::json!({"path": "/a", "text": "hi", "mode": "append"}),
+            ),
+        ] {
+            let (restored_name, restored) =
+                restore_tool_use_for_client(name, input.clone(), &map);
+            assert_eq!(restored_name, name);
+            assert_eq!(restored, input, "{} 未劫持时入参不得改写", name);
+        }
+    }
+
+    #[test]
+    fn cc_hermes_read_file_roundtrip_passthrough() {
+        let mut map = HashMap::new();
+        let out = convert_tools(
+            &Some(vec![cc_tool_with_properties(
+                "read_file",
+                serde_json::json!({
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                }),
+            )]),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(out[0].tool_specification.name, "read_file");
+        let schema = serde_json::to_string(&out[0].tool_specification.input_schema).unwrap();
+        assert!(schema.contains("\"offset\""), "应保留客户端 schema");
+        assert!(!schema.contains("\"start_line\""));
+        assert!(map.get("read_file").is_none());
+
+        let input = serde_json::json!({"path": "/opt/data/a.txt", "offset": 10, "limit": 20});
+        let (name, restored) = restore_tool_use_for_client("read_file", input.clone(), &map);
+        assert_eq!(name, "read_file");
+        assert_eq!(restored, input);
     }
 
     #[test]
