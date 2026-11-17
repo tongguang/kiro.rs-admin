@@ -733,8 +733,8 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 与上游一致，模型列表与余额查询使用固定版本，不跟随聊天的动态版本。
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    // 模型列表与余额查询和聊天共用当前 IDE 版本；获取失败时回退到配置值。
+    let kiro_version = crate::kiro::kiro_version::effective(&config.kiro_version);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -757,6 +757,9 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
             .get(&url)
             .header("x-amz-user-agent", &amz_user_agent)
             .header("user-agent", &user_agent)
+            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("Accept", "application/json")
             .header("host", &host)
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=1")
@@ -5604,24 +5607,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_and_usage_queries_send_social_arn_with_fixed_identity_and_fallback() {
+    async fn model_and_usage_queries_send_current_ide_headers_and_social_arn_with_fallback() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut config = Config::default();
         config.kiro_version = "1.2.3-test".into();
-        let expected_version = "0.9.2";
+        let expected_version =
+            crate::kiro::kiro_version::cached().unwrap_or_else(|| config.kiro_version.clone());
         let apis: [(&str, fn(&str, Option<&str>) -> String); 2] = [
             ("getUsageLimits", usage_limits_url),
             ("ListAvailableModels", available_models_url),
         ];
         for (api_name, build_url) in apis {
-            for imported_arn in [None, Some(SOCIAL_PROFILE_ARN)] {
+            for (provider, imported_arn) in [
+                ("Github", None),
+                ("Github", Some(SOCIAL_PROFILE_ARN)),
+                ("Google", None),
+                ("Google", Some(SOCIAL_PROFILE_ARN)),
+            ] {
                 for reject_arn in [None, Some(400), Some(401), Some(403)] {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let address = listener.local_addr().unwrap();
                     let mut credentials = KiroCredentials {
                         auth_method: Some("social".into()),
-                        provider: Some("Github".into()),
+                        provider: Some(provider.into()),
                         profile_arn: imported_arn.map(str::to_string),
                         ..Default::default()
                     };
@@ -5698,20 +5707,32 @@ mod tests {
                     }
                     let machine_id = machine_id::generate_from_credentials(&credentials, &config);
                     for (request, _) in requests {
+                        let header_value = |header: &str| {
+                            request.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case(header).then_some(value.trim())
+                            })
+                        };
                         for header in ["user-agent", "x-amz-user-agent"] {
-                            let value = request
-                                .lines()
-                                .find_map(|line| {
-                                    let (name, value) = line.split_once(':')?;
-                                    name.eq_ignore_ascii_case(header).then_some(value.trim())
-                                })
-                                .unwrap();
+                            let value = header_value(header).unwrap();
                             assert!(
                                 value
                                     .ends_with(&format!("KiroIDE-{expected_version}-{machine_id}")),
                                 "{api_name} {header} must use KiroIDE-{expected_version}"
                             );
                         }
+                        for (header, expected) in [
+                            ("x-amzn-kiro-agent-mode", "vibe"),
+                            ("x-amzn-codewhisperer-optout", "true"),
+                            ("accept", "application/json"),
+                        ] {
+                            assert_eq!(
+                                header_value(header),
+                                Some(expected),
+                                "{api_name} {provider} {header}"
+                            );
+                        }
+                        assert_eq!(header_value("tokentype"), None);
                     }
                 }
             }
