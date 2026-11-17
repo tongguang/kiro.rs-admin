@@ -7,9 +7,9 @@
 //! - 跨平台 `currentRelease` 一致，固定使用 win32-x64 元数据即可；
 //! - 获取失败时调用方回退到 `config.kiro_version`，不阻塞启动。
 //!
-//! 模型列表与余额查询（ListAvailableModels / getUsageLimits）和聊天共用当前版本。
-//! Profile 与偏好接口（ListAvailableProfiles / setUserPreference）仍固定使用
-//! [`USAGE_API_KIRO_VERSION`]，保留原有请求行为。
+//! 模型列表、余额、Profile 与偏好接口（ListAvailableModels / getUsageLimits /
+//! ListAvailableProfiles / setUserPreference）固定使用 [`USAGE_API_KIRO_VERSION`]，
+//! 与上游一致，不跟随聊天的动态版本。
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -27,7 +27,9 @@ use crate::model::config::TlsBackend;
 const METADATA_URL: &str =
     "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json";
 
-/// Profile 与偏好接口（ListAvailableProfiles / setUserPreference）保留使用的 Kiro IDE 版本。
+/// 模型列表、余额、Profile 与偏好接口固定使用的 Kiro IDE 版本。
+///
+/// 版本号不决定是否需要 profileArn，固定版本不能替代有效 ARN。
 pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
 
 static LATEST_VERSION: OnceLock<RwLock<Option<String>>> = OnceLock::new();

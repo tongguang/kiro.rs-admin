@@ -636,7 +636,7 @@ fn usage_api_should_fallback(status: u16, had_profile_arn: bool, has_next: bool)
 
 /// 用量类接口的回退候选：每个区域端点先带可用 profileArn，再退回不带。
 ///
-/// 新版接口也要求 Social 登录携带共享 ARN；BuilderID 占位符仍由
+/// 保留 Social 登录的共享 ARN；BuilderID 占位符仍由
 /// `effective_profile_arn` 过滤，不向管理接口发送无效占位符。
 fn usage_api_attempts<'a>(
     credentials: &'a KiroCredentials,
@@ -733,8 +733,8 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 模型列表与余额查询跟随聊天的当前 IDE 版本；获取失败时回退到配置值。
-    let kiro_version = crate::kiro::kiro_version::effective(&config.kiro_version);
+    // 与上游一致，模型列表与余额查询使用固定版本，不跟随聊天的动态版本。
+    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -5604,12 +5604,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_and_usage_queries_send_social_arn_with_current_identity_and_fallback() {
+    async fn model_and_usage_queries_send_social_arn_with_fixed_identity_and_fallback() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut config = Config::default();
         config.kiro_version = "1.2.3-test".into();
-        let expected_version = crate::kiro::kiro_version::effective(&config.kiro_version);
+        let expected_version = "0.9.2";
         let apis: [(&str, fn(&str, Option<&str>) -> String); 2] = [
             ("getUsageLimits", usage_limits_url),
             ("ListAvailableModels", available_models_url),
