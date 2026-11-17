@@ -24,7 +24,7 @@ use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
-use crate::kiro::model::credentials::{KiroCredentials, SOCIAL_PROFILE_ARN};
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -627,28 +627,24 @@ fn management_api_host(credentials: &KiroCredentials, config: &Config, region: &
 
 /// 用量类 REST 请求是否回退到下一候选（形态/区域）。
 ///
-/// 403 恒回退（Enterprise / IdC 账号强制 profileArn 的已知拒绝形态）；带 ARN 的
-/// 请求被拒为 400/401 时同样回退——fork 的 Social 凭据全量带 SOCIAL_PROFILE_ARN，
-/// 该组合上游从未覆盖，malformed（400）类拒绝不能只认 403。429（限流）与 5xx
-/// （服务端错误）不回退，直接走各自错误路径。
+/// 403 恒回退；带 ARN 的请求被拒为 400/401 时也尝试无 ARN 形态，
+/// 兼容不同租户对 profileArn 的要求。429（限流）与 5xx（服务端错误）
+/// 不进入区域/ARN 回退，直接走各自错误路径。
 fn usage_api_should_fallback(status: u16, had_profile_arn: bool, has_next: bool) -> bool {
     has_next && (status == 403 || (had_profile_arn && matches!(status, 400 | 401)))
 }
 
-/// 用量类接口的 403 回退候选：每个区域端点先带真实 profileArn 试，再退回不带。
+/// 用量类接口的回退候选：每个区域端点先带可用 profileArn，再退回不带。
 ///
-/// Enterprise / IdC 账号缺 profileArn 会被上游拒（`403 User is not authorized
-/// to make this call.`）；BuilderID 占位符已由 `effective_profile_arn` 过滤，
-/// Social 共享 ARN 上游从未覆盖，这两种账号都只生成「不带」一种形态。
+/// 新版接口也要求 Social 登录携带共享 ARN；BuilderID 占位符仍由
+/// `effective_profile_arn` 过滤，不向管理接口发送无效占位符。
 fn usage_api_attempts<'a>(
     credentials: &'a KiroCredentials,
     candidates: &[&'static str],
 ) -> Vec<(&'static str, Option<&'a str>)> {
     let mut attempts = Vec::with_capacity(candidates.len() * 2);
     for region in candidates {
-        if let Some(arn) = credentials.effective_profile_arn()
-            && arn != SOCIAL_PROFILE_ARN
-        {
+        if let Some(arn) = credentials.effective_profile_arn() {
             attempts.push((*region, Some(arn)));
         }
         attempts.push((*region, None));
@@ -730,7 +726,7 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
     proxy: Option<&ProxyConfig>,
     api_name: &str,
     cn_label: &str,
-    build_url: fn(&str, Option<&str>) -> String,
+    build_url: impl Fn(&str, Option<&str>) -> String,
 ) -> anyhow::Result<T> {
     tracing::debug!("正在获取{}...", cn_label);
 
@@ -5262,6 +5258,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::SOCIAL_PROFILE_ARN;
     use std::sync::Arc;
 
     #[test]
@@ -5607,66 +5604,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_and_usage_queries_use_current_ide_version() {
+    async fn model_and_usage_queries_send_social_arn_with_current_identity_and_fallback() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut config = Config::default();
         config.kiro_version = "1.2.3-test".into();
         let expected_version = crate::kiro::kiro_version::effective(&config.kiro_version);
-        for api_name in ["getUsageLimits", "ListAvailableModels"] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            // 通过现有 URL 构造参数将生产请求发送路径限定在本地。
-            let credentials = KiroCredentials {
-                auth_method: Some("social".into()),
-                profile_arn: Some(format!("http://{}/", listener.local_addr().unwrap())),
-                ..Default::default()
-            };
-            let capture = async {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buffer = Vec::new();
-                loop {
-                    let mut chunk = [0; 1024];
-                    let read = socket.read(&mut chunk).await.unwrap();
-                    assert!(read > 0);
-                    buffer.extend_from_slice(&chunk[..read]);
-                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+        let apis: [(&str, fn(&str, Option<&str>) -> String); 2] = [
+            ("getUsageLimits", usage_limits_url),
+            ("ListAvailableModels", available_models_url),
+        ];
+        for (api_name, build_url) in apis {
+            for imported_arn in [None, Some(SOCIAL_PROFILE_ARN)] {
+                for reject_arn in [None, Some(400), Some(401), Some(403)] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let mut credentials = KiroCredentials {
+                        auth_method: Some("social".into()),
+                        provider: Some("Github".into()),
+                        profile_arn: imported_arn.map(str::to_string),
+                        ..Default::default()
+                    };
+                    // 启动和导入已有的补全流程，缺少显式 ARN 时不要求重新登录。
+                    credentials.fill_default_profile_arn();
+                    let expected_calls = if reject_arn.is_some() { 2 } else { 1 };
+                    let capture = async {
+                        let mut requests = Vec::new();
+                        for _ in 0..expected_calls {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            let mut buffer = Vec::new();
+                            loop {
+                                let mut chunk = [0; 1024];
+                                let read = socket.read(&mut chunk).await.unwrap();
+                                assert!(read > 0);
+                                buffer.extend_from_slice(&chunk[..read]);
+                                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            let request = String::from_utf8(buffer).unwrap();
+                            let target = request.split_whitespace().nth(1).unwrap();
+                            let url =
+                                reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                            let arn = url
+                                .query_pairs()
+                                .find(|(key, _)| key == "profileArn")
+                                .map(|(_, value)| value.into_owned());
+                            let status = match (arn.as_deref(), reject_arn) {
+                                (Some(SOCIAL_PROFILE_ARN), None) | (None, Some(_)) => 200,
+                                (Some(SOCIAL_PROFILE_ARN), Some(status)) => status,
+                                _ => 400,
+                            };
+                            let body = if status == 200 {
+                                "{}"
+                            } else {
+                                r#"{"message":"Invalid profileArn"}"#
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            socket.write_all(response.as_bytes()).await.unwrap();
+                            requests.push((request, arn));
+                        }
+                        requests
+                    };
+                    let call = q_rest_get_with_region_fallback::<serde_json::Value>(
+                        &credentials,
+                        &config,
+                        "test-token",
+                        None,
+                        api_name,
+                        "测试",
+                        |host, arn| {
+                            let mut url = reqwest::Url::parse(&build_url(host, arn)).unwrap();
+                            // 保留生产路径和查询参数，仅将请求发往本地。
+                            url.set_scheme("http").unwrap();
+                            url.set_host(Some("127.0.0.1")).unwrap();
+                            url.set_port(Some(address.port())).unwrap();
+                            url.to_string()
+                        },
+                    );
+                    let (requests, response) =
+                        tokio::time::timeout(StdDuration::from_secs(5), async {
+                            tokio::join!(capture, call)
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(response.unwrap(), serde_json::json!({}), "{api_name}");
+                    assert_eq!(requests[0].1.as_deref(), Some(SOCIAL_PROFILE_ARN));
+                    if reject_arn.is_some() {
+                        assert_eq!(requests[1].1, None);
+                    }
+                    let machine_id = machine_id::generate_from_credentials(&credentials, &config);
+                    for (request, _) in requests {
+                        for header in ["user-agent", "x-amz-user-agent"] {
+                            let value = request
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case(header).then_some(value.trim())
+                                })
+                                .unwrap();
+                            assert!(
+                                value
+                                    .ends_with(&format!("KiroIDE-{expected_version}-{machine_id}")),
+                                "{api_name} {header} must use KiroIDE-{expected_version}"
+                            );
+                        }
                     }
                 }
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                    .await
-                    .unwrap();
-                String::from_utf8(buffer).unwrap()
-            };
-            let call = q_rest_get_with_region_fallback::<serde_json::Value>(
-                &credentials,
-                &config,
-                "test-token",
-                None,
-                api_name,
-                "测试",
-                |_, url| url.unwrap().to_string(),
-            );
-            let (request, response) = tokio::time::timeout(StdDuration::from_secs(5), async {
-                tokio::join!(capture, call)
-            })
-            .await
-            .unwrap();
-            assert_eq!(response.unwrap(), serde_json::json!({}));
-            let machine_id = machine_id::generate_from_credentials(&credentials, &config);
-            for header in ["user-agent", "x-amz-user-agent"] {
-                let value = request
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case(header).then_some(value.trim())
-                    })
-                    .unwrap();
-                assert!(
-                    value.ends_with(&format!("KiroIDE-{expected_version}-{machine_id}")),
-                    "{api_name} {header} must use KiroIDE-{expected_version}"
-                );
             }
         }
     }
@@ -8036,16 +8083,22 @@ mod tests {
     }
 
     #[test]
-    fn usage_api_attempts_social_arn_is_plain_only() {
+    fn usage_api_attempts_social_arn_precedes_plain_fallback() {
         let credentials = KiroCredentials {
             profile_arn: Some(SOCIAL_PROFILE_ARN.to_string()),
             auth_method: Some("social".to_string()),
             ..Default::default()
         };
         let attempts = usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]);
-        assert_eq!(attempts.len(), 2, "social 每区域只应一条无 ARN 请求");
-        assert_eq!(attempts[0], ("us-east-1", None));
-        assert_eq!(attempts[1], ("eu-central-1", None));
+        assert_eq!(
+            attempts,
+            vec![
+                ("us-east-1", Some(SOCIAL_PROFILE_ARN)),
+                ("us-east-1", None),
+                ("eu-central-1", Some(SOCIAL_PROFILE_ARN)),
+                ("eu-central-1", None),
+            ]
+        );
     }
 
     #[test]

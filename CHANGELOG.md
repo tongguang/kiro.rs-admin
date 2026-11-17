@@ -10,7 +10,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 修复 — 个人使用场景的上游兼容
 
-- 模型列表和余额查询的 `User-Agent` / `x-amz-user-agent` 跟随自动获取的最新 IDE 版本，获取失败时回退到配置中的 `kiroVersion`，不再固定为 `0.9.2`；端点、ARN 和区域回退规则不变。
+- 模型列表和余额查询的 `User-Agent` / `x-amz-user-agent` 跟随自动获取的最新 IDE 版本，获取失败时回退到配置中的 `kiroVersion`，不再固定为 `0.9.2`；端点与区域回退规则不变。
+- 新版模型列表与余额查询保留 Social 登录已有或自动补全的 `profileArn`，不再主动过滤共享 ARN，修复升级身份后出现 `Invalid profileArn` 的请求缺参问题；仍保留租户所需的无 ARN 回退，BuilderID 占位符过滤不变。
 - `runtime` / `runtime_cli` 的模型列表、用量、Profile 与偏好请求改用 `management.{region}.kiro.dev`；其他端点保留 AWS 管理地址，区域、ARN、代理回退规则不变。管理接口的 `null` 数组按空列表解析。
 - 默认系统 Key 正常累计成功请求的 token、缓存与 credit 用量，不再排除 ID 0。
 - Opus 权限以账号实际模型列表为准，不再按 FREE 订阅名称拦截；分组、禁用、限流和 RPM 约束仍有效。
@@ -46,7 +47,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - **Admin JSON 原子落盘**：`model_mappings.json` / `groups.json` / `client_api_keys.json` 统一 tmp+rename；映射文件损坏时隔离为 `.bak` 并 seed 默认映射，后续修改仍可落盘。
 - **凭据落盘按 id 精确匹配**：同 email 多条凭据不再串写 token；email 回退命中多条时拒绝匹配并告警。
 - **模型不支持回 400**：凭据池均不支持请求模型时返回明确 400，不再误报 502「所有凭据均已禁用」。
-- **Social 用量接口单形态**：不再先发注定失败的带 ARN 请求再回退。
 - **Responses 错误体归一化**：非 2xx 与 Chat 共用 OpenAI `{"error":{...}}` 形状。
 - **禁用状态落盘对称**：额度用尽 / Token 刷新失败 / refreshToken 失效禁用后写回凭据文件，避免重启复活。
 - **流式 web_search 首轮失败保留 HTTP 状态码**：首轮上游失败原样返回（含 429+Retry-After），成功后再切 200+SSE。
