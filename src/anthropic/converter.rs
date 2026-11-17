@@ -803,7 +803,7 @@ pub fn convert_request_with_mode(
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (mut text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
@@ -838,7 +838,7 @@ pub fn convert_request_with_mode(
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
-        validate_tool_pairing(&history, &tool_results);
+        validate_tool_pairing(&mut history, &tool_results, &mut text_content);
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
@@ -1069,8 +1069,8 @@ fn extract_tool_result_content(
 
 /// 验证并过滤 tool_use/tool_result 配对
 ///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
+/// 验证当前与历史工具结果；确定的错配/重复结果降为文本，不丢内容。
+/// 真实用户输入或下一批工具调用结束上一批；允许批内文本 assistant 插入。
 ///
 /// # Arguments
 /// * `history` - 历史消息引用
@@ -1079,76 +1079,78 @@ fn extract_tool_result_content(
 /// # Returns
 /// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
 fn validate_tool_pairing(
-    history: &[Message],
+    history: &mut [Message],
     tool_results: &[ToolResult],
+    text_content: &mut String,
 ) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
-    // 1. 收集所有历史中的 tool_use_id
     let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
+    let mut pending_ids = HashSet::new();
+    let mut paired_ids = HashSet::new();
 
     for msg in history {
         match msg {
             Message::Assistant(assistant_msg) => {
                 if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                    pending_ids.clear();
                     for tool_use in tool_uses {
                         all_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                        pending_ids.insert(tool_use.tool_use_id.clone());
                     }
                 }
             }
             Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
-                for result in &user_msg
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
+                let msg = &mut user_msg.user_input_message;
+                let results = &mut msg.user_input_message_context.tool_results;
+                if results.is_empty() && !msg.content.trim().is_empty() {
+                    pending_ids.clear();
                 }
+                demote_unpaired_tool_results(results, &mut msg.content, &mut pending_ids);
+                paired_ids.extend(results.iter().map(|result| result.tool_use_id.clone()));
             }
         }
     }
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
-    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
-        .cloned()
-        .collect();
-
-    // 4. 过滤并验证当前消息的 tool_results
-    let mut filtered_results = Vec::new();
-
-    for result in tool_results {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
-            filtered_results.push(result.clone());
-            unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
-            tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
-                result.tool_use_id
-            );
-        } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
-            tracing::warn!(
-                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
-                result.tool_use_id
-            );
-        }
-    }
-
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
-    for orphaned_id in &unpaired_tool_use_ids {
-        tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
-            orphaned_id
-        );
-    }
-
+    let mut filtered_results = tool_results.to_vec();
+    demote_unpaired_tool_results(&mut filtered_results, text_content, &mut pending_ids);
+    paired_ids.extend(
+        filtered_results
+            .iter()
+            .map(|result| result.tool_use_id.clone()),
+    );
+    let unpaired_tool_use_ids = all_tool_use_ids.difference(&paired_ids).cloned().collect();
     (filtered_results, unpaired_tool_use_ids)
+}
+
+fn demote_unpaired_tool_results(
+    results: &mut Vec<ToolResult>,
+    content: &mut String,
+    pending_ids: &mut std::collections::HashSet<String>,
+) {
+    results.retain(|result| {
+        if pending_ids.remove(&result.tool_use_id) {
+            return true;
+        }
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        let status = if result.is_error || result.status.as_deref() == Some("error") {
+            " error"
+        } else {
+            ""
+        };
+        content.push_str(&format!("[Tool Result ({}){}]", result.tool_use_id, status));
+        for item in &result.content {
+            content.push('\n');
+            if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                content.push_str(text);
+            } else {
+                content.push_str(&serde_json::to_string(item).unwrap());
+            }
+        }
+        false
+    });
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -4299,17 +4301,108 @@ mod tests {
     fn test_validate_tool_pairing_orphaned_result() {
         // 测试孤立的 tool_result 被过滤
         // 历史中没有 tool_use，但 tool_results 中有 tool_result
-        let history = vec![
+        let mut history = vec![
             Message::User(HistoryUserMessage::new("Hello", "claude-sonnet-4.5")),
             Message::Assistant(HistoryAssistantMessage::new("Hi there!")),
         ];
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let mut content = String::new();
+        let (filtered, _) = validate_tool_pairing(&mut history, &tool_results, &mut content);
+        assert!(content.contains("some result"));
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn event_compatibility_tool_results_keep_text_without_crossing_batches() {
+        let convert = |messages: serde_json::Value| {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"claude-sonnet-4.5", "max_tokens":100, "messages":messages
+            }))
+            .unwrap();
+            serde_json::to_value(convert_request(&req).unwrap().conversation_state).unwrap()
+        };
+        let value = convert(serde_json::json!([
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"A","name":"tool_call","input":{"raw":"keep"}},
+                {"type":"tool_use","id":"B","name":"tool_call","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"A","content":"VALID","is_error":true},
+                {"type":"tool_result","tool_use_id":"Z","content":"HISTORY_ORPHAN","is_error":true},
+                {"type":"tool_result","tool_use_id":"A","content":"DUPLICATE"}
+            ]},
+            {"role":"assistant","content":"interleaved text"},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"B","content":"BATCH_CONTINUATION"},
+                {"type":"tool_result","tool_use_id":"Q","content":"CURRENT_ORPHAN"}
+            ]}
+        ]));
+        let history = value["history"].as_array().unwrap();
+        let user = &history[2]["userInputMessage"];
+        assert!(user["content"].as_str().unwrap().contains("HISTORY_ORPHAN"));
+        assert!(user["content"].as_str().unwrap().contains("DUPLICATE"));
+        assert!(user["content"].as_str().unwrap().contains("error"));
+        let results = user["userInputMessageContext"]["toolResults"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["toolUseId"], "A");
+        assert_eq!(results[0]["status"], "error");
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["toolUses"][0]["name"],
+            "tool_call"
+        );
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["toolUses"][0]["input"]["raw"],
+            "keep"
+        );
+        let current = &value["currentMessage"]["userInputMessage"];
+        assert!(
+            current["content"]
+                .as_str()
+                .unwrap()
+                .contains("CURRENT_ORPHAN")
+        );
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["toolUseId"],
+            "B"
+        );
+
+        for boundary in [
+            serde_json::json!({"role":"user","content":"interrupt"}),
+            serde_json::json!({"role":"assistant","content":[{"type":"tool_use","id":"NEW","name":"tool_call","input":{}}]}),
+        ] {
+            let value = convert(serde_json::json!([
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"OLD","name":"tool_call","input":{}}]},
+                {"role":"user","content":""},
+                boundary,
+                {"role":"assistant","content":"answer"},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"OLD","content":"DELAYED_RESULT"}]}
+            ]));
+            let current = &value["currentMessage"]["userInputMessage"];
+            assert!(
+                current["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("DELAYED_RESULT")
+            );
+            assert!(
+                current["userInputMessageContext"]
+                    .get("toolResults")
+                    .is_none()
+            );
+            assert!(
+                !value["history"]
+                    .to_string()
+                    .contains("\"toolUseId\":\"OLD\"")
+            );
+        }
     }
 
     #[test]
@@ -4323,7 +4416,7 @@ mod tests {
                 .with_input(serde_json::json!({"path": "/test.txt"})),
         ]);
 
-        let history = vec![
+        let mut history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
                 "claude-sonnet-4.5",
@@ -4336,7 +4429,8 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&mut history, &tool_results, &mut String::new());
 
         // 结果应该为空（因为没有 tool_result）
         // 同时应该返回孤立的 tool_use_id
@@ -4355,7 +4449,7 @@ mod tests {
                 .with_input(serde_json::json!({"path": "/test.txt"})),
         ]);
 
-        let history = vec![
+        let mut history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
                 "claude-sonnet-4.5",
@@ -4367,7 +4461,8 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&mut history, &tool_results, &mut String::new());
 
         // 配对成功，应该保留，无孤立
         assert_eq!(filtered.len(), 1);
@@ -4386,7 +4481,7 @@ mod tests {
             ToolUseEntry::new("tool-2", "write").with_input(serde_json::json!({})),
         ]);
 
-        let history = vec![
+        let mut history = vec![
             Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
             Message::Assistant(HistoryAssistantMessage {
                 assistant_response_message: assistant_msg,
@@ -4399,7 +4494,9 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let mut content = String::new();
+        let (filtered, orphaned) = validate_tool_pairing(&mut history, &tool_results, &mut content);
+        assert!(content.contains("orphan result"));
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
@@ -4426,7 +4523,7 @@ mod tests {
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
 
-        let history = vec![
+        let mut history = vec![
             // 第一轮：用户请求
             Message::User(HistoryUserMessage::new(
                 "Read the file",
@@ -4447,7 +4544,8 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&mut history, &tool_results, &mut String::new());
 
         // 结果应该为空，且不应该有孤立 tool_use
         // 因为 tool-1 已经在历史中配对了
@@ -4472,7 +4570,7 @@ mod tests {
         ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
         user_msg_with_result = user_msg_with_result.with_context(ctx);
 
-        let history = vec![
+        let mut history = vec![
             Message::User(HistoryUserMessage::new(
                 "Read the file",
                 "claude-sonnet-4.5",
@@ -4489,7 +4587,9 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let mut content = String::new();
+        let (filtered, _) = validate_tool_pairing(&mut history, &tool_results, &mut content);
+        assert!(content.contains("file content again"));
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");

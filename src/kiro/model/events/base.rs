@@ -31,7 +31,7 @@ impl EventType {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
-            "metadataEvent" => Self::Metadata,
+            "metadataEvent" | "messageStopEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
@@ -102,6 +102,58 @@ pub enum Event {
 }
 
 impl Event {
+    /// HTTP 200 正文内的错误也必须以失败收尾。长度上限保留既有 max_tokens 语义。
+    pub fn upstream_error(&self) -> Option<(u16, &str, &str)> {
+        match self {
+            Self::Error {
+                error_code,
+                error_message,
+            } => {
+                let status = match error_code.as_str() {
+                    "rate_limit_error" => 429,
+                    "authentication_error" => 401,
+                    "permission_error" => 403,
+                    "invalid_request_error" => 400,
+                    "not_found_error" => 404,
+                    _ => 502,
+                };
+                Some((status, error_code, error_message))
+            }
+            Self::Exception {
+                exception_type,
+                message,
+            } if exception_type != "ContentLengthExceededException" => {
+                let (status, code) = match exception_type.as_str() {
+                    "ThrottlingException" | "ServiceQuotaExceededException" => {
+                        (429, "rate_limit_error")
+                    }
+                    "UnauthorizedException" => (401, "authentication_error"),
+                    "AccessDeniedException" => (403, "permission_error"),
+                    "ValidationException" | "InvalidModelException" => {
+                        (400, "invalid_request_error")
+                    }
+                    "ResourceNotFoundException" => (404, "not_found_error"),
+                    "ConflictException" => (409, "conflict_error"),
+                    _ => (502, "upstream_error"),
+                };
+                Some((status, code, message))
+            }
+            Self::Metadata(metadata)
+                if metadata
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.to_ascii_uppercase().starts_with("MALFORMED")) =>
+            {
+                Some((
+                    502,
+                    "upstream_error",
+                    "Upstream returned a malformed stop reason",
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// 从帧解析事件
     pub fn from_frame(frame: Frame) -> ParseResult<Self> {
         let message_type = frame.message_type().unwrap_or("event");

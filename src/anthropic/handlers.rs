@@ -1232,21 +1232,31 @@ fn create_sse_stream(
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
+                                ctx.process_kiro_event(&Event::Error {
+                                    error_code: "upstream_error".into(),
+                                    error_message: "Upstream event stream buffer overflow".into(),
+                                });
                             }
 
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
-                                        }
+                                        let event = Event::from_frame(frame).unwrap_or_else(|_| Event::Error {
+                                            error_code: "upstream_error".into(),
+                                            error_message: "Invalid upstream event payload".into(),
+                                        });
+                                        events.extend(ctx.process_kiro_event(&event));
                                     }
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
+                                        ctx.process_kiro_event(&Event::Error {
+                                            error_code: "upstream_error".into(),
+                                            error_message: "Invalid upstream event stream frame".into(),
+                                        });
                                     }
                                 }
+                                if ctx.has_upstream_error() { break; }
                             }
                             settlement.capture(&ctx);
 
@@ -1301,6 +1311,12 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                         None => {
+                            if decoder.finish().is_err() {
+                                ctx.process_kiro_event(&Event::Error {
+                                    error_code: "upstream_error".into(),
+                                    error_message: "Upstream event stream ended with an incomplete frame".into(),
+                                });
+                            }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
@@ -1423,9 +1439,13 @@ async fn handle_non_stream_request(
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
-    }
+    let mut upstream_error = decoder.feed(&body_bytes).err().map(|_| {
+        (
+            502,
+            "upstream_error".to_string(),
+            "Upstream event stream buffer overflow".to_string(),
+        )
+    });
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
@@ -1456,91 +1476,123 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::ReasoningContent(reasoning) => {
-                            if let Some(text) = reasoning.text
-                                && !text.is_empty()
+                match Event::from_frame(frame) {
+                    Ok(event) => {
+                        if let Some((status, code, message)) = event.upstream_error() {
+                            upstream_error = Some((status, code.to_string(), message.to_string()));
+                            if let Event::Metadata(metadata) = &event
+                                && let Some(usage) = metadata.token_usage
                             {
-                                native_thinking.push_str(&text);
-                            }
-                            if let Some(signature) = reasoning.signature
-                                && !signature.is_empty()
-                            {
-                                native_thinking_signature = Some(signature);
-                            }
-                            if let Some(redacted) = reasoning.redacted_content
-                                && !redacted.is_empty()
-                            {
-                                native_redacted_thinking.push(redacted);
-                            }
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
-                            match tool_accumulator.push(&tool_use, &tool_name_map) {
-                                Ok(Some(completed)) => {
-                                    tool_uses.push(completed.to_anthropic_block());
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::error!("{}", e);
-                                    tool_json_error = Some(e);
-                                }
-                            }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (context_window_size as f64)
-                                / 100.0)
-                                as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason.set_fallback("model_context_window_exceeded");
-                            }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Metadata(metadata) => {
-                            // 保留最后一份精确用量快照：成功响应 / 记账 / trace 统一改用
-                            if let Some(usage) = metadata.token_usage {
                                 provider_token_usage = Some(usage);
                             }
-                            stop_reason.observe_metadata(&metadata);
+                            break;
                         }
-                        Event::Metering(metering) => {
-                            // 上游只下发 credit；token / cache 字段不存在
-                            credits += metering.usage;
-                            last_metering = Some(metering);
-                            tracing::debug!("metering credits +{:.6}", credits);
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason.set_fallback("max_tokens");
+                        match event {
+                            Event::AssistantResponse(resp) => {
+                                text_content.push_str(&resp.content);
                             }
+                            Event::ReasoningContent(reasoning) => {
+                                if let Some(text) = reasoning.text
+                                    && !text.is_empty()
+                                {
+                                    native_thinking.push_str(&text);
+                                }
+                                if let Some(signature) = reasoning.signature
+                                    && !signature.is_empty()
+                                {
+                                    native_thinking_signature = Some(signature);
+                                }
+                                if let Some(redacted) = reasoning.redacted_content
+                                    && !redacted.is_empty()
+                                {
+                                    native_redacted_thinking.push(redacted);
+                                }
+                            }
+                            Event::ToolUse(tool_use) => {
+                                has_tool_use = true;
+                                match tool_accumulator.push(&tool_use, &tool_name_map) {
+                                    Ok(Some(completed)) => {
+                                        tool_uses.push(completed.to_anthropic_block());
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::error!("{}", e);
+                                        tool_json_error = Some(e);
+                                    }
+                                }
+                            }
+                            Event::ContextUsage(context_usage) => {
+                                // 从上下文使用百分比计算实际的 input_tokens
+                                let actual_input_tokens = (context_usage.context_usage_percentage
+                                    * (context_window_size as f64)
+                                    / 100.0)
+                                    as i32;
+                                context_input_tokens = Some(actual_input_tokens);
+                                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                                if context_usage.context_usage_percentage >= 100.0 {
+                                    stop_reason.set_fallback("model_context_window_exceeded");
+                                }
+                                tracing::debug!(
+                                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                    context_usage.context_usage_percentage,
+                                    actual_input_tokens
+                                );
+                            }
+                            Event::Metadata(metadata) => {
+                                // 保留最后一份精确用量快照：成功响应 / 记账 / trace 统一改用
+                                if let Some(usage) = metadata.token_usage {
+                                    provider_token_usage = Some(usage);
+                                }
+                                stop_reason.observe_metadata(&metadata);
+                            }
+                            Event::Metering(metering) => {
+                                // 上游只下发 credit；token / cache 字段不存在
+                                credits += metering.usage;
+                                last_metering = Some(metering);
+                                tracing::debug!("metering credits +{:.6}", credits);
+                            }
+                            Event::Exception { exception_type, .. } => {
+                                if exception_type == "ContentLengthExceededException" {
+                                    stop_reason.set_fallback("max_tokens");
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                    Err(_) => {
+                        upstream_error = Some((
+                            502,
+                            "upstream_error".into(),
+                            "Invalid upstream event payload".into(),
+                        ));
+                        break;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("解码事件失败: {}", e);
+                upstream_error = Some((
+                    502,
+                    "upstream_error".into(),
+                    "Invalid upstream event stream frame".into(),
+                ));
+                break;
             }
         }
+    }
+    if upstream_error.is_none() && decoder.finish().is_err() {
+        upstream_error = Some((
+            502,
+            "upstream_error".into(),
+            "Upstream event stream ended with an incomplete frame".into(),
+        ));
     }
 
     // 恢复缺失 stop 的空参数调用；已有 JSON 错误优先。
     if stop_reason.get() == Some("refusal") {
         tool_json_error = None;
         tool_uses.clear();
-    } else if tool_json_error.is_none() {
+    } else if tool_json_error.is_none() && upstream_error.is_none() {
         match tool_accumulator.finish(&tool_name_map) {
             Ok(recovered) => {
                 for completed in recovered {
@@ -1557,8 +1609,10 @@ async fn handle_non_stream_request(
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
-    if let Some(err) = tool_json_error {
-        let message = err.message();
+    let failure = upstream_error.or_else(|| {
+        tool_json_error.map(|err| (502, "upstream_tool_json_error".into(), err.message()))
+    });
+    if let Some((status, code, message)) = failure {
         // 已有 metadataEvent 快照时按精确用量记账；没有则保持裸 input + 0 output
         let had_provider = provider_token_usage.is_some();
         let (in_t, out_t, cw, cr) = resolve_non_stream_usage(
@@ -1596,14 +1650,18 @@ async fn handle_non_stream_request(
         );
         tracer.finalize(
             "error",
-            Some(outcome::BAD_REQUEST),
+            Some(if code == "upstream_tool_json_error" {
+                outcome::BAD_REQUEST
+            } else {
+                outcome::UNKNOWN
+            }),
             Some(&message),
             None,
             trace_usage,
         );
         return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            StatusCode::from_u16(status).unwrap(),
+            Json(ErrorResponse::new(code, message)),
         )
             .into_response();
     }
@@ -2213,6 +2271,12 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
                             None => {
+                                if decoder.finish().is_err() {
+                                    ctx.process_and_buffer(&Event::Error {
+                                        error_code: "upstream_error".into(),
+                                        error_message: "Upstream event stream ended with an incomplete frame".into(),
+                                    });
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
                                 // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
                                 // 非法工具调用 JSON 或上游错误帧，error 事件已随缓冲发出，

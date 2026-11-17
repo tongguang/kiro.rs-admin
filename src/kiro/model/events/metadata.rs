@@ -140,8 +140,9 @@ impl StopReason {
             .map(str::to_ascii_uppercase)
             .as_deref()
         {
-            Some("CONTENT_FILTERED" | "REFUSAL") => "refusal",
+            Some("CONTENT_FILTERED" | "REFUSAL" | "GUARDRAIL_INTERVENED") => "refusal",
             Some("MAX_TOKENS") => "max_tokens",
+            Some("MODEL_CONTEXT_WINDOW_EXCEEDED") => "model_context_window_exceeded",
             Some("END_TURN") => "end_turn",
             Some("STOP_SEQUENCE") => "stop_sequence",
             Some("TOOL_USE") => "tool_use",
@@ -173,7 +174,17 @@ impl StopReason {
 
 impl EventPayload for MetadataEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        let value: serde_json::Value = frame.payload_as_json()?;
+        let mut metadata: Self = serde_json::from_value(value.clone())?;
+        for key in ["metadataEvent", "messageStopEvent"] {
+            if let Some(nested) = value.get(key).filter(|value| value.is_object()) {
+                let nested: Self = serde_json::from_value(nested.clone())?;
+                metadata.token_usage = metadata.token_usage.or(nested.token_usage);
+                metadata.stop_reason = metadata.stop_reason.or(nested.stop_reason);
+                metadata.stop_details = metadata.stop_details.or(nested.stop_details);
+            }
+        }
+        Ok(metadata)
     }
 }
 

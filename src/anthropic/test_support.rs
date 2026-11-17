@@ -15,25 +15,32 @@ use crate::model::config::Config;
 pub(super) fn event_stream(events: &[(&str, Value)]) -> Vec<u8> {
     let mut output = Vec::new();
     for (event, payload) in events {
-        let mut headers = Vec::new();
-        for (name, value) in [(":message-type", "event"), (":event-type", *event)] {
-            headers.push(name.len() as u8);
-            headers.extend_from_slice(name.as_bytes());
-            headers.push(7);
-            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
-            headers.extend_from_slice(value.as_bytes());
-        }
-        let payload = serde_json::to_vec(payload).unwrap();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
-        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
-        frame.extend_from_slice(&headers);
-        frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
-        output.extend(frame);
+        output.extend(event_frame(
+            &[(":message-type", "event"), (":event-type", *event)],
+            payload,
+        ));
     }
     output
+}
+
+pub(super) fn event_frame(headers: &[(&str, &str)], payload: &Value) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for (name, value) in headers {
+        encoded.push(name.len() as u8);
+        encoded.extend_from_slice(name.as_bytes());
+        encoded.push(7);
+        encoded.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    }
+    let payload = serde_json::to_vec(payload).unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&((16 + encoded.len() + payload.len()) as u32).to_be_bytes());
+    frame.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    frame.extend(encoded);
+    frame.extend(payload);
+    frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+    frame
 }
 
 struct LoopbackEndpoint(String);

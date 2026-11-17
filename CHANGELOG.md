@@ -10,6 +10,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 修复 — 个人使用场景的上游兼容
 
+- 修复 HTTP 200 事件流中的 AWS 异常、非流式错误帧及残缺二进制帧被误判为成功；流式输出错误终态，保留精确用量与恰好一次结算。没有 stop 事件的正常响应、空参数工具恢复及长度上限异常的既有处理不变。
+- 工具参数兼容对象快照（保留最后一份，不拼接重复对象），字符串分片仍实时输出；兼容嵌套 `reasoningText`、`messageStopEvent`、嵌套 metadata 和明确的上下文上限、护栏及 malformed 结束原因。
+- 当前和历史中的孤立、重复或跨工具批次结果改为保留正文的普通文本，不再静默丢失或向上游发送确定无效的结构化结果；有效配对、批内并行结果、工具还原及错误标记不变。
 - 模型列表和余额查询的 `User-Agent` / `x-amz-user-agent` 与聊天共用自动获取的当前 IDE 版本，获取失败时回退到配置中的 `kiroVersion`；补齐 `x-amzn-kiro-agent-mode: vibe`、`x-amzn-codewhisperer-optout: true` 和 JSON `Accept` 请求头，端点、区域与代理回退规则不变。
 - 模型列表与余额查询保留 Social 登录已有或自动补全的 `profileArn`，不再主动过滤共享 ARN，避免查询漏传有效 ARN；仍保留租户所需的无 ARN 回退，BuilderID 占位符过滤不变。
 - `runtime` / `runtime_cli` 的模型列表、用量、Profile 与偏好请求改用 `management.{region}.kiro.dev`；其他端点保留 AWS 管理地址，区域、ARN、代理回退规则不变。管理接口的 `null` 数组按空列表解析。

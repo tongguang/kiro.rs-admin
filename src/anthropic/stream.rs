@@ -972,8 +972,8 @@ impl std::error::Error for ToolJsonAccumulatorError {}
 /// 同时增量输出原始分片，只有校验成功后才关闭工具块。
 #[derive(Debug, Default)]
 pub struct ToolJsonAccumulator {
-    /// tool_use_id -> (工具名, 已累积的 JSON 分片)
-    buffers: HashMap<String, (String, String)>,
+    /// tool_use_id -> (工具名, 字符串增量或最后一份对象快照)
+    buffers: HashMap<String, (String, serde_json::Value)>,
 }
 
 impl ToolJsonAccumulator {
@@ -997,30 +997,44 @@ impl ToolJsonAccumulator {
         let entry = self
             .buffers
             .entry(tool_use.tool_use_id.clone())
-            .or_insert_with(|| (tool_use.name.clone(), String::new()));
+            .or_insert_with(|| (tool_use.name.clone(), json!("")));
         if entry.0.is_empty() {
             entry.0 = tool_use.name.clone();
         }
-        entry.1.push_str(&tool_use.input);
+        match &tool_use.input {
+            serde_json::Value::String(delta) => match &mut entry.1 {
+                serde_json::Value::String(buffer) => buffer.push_str(delta),
+                _ if delta.is_empty() => {}
+                _ => {
+                    return Err(ToolJsonAccumulatorError::InvalidJson {
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        name: entry.0.clone(),
+                        message: "String delta cannot follow an object snapshot".into(),
+                    });
+                }
+            },
+            snapshot => entry.1 = snapshot.clone(),
+        }
 
         if !tool_use.stop {
             return Ok(None);
         }
 
-        let (kiro_name, input_json) = self
-            .buffers
-            .remove(&tool_use.tool_use_id)
-            .unwrap_or_else(|| (tool_use.name.clone(), tool_use.input.clone()));
-        let input = if input_json.trim().is_empty() {
-            serde_json::json!({})
+        let (kiro_name, input_json) = self.buffers.remove(&tool_use.tool_use_id).unwrap();
+        let input = if let Some(input_json) = input_json.as_str() {
+            if input_json.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<serde_json::Value>(input_json).map_err(|e| {
+                    ToolJsonAccumulatorError::InvalidJson {
+                        tool_use_id: tool_use.tool_use_id.clone(),
+                        name: kiro_name.clone(),
+                        message: e.to_string(),
+                    }
+                })?
+            }
         } else {
-            serde_json::from_str::<serde_json::Value>(&input_json).map_err(|e| {
-                ToolJsonAccumulatorError::InvalidJson {
-                    tool_use_id: tool_use.tool_use_id.clone(),
-                    name: kiro_name.clone(),
-                    message: e.to_string(),
-                }
-            })?
+            input_json
         };
 
         // 通过统一入口还原客户端工具名 + 入参。
@@ -1032,29 +1046,32 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 仅恢复缺失 stop 的空参数调用；非空参数仍视为截断，不能猜测为完整调用。
+    /// 恢复对象快照及缺失 stop 的空参数；非空字符串仍视为截断。
     pub fn finish(
         &mut self,
         tool_name_map: &HashMap<String, String>,
     ) -> Result<Vec<CompletedToolUse>, ToolJsonAccumulatorError> {
         let (mut empty, incomplete): (Vec<_>, Vec<_>) = std::mem::take(&mut self.buffers)
             .into_iter()
-            .partition(|(_, (_, input))| input.trim().is_empty());
+            .partition(|(_, (_, input))| {
+                input.is_object() || input.as_str().is_some_and(|s| s.trim().is_empty())
+            });
         if let Some((tool_use_id, (name, input))) = incomplete
             .into_iter()
-            .max_by_key(|(_, (_, input))| input.len())
+            .max_by_key(|(_, (_, input))| input.as_str().unwrap().len())
         {
             return Err(ToolJsonAccumulatorError::IncompleteJson {
                 tool_use_id,
                 name,
-                bytes: input.len(),
+                bytes: input.as_str().unwrap().len(),
             });
         }
         empty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(empty
             .into_iter()
-            .map(|(id, (name, _))| {
-                CompletedToolUse::from_kiro(id, &name, serde_json::json!({}), tool_name_map)
+            .map(|(id, (name, input))| {
+                let input = if input.is_object() { input } else { json!({}) };
+                CompletedToolUse::from_kiro(id, &name, input, tool_name_map)
             })
             .collect())
     }
@@ -1651,6 +1668,16 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.upstream_error.is_some() {
+            return Vec::new();
+        }
+        if let Some((_, code, message)) = event.upstream_error() {
+            self.upstream_error = Some((code.to_string(), message.to_string()));
+            // 同一个 metadata 帧仍可携带应保留的精确用量。
+            if !matches!(event, Event::Metadata(_)) {
+                return Vec::new();
+            }
+        }
         let events = match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -1705,24 +1732,11 @@ impl StreamContext {
                 self.metering = Some(metering.clone());
                 Vec::new()
             }
-            Event::Error {
-                error_code,
-                error_message,
-            } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                // 错误帧不能吞：记下来，收尾改走 error 终态，记账记 error。
-                self.upstream_error = Some((error_code.clone(), error_message.clone()));
-                Vec::new()
-            }
-            Event::Exception {
-                exception_type,
-                message,
-            } => {
+            Event::Exception { exception_type, .. } => {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2520,12 +2534,27 @@ impl StreamContext {
             .unwrap_or(&tool_use.name)
             .to_string();
         let stream_input = !kiro_name.is_empty()
+            && tool_use.input.is_string()
+            && pending.is_none_or(|(_, input)| input.is_string())
             && !super::converter::tool_input_needs_rewrite(&kiro_name, &self.tool_name_map);
-        let empty_input = pending.is_none_or(|(_, input)| input.trim().is_empty())
-            && tool_use.input.trim().is_empty();
+        if tool_use.input.is_object() && self.tool_block_indices.contains_key(&tool_use.tool_use_id)
+        {
+            self.tool_json_error = Some(ToolJsonAccumulatorError::InvalidJson {
+                tool_use_id: tool_use.tool_use_id.clone(),
+                name: kiro_name,
+                message: "Object snapshot cannot replace already streamed string arguments".into(),
+            });
+            return events;
+        }
+        let empty_input = pending
+            .is_none_or(|(_, input)| input.as_str().is_some_and(|s| s.trim().is_empty()))
+            && tool_use.input.as_str().is_some_and(|s| s.trim().is_empty());
         let buffered_prefix =
             if stream_input && !self.tool_block_indices.contains_key(&tool_use.tool_use_id) {
-                pending.map(|(_, input)| input.clone()).unwrap_or_default()
+                pending
+                    .and_then(|(_, input)| input.as_str())
+                    .unwrap_or_default()
+                    .to_string()
             } else {
                 String::new()
             };
@@ -2551,7 +2580,7 @@ impl StreamContext {
             let (index, start_events) = self.start_tool_use(&tool_use.tool_use_id, &client_name);
             events.extend(start_events);
             events.extend(self.emit_tool_input_fragment(index, &buffered_prefix));
-            events.extend(self.emit_tool_input_fragment(index, &tool_use.input));
+            events.extend(self.emit_tool_input_fragment(index, tool_use.input.as_str().unwrap()));
             if completed.is_some() {
                 if empty_input {
                     events.extend(self.emit_tool_input_fragment(index, "{}"));
@@ -2911,6 +2940,37 @@ fn estimate_character_tokens(chinese_count: i32, other_count: i32) -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn object_snapshots_restore_mapped_tools_and_wait_for_completion() {
+        let map = HashMap::from([("read_file".into(), "Read".into())]);
+        let mut ctx = StreamContext::new_with_thinking("test", 1, false, map, Default::default());
+        let first = serde_json::from_value(
+            json!({"toolUseId":"t","name":"read_file","input":{"path":"first","start_line":1}}),
+        )
+        .unwrap();
+        assert!(ctx.process_tool_use(&first).is_empty());
+        let last = serde_json::from_value(
+            json!({"toolUseId":"t","input":{"path":"last","start_line":3,"end_line":5}}),
+        )
+        .unwrap();
+        assert!(ctx.process_tool_use(&last).is_empty());
+        let events = ctx.generate_final_events();
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
+        assert_eq!(start.data["content_block"]["name"], "Read");
+        let input = events
+            .iter()
+            .find_map(|e| e.data["delta"]["partial_json"].as_str())
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert_eq!(input["file_path"], "last");
+        assert_eq!(input["offset"], 3);
+        assert_eq!(input["limit"], 3);
+        assert!(input.get("path").is_none());
+    }
+
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
 
     fn tool_evt(
@@ -2922,7 +2982,7 @@ mod tests {
         crate::kiro::model::events::ToolUseEvent {
             name: name.to_string(),
             tool_use_id: id.to_string(),
-            input: input.to_string(),
+            input: input.into(),
             stop,
         }
     }
@@ -3683,7 +3743,7 @@ mod tests {
         let tool_event = Event::ToolUse(ToolUseEvent {
             name: "short_abc12345".to_string(),
             tool_use_id: "toolu_01".to_string(),
-            input: r#"{"key":"value"}"#.to_string(),
+            input: r#"{"key":"value"}"#.into(),
             stop: true,
         });
 
@@ -3726,7 +3786,7 @@ mod tests {
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
+            input: "{}".into(),
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
         assert!(
@@ -3794,7 +3854,7 @@ mod tests {
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
+            input: "{}".into(),
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
 
@@ -3999,7 +4059,7 @@ mod tests {
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
+            input: "{}".into(),
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
         all_events.extend(tool_events);
@@ -5123,7 +5183,7 @@ mod tests {
             ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
                 name: "test_tool".to_string(),
                 tool_use_id: "tool_1".to_string(),
-                input: "{}".to_string(),
+                input: "{}".into(),
                 stop: true,
             }),
         );

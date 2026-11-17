@@ -220,6 +220,22 @@ impl EventStreamDecoder {
         DecodeIter { decoder: self }
     }
 
+    /// 仅检查实际残帧，不要求 stop 事件；只带计量尾帧的正常响应仍可完成。
+    pub fn finish(&self) -> ParseResult<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let needed = if self.buffer.len() >= 4 {
+            u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize
+        } else {
+            PRELUDE_SIZE
+        };
+        Err(ParseError::Incomplete {
+            needed,
+            available: self.buffer.len(),
+        })
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：
@@ -318,6 +334,20 @@ impl<'a> Iterator for DecodeIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_rejects_partial_frames_but_accepts_empty_buffer() {
+        assert!(EventStreamDecoder::new().finish().is_ok());
+        for bytes in [&[0u8][..], &[0, 0, 0, 100, 0, 0, 0, 0, 0][..]] {
+            let mut decoder = EventStreamDecoder::new();
+            decoder.feed(bytes).unwrap();
+            assert!(decoder.decode().unwrap().is_none());
+            assert!(matches!(
+                decoder.finish(),
+                Err(ParseError::Incomplete { .. })
+            ));
+        }
+    }
 
     #[test]
     fn test_decoder_feed() {

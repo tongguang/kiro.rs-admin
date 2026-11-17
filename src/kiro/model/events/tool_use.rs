@@ -20,12 +20,29 @@ pub struct ToolUseEvent {
     pub name: String,
     /// 工具调用 ID
     pub tool_use_id: String,
-    /// 工具输入数据 (JSON 字符串，可能是流式的部分数据)
-    #[serde(default)]
-    pub input: String,
+    /// 字符串是增量分片，对象是最新完整快照，不能把多个对象拼接。
+    #[serde(default = "empty_input", deserialize_with = "deserialize_input")]
+    pub input: serde_json::Value,
     /// 是否是最后一个块
     #[serde(default)]
     pub stop: bool,
+}
+
+fn empty_input() -> serde_json::Value {
+    serde_json::Value::String(String::new())
+}
+
+fn deserialize_input<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_string() || value.is_object() {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "tool input must be a string delta or object snapshot",
+        ))
+    }
 }
 
 impl EventPayload for ToolUseEvent {

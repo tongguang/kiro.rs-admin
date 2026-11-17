@@ -355,19 +355,36 @@ async fn decode_round(
         };
         if let Err(e) = decoder.feed(&chunk) {
             tracing::warn!("buffer overflow: {}", e);
+            stream_error = Some("Upstream event stream buffer overflow".into());
+            break;
         }
         for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!("failed to decode event: {}", e);
-                    continue;
+                    stream_error = Some("Invalid upstream event stream frame".into());
+                    break 'body;
                 }
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
-                Err(_) => continue,
+                Err(_) => {
+                    stream_error = Some("Invalid upstream event payload".into());
+                    break 'body;
+                }
             };
+            if let Some((_, code, message)) = event.upstream_error() {
+                stream_error = Some(format!("{code}: {message}"));
+                if let Event::Metadata(metadata) = &event
+                    && let Some(usage) = metadata.token_usage
+                {
+                    let usage = usage.sanitized();
+                    settlement.capture_in_flight_usage(usage);
+                    provider_token_usage = Some(usage);
+                }
+                break 'body;
+            }
             if let Some(emitter) = emitter.as_deref_mut() {
                 match &event {
                     Event::ToolUse(tool) => {
@@ -444,16 +461,12 @@ async fn decode_round(
                         stop_reason.set_fallback("max_tokens");
                     }
                 }
-                Event::Error {
-                    error_code,
-                    error_message,
-                } => {
-                    stream_error = Some(format!("{error_code}: {error_message}"));
-                    break 'body;
-                }
                 _ => {}
             }
         }
+    }
+    if stream_error.is_none() && decoder.finish().is_err() {
+        stream_error = Some("Upstream event stream ended with an incomplete frame".into());
     }
 
     // 非法 / 半截 JSON 不作为成功工具调用：记 stream_error，由 run_round 按
@@ -2246,7 +2259,7 @@ mod tests {
         crate::kiro::model::events::ToolUseEvent {
             name: name.to_string(),
             tool_use_id: id.to_string(),
-            input: input.to_string(),
+            input: input.into(),
             stop,
         }
     }
