@@ -737,9 +737,8 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    // 模型列表与余额查询跟随聊天的当前 IDE 版本；获取失败时回退到配置值。
+    let kiro_version = crate::kiro::kiro_version::effective(&config.kiro_version);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -5605,6 +5604,71 @@ mod tests {
             }
         }
         assert_eq!(manager.available_count(), 0, "预期全部凭据已禁用");
+    }
+
+    #[tokio::test]
+    async fn model_and_usage_queries_use_current_ide_version() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut config = Config::default();
+        config.kiro_version = "1.2.3-test".into();
+        let expected_version = crate::kiro::kiro_version::effective(&config.kiro_version);
+        for api_name in ["getUsageLimits", "ListAvailableModels"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // 通过现有 URL 构造参数将生产请求发送路径限定在本地。
+            let credentials = KiroCredentials {
+                auth_method: Some("social".into()),
+                profile_arn: Some(format!("http://{}/", listener.local_addr().unwrap())),
+                ..Default::default()
+            };
+            let capture = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                String::from_utf8(buffer).unwrap()
+            };
+            let call = q_rest_get_with_region_fallback::<serde_json::Value>(
+                &credentials,
+                &config,
+                "test-token",
+                None,
+                api_name,
+                "测试",
+                |_, url| url.unwrap().to_string(),
+            );
+            let (request, response) = tokio::time::timeout(StdDuration::from_secs(5), async {
+                tokio::join!(capture, call)
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.unwrap(), serde_json::json!({}));
+            let machine_id = machine_id::generate_from_credentials(&credentials, &config);
+            for header in ["user-agent", "x-amz-user-agent"] {
+                let value = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(header).then_some(value.trim())
+                    })
+                    .unwrap();
+                assert!(
+                    value.ends_with(&format!("KiroIDE-{expected_version}-{machine_id}")),
+                    "{api_name} {header} must use KiroIDE-{expected_version}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

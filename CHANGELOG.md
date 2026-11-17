@@ -10,6 +10,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 修复 — 个人使用场景的上游兼容
 
+- 模型列表和余额查询的 `User-Agent` / `x-amz-user-agent` 跟随自动获取的最新 IDE 版本，获取失败时回退到配置中的 `kiroVersion`，不再固定为 `0.9.2`；端点、ARN 和区域回退规则不变。
 - `runtime` / `runtime_cli` 的模型列表、用量、Profile 与偏好请求改用 `management.{region}.kiro.dev`；其他端点保留 AWS 管理地址，区域、ARN、代理回退规则不变。管理接口的 `null` 数组按空列表解析。
 - 默认系统 Key 正常累计成功请求的 token、缓存与 credit 用量，不再排除 ID 0。
 - Opus 权限以账号实际模型列表为准，不再按 FREE 订阅名称拦截；分组、禁用、限流和 RPM 约束仍有效。
