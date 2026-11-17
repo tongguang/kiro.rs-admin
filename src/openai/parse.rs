@@ -250,6 +250,7 @@ pub(crate) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
 
 pub(crate) fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
+        "refusal" => "content_filter",
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ if has_tool_calls => "tool_calls",
@@ -396,6 +397,30 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::StatusCode;
+
+    #[test]
+    fn refusal_finish_reason_wins_over_tool_calls() {
+        for has_tools in [false, true] {
+            assert_eq!(map_finish_reason("refusal", has_tools), "content_filter");
+            assert_eq!(map_finish_reason("max_tokens", has_tools), "length");
+        }
+        let response = parse_anthropic_message(
+            &json!({
+                "content": [], "stop_reason": "refusal",
+                "usage": {"input_tokens":3,"output_tokens":11,"cache_read_input_tokens":7,"cache_creation_input_tokens":4}
+            }),
+            "test-model",
+        );
+        assert_eq!(response.finish_reason, "content_filter");
+        assert_eq!(
+            (
+                response.prompt_tokens,
+                response.completion_tokens,
+                response.cached_tokens
+            ),
+            (14, 11, 7)
+        );
+    }
 
     #[test]
     fn parse_anthropic_message_extracts_credit_fields() {

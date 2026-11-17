@@ -1106,7 +1106,7 @@ struct ResponsesView {
 }
 
 fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
-    let status = if p.finish_reason == "length" {
+    let status = if matches!(p.finish_reason.as_str(), "length" | "content_filter") {
         "incomplete".to_string()
     } else {
         "completed".to_string()
@@ -1249,7 +1249,9 @@ fn build_response_object_from(
         "tools": config.tools,
     });
     if view.status == "incomplete" {
-        obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        obj["incomplete_details"] = json!({
+            "reason": if p.finish_reason == "content_filter" { "content_filter" } else { "max_output_tokens" }
+        });
     }
     obj
 }
@@ -1287,6 +1289,7 @@ enum StreamingBlock {
         call_id: String,
         flat_name: String,
         arguments: String,
+        live: Option<(String, i64)>,
     },
     WebSearch {
         item_id: String,
@@ -1305,7 +1308,7 @@ struct ResponsesStreamContext {
     sequence_number: i64,
     next_output_index: i64,
     blocks: HashMap<i64, StreamingBlock>,
-    output: Vec<Value>,
+    output: std::collections::BTreeMap<i64, Value>,
     input_tokens: i64,
     cache_creation_tokens: i64,
     cached_tokens: i64,
@@ -1339,7 +1342,7 @@ impl ResponsesStreamContext {
             sequence_number: 0,
             next_output_index: 0,
             blocks: HashMap::new(),
-            output: Vec::new(),
+            output: std::collections::BTreeMap::new(),
             input_tokens: 0,
             cache_creation_tokens: 0,
             cached_tokens: 0,
@@ -1473,6 +1476,7 @@ impl ResponsesStreamContext {
                     .unwrap_or("")
                     .to_string(),
                 arguments: String::new(),
+                live: None,
             },
             "server_tool_use"
                 if block.get("name").and_then(Value::as_str) == Some("web_search") =>
@@ -1509,8 +1513,36 @@ impl ResponsesStreamContext {
             }
             _ => StreamingBlock::Ignored,
         };
+        let mut state = state;
+        let mut events = Vec::new();
+        if let StreamingBlock::Tool {
+            call_id,
+            flat_name,
+            live,
+            ..
+        } = &mut state
+        {
+            let decl = self.tool_kinds.get(flat_name);
+            // custom 工具要把 JSON envelope 还原为原始文本，不能直接转发 JSON 分片。
+            if decl.is_none_or(|decl| decl.kind == DeclaredToolKind::Function) {
+                let mut item = json!({
+                    "type":"function_call", "id":new_fc_id(), "call_id":call_id,
+                    "name":decl.map(|decl| decl.name.as_str()).unwrap_or(flat_name),
+                    "arguments":"", "status":"in_progress"
+                });
+                if let Some(namespace) = decl.and_then(|decl| decl.namespace.as_ref()) {
+                    item["namespace"] = json!(namespace);
+                }
+                let output_index = self.allocate_output_index();
+                *live = Some((item["id"].as_str().unwrap().to_string(), output_index));
+                events.push(self.emit(
+                    "response.output_item.added",
+                    json!({"output_index":output_index, "item":item}),
+                ));
+            }
+        }
         self.blocks.insert(index, state);
-        Vec::new()
+        events
     }
 
     fn handle_block_delta(&mut self, data: &Value) -> Vec<Bytes> {
@@ -1528,13 +1560,21 @@ impl ResponsesStreamContext {
                 self.handle_reasoning_delta(index, text)
             }
             "input_json_delta" => {
-                if let Some(StreamingBlock::Tool { arguments, .. }) = self.blocks.get_mut(&index) {
-                    arguments.push_str(
-                        delta
-                            .get("partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or(""),
-                    );
+                let fragment = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(StreamingBlock::Tool {
+                    arguments, live, ..
+                }) = self.blocks.get_mut(&index)
+                {
+                    arguments.push_str(fragment);
+                    if let Some((item_id, output_index)) = live.clone() {
+                        return vec![self.emit(
+                            "response.function_call_arguments.delta",
+                            json!({"item_id":item_id,"output_index":output_index,"delta":fragment}),
+                        )];
+                    }
                 }
                 Vec::new()
             }
@@ -1673,7 +1713,8 @@ impl ResponsesStreamContext {
                 call_id,
                 flat_name,
                 arguments,
-            }) => self.finish_tool(call_id, flat_name, arguments),
+                live,
+            }) => self.finish_tool(call_id, flat_name, arguments, live),
             Some(StreamingBlock::WebSearch {
                 item_id,
                 query,
@@ -1690,7 +1731,7 @@ impl ResponsesStreamContext {
                 "type": "output_text", "text": text, "annotations": [],
             }],
         });
-        self.output.push(item.clone());
+        self.output.insert(output_index, item.clone());
         vec![
             self.emit(
                 "response.output_text.done",
@@ -1718,7 +1759,7 @@ impl ResponsesStreamContext {
             "type": "reasoning", "id": item_id,
             "summary": [{ "type": "summary_text", "text": text }],
         });
-        self.output.push(item.clone());
+        self.output.insert(output_index, item.clone());
         vec![
             self.emit(
                 "response.reasoning_summary_text.done",
@@ -1744,7 +1785,7 @@ impl ResponsesStreamContext {
             "type": "reasoning", "id": item_id,
             "summary": [{ "type": "summary_text", "text": text }],
         });
-        self.output.push(item.clone());
+        self.output.insert(output_index, item.clone());
         vec![
             self.emit(
                 "response.output_item.added",
@@ -1778,11 +1819,16 @@ impl ResponsesStreamContext {
         call_id: String,
         flat_name: String,
         mut arguments: String,
+        live: Option<(String, i64)>,
     ) -> Vec<Bytes> {
+        let empty = arguments.trim().is_empty();
         if arguments.trim().is_empty() {
             arguments = "{}".to_string();
         }
-        let output_index = self.allocate_output_index();
+        let output_index = live
+            .as_ref()
+            .map(|(_, index)| *index)
+            .unwrap_or_else(|| self.allocate_output_index());
         let decl = self.tool_kinds.get(&flat_name);
         let (name, namespace, kind) = match decl {
             Some(d) => (d.name.clone(), d.namespace.clone(), d.kind),
@@ -1812,7 +1858,7 @@ impl ResponsesStreamContext {
             }
             DeclaredToolKind::Function => {
                 let mut item = json!({
-                    "type": "function_call", "id": new_fc_id(),
+                    "type": "function_call", "id": live.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(new_fc_id),
                     "call_id": call_id, "name": name, "arguments": arguments,
                     "status": "completed",
                 });
@@ -1833,7 +1879,7 @@ impl ResponsesStreamContext {
             }
         };
         let item_id = item["id"].as_str().unwrap_or("").to_string();
-        self.output.push(item.clone());
+        self.output.insert(output_index, item.clone());
         let mut delta_payload = json!({
             "item_id": item_id,
             "output_index": output_index,
@@ -1844,18 +1890,24 @@ impl ResponsesStreamContext {
             "output_index": output_index,
         });
         done_payload[done_key] = json!(value);
-        vec![
-            self.emit(
+        let mut events = Vec::new();
+        if live.is_none() {
+            events.push(self.emit(
                 "response.output_item.added",
                 json!({ "output_index": output_index, "item": added }),
-            ),
-            self.emit(delta_event, delta_payload),
+            ));
+        }
+        if live.is_none() || empty {
+            events.push(self.emit(delta_event, delta_payload));
+        }
+        events.extend([
             self.emit(done_event, done_payload),
             self.emit(
                 "response.output_item.done",
                 json!({ "output_index": output_index, "item": item }),
             ),
-        ]
+        ]);
+        events
     }
 
     fn finish_web_search(
@@ -1868,7 +1920,7 @@ impl ResponsesStreamContext {
             "type": "web_search_call", "id": item_id, "status": "completed",
             "action": { "type": "search", "query": query },
         });
-        self.output.push(item.clone());
+        self.output.insert(output_index, item.clone());
         vec![self.emit(
             "response.output_item.done",
             json!({ "output_index": output_index, "item": item }),
@@ -1933,14 +1985,16 @@ impl ResponsesStreamContext {
             "created_at": self.created_at,
             "status": status,
             "model": self.model,
-            "output": self.output,
+            "output": self.output.values().collect::<Vec<_>>(),
             "usage": self.usage(),
             "parallel_tool_calls": self.response_config.parallel_tool_calls,
             "tool_choice": self.response_config.tool_choice,
             "tools": self.response_config.tools,
         });
         if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+            response["incomplete_details"] = json!({
+                "reason": if self.stop_reason.as_deref() == Some("refusal") { "content_filter" } else { "max_output_tokens" }
+            });
         }
         // 回显字段与 store 无关（对齐非流式路径：previous_response_id 恒写含 null，
         // metadata 有才写），store=false 的流式终态对象也不再丢字段。
@@ -1958,9 +2012,19 @@ impl ResponsesStreamContext {
         if !self.saw_message_stop {
             return vec![self.fail("server_error", "upstream stream ended before message_stop")];
         }
+        if self
+            .blocks
+            .values()
+            .any(|block| matches!(block, StreamingBlock::Tool { .. }))
+        {
+            return vec![self.fail(
+                "server_error",
+                "upstream ended before completing tool arguments; discard the partial calls",
+            )];
+        }
         let incomplete = matches!(
             self.stop_reason.as_deref(),
-            Some("max_tokens" | "model_context_window_exceeded")
+            Some("max_tokens" | "model_context_window_exceeded" | "refusal")
         );
         let status = if incomplete {
             "incomplete"
@@ -3487,6 +3551,56 @@ mod tests {
     }
 
     #[test]
+    fn parallel_function_fragments_are_live_and_final_output_follows_allocated_indexes() {
+        let mut kinds = ToolKindMap::new();
+        kinds.insert(
+            "ns__tool".into(),
+            DeclaredTool {
+                kind: DeclaredToolKind::Function,
+                name: "tool".into(),
+                namespace: Some("ns".into()),
+            },
+        );
+        let mut context =
+            ResponsesStreamContext::new("test".into(), kinds, ResponsesResponseConfig::default());
+        for (index, id) in [(0, "a"), (1, "b")] {
+            let added = feed_event(
+                &mut context,
+                "content_block_start",
+                json!({"index":index,"content_block":{"type":"tool_use","id":id,"name":"ns__tool"}}),
+            );
+            assert!(
+                added.contains("response.output_item.added")
+                    && added.contains("\"namespace\":\"ns\"")
+            );
+        }
+        for (index, fragment) in [(0, "{\"x\":"), (1, "{}"), (0, "1}")] {
+            let delta = feed_event(
+                &mut context,
+                "content_block_delta",
+                json!({"index":index,"delta":{"type":"input_json_delta","partial_json":fragment}}),
+            );
+            assert!(
+                delta.contains("response.function_call_arguments.delta")
+                    && !delta.contains(".done")
+            );
+        }
+        for index in [1, 0] {
+            let done = feed_event(&mut context, "content_block_stop", json!({"index":index}));
+            assert!(done.contains("response.function_call_arguments.done"));
+            assert!(
+                !done.contains("response.output_item.added")
+                    && !done.contains("response.function_call_arguments.delta")
+            );
+        }
+        let output = context.response_object("completed");
+        assert_eq!(output["output"][0]["call_id"], "a");
+        assert_eq!(output["output"][0]["arguments"], "{\"x\":1}");
+        assert_eq!(output["output"][1]["call_id"], "b");
+        assert_eq!(output["output"][1]["arguments"], "{}");
+    }
+
+    #[test]
     fn streaming_error_maps_to_failed_without_completed() {
         let mut context = ResponsesStreamContext::new(
             "gpt-5.6-sol".into(),
@@ -3552,7 +3666,7 @@ mod tests {
         assert!(sse.contains("event: response.reasoning_summary_text.done"));
         assert!(sse.contains("search reasoning"));
         assert_eq!(context.output.len(), 1);
-        assert_eq!(context.output[0]["type"], json!("reasoning"));
+        assert_eq!(context.output[&0]["type"], json!("reasoning"));
     }
 
     #[test]
@@ -3851,6 +3965,77 @@ mod tests {
             load_owned_response(&resp_id, 7).is_none(),
             "store=false 的响应不得入库"
         );
+    }
+
+    #[test]
+    fn non_stream_refusal_maps_to_content_filter_incomplete() {
+        let parsed = parse_anthropic_message(
+            &json!({
+                "content": [{"type":"thinking","thinking":"reasoning"}],
+                "stop_reason":"refusal","usage":{"input_tokens":3,"output_tokens":11}
+            }),
+            "test-model",
+        );
+        let object = build_responses_object(&parsed, &ToolKindMap::new());
+        assert_eq!(object["status"], "incomplete");
+        assert_eq!(object["incomplete_details"]["reason"], "content_filter");
+        let sse = build_responses_sse(&parsed, &ToolKindMap::new());
+        assert!(sse.contains("event: response.incomplete"));
+        assert!(!sse.contains("event: response.completed"));
+        assert!(sse.contains(r#""reason":"content_filter""#));
+    }
+
+    #[tokio::test]
+    async fn streaming_refusal_preserves_incomplete_status_and_store_controls() {
+        for store in [false, true] {
+            let sse = concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+                "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":11}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            );
+            let response = responses_streaming_response(
+                Body::from(sse),
+                "test-model".into(),
+                ToolKindMap::new(),
+                ResponsesResponseConfig::default(),
+                StreamStorePlan {
+                    enabled: store,
+                    owner_key_id: 7,
+                    input_items: Vec::new(),
+                },
+                Some("resp_previous".into()),
+                Some(json!({"test":true})),
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let output = String::from_utf8(bytes.to_vec()).unwrap();
+            let terminal = output
+                .split("\n\n")
+                .find(|frame| frame.starts_with("event: response.incomplete"))
+                .unwrap();
+            let data = terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let data: Value = serde_json::from_str(data).unwrap();
+            let response = &data["response"];
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], "content_filter");
+            assert_eq!(response["previous_response_id"], "resp_previous");
+            assert_eq!(response["metadata"], json!({"test":true}));
+            assert_eq!(response["usage"]["output_tokens"], 11);
+            assert!(!output.contains("event: response.completed"));
+            let stored = load_owned_response(response["id"].as_str().unwrap(), 7);
+            assert_eq!(stored.is_some(), store);
+            if let Some(stored) = stored {
+                assert_eq!(stored.response["status"], "incomplete");
+                assert_eq!(
+                    stored.response["incomplete_details"]["reason"],
+                    "content_filter"
+                );
+            }
+        }
     }
 
     #[test]

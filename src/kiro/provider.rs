@@ -14,9 +14,9 @@ use tokio::time::sleep;
 use crate::admin::proxy_pool::{ProxyInFlightGuard, ProxyPoolManager};
 use crate::admin::trace_db::{TraceAttempt, TraceSink, TraceStage, outcome, truncate_snippet};
 use crate::anthropic::converter::normalize_model_id;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client_with_timeouts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::{UnsupportedModelError, UpstreamRateLimitError};
+use crate::kiro::error::{UnsupportedModelError, UpstreamRateLimitError, UpstreamTimeoutError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -297,8 +297,15 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+        let config = token_manager.config();
+        let initial_client = build_client_with_timeouts(
+            proxy.as_ref(),
+            config.upstream_request_timeout_secs,
+            tls_backend,
+            config.upstream_connect_timeout_secs,
+            config.upstream_read_timeout_secs,
+        )
+        .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
@@ -322,7 +329,14 @@ impl KiroProvider {
         if let Some(client) = cache.get(&proxy) {
             return Ok(client);
         }
-        let client = build_client(proxy.as_ref(), 720, self.tls_backend)?;
+        let config = self.token_manager.config();
+        let client = build_client_with_timeouts(
+            proxy.as_ref(),
+            config.upstream_request_timeout_secs,
+            self.tls_backend,
+            config.upstream_connect_timeout_secs,
+            config.upstream_read_timeout_secs,
+        )?;
         cache.insert(proxy, client.clone());
         Ok(client)
     }
@@ -424,6 +438,7 @@ impl KiroProvider {
         config: &crate::model::config::Config,
         request_body: &str,
         proxy: Option<ProxyConfig>,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<reqwest::Response> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
@@ -438,12 +453,14 @@ impl KiroProvider {
         tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
         tracing::debug!("实际发送请求体: {}", body);
 
-        let base = self
+        let mut base = self
             .client_for_proxy(proxy.clone())?
             .post(&url)
             .body(body)
-            .header("content-type", endpoint.content_type())
-            .header("Connection", "close");
+            .header("content-type", endpoint.content_type());
+        if let Some(deadline) = deadline {
+            base = base.timeout(deadline.saturating_duration_since(Instant::now()));
+        }
         let request = endpoint.decorate_api(base, &rctx);
 
         // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -465,6 +482,7 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<ProxyAttemptResult> {
         let candidates = self.proxy_candidates_for(ctx.id, &ctx.credentials);
         let candidate_count = candidates.len();
@@ -489,6 +507,7 @@ impl KiroProvider {
                     config,
                     request_body,
                     proxy.clone(),
+                    deadline,
                 )
                 .await
             {
@@ -538,6 +557,7 @@ impl KiroProvider {
         machine_id: &str,
         config: &crate::model::config::Config,
         request_body: &str,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<reqwest::Response> {
         let rctx = RequestContext {
             credentials: &ctx.credentials,
@@ -561,12 +581,14 @@ impl KiroProvider {
                     proxy.as_ref().map(|p| p.url.as_str()).unwrap_or("direct")
                 );
             }
-            let base = self
+            let mut base = self
                 .client_for_proxy(proxy.clone())?
                 .post(&url)
                 .body(body.clone())
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
+            if let Some(deadline) = deadline {
+                base = base.timeout(deadline.saturating_duration_since(Instant::now()));
+            }
             let request = endpoint.decorate_mcp(base, &rctx);
             match request.send().await {
                 Ok(response) => {
@@ -849,6 +871,8 @@ impl KiroProvider {
                 &machine_id,
                 config,
                 &request_body,
+                (config.upstream_request_timeout_secs > 0)
+                    .then(|| started + Duration::from_secs(config.upstream_request_timeout_secs)),
             )
             .await
         {
@@ -894,6 +918,48 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+    ) -> anyhow::Result<McpCallResult> {
+        let started = Instant::now();
+        let config = self.token_manager.config();
+        let deadline = (config.upstream_request_timeout_secs > 0)
+            .then(|| started + Duration::from_secs(config.upstream_request_timeout_secs));
+        let budget = deadline.map(|end| end.duration_since(started)).map_or(
+            Duration::from_secs(config.upstream_first_response_timeout_secs),
+            |total| {
+                total.min(Duration::from_secs(
+                    config.upstream_first_response_timeout_secs,
+                ))
+            },
+        );
+        match tokio::time::timeout(
+            budget,
+            self.call_mcp_with_retry_inner(request_body, sink, group, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                Self::emit_attempt(
+                    sink,
+                    0,
+                    0,
+                    "",
+                    None,
+                    outcome::NETWORK_ERROR,
+                    Some("upstream response deadline exceeded"),
+                    started,
+                );
+                Err(UpstreamTimeoutError.into())
+            }
+        }
+    }
+
+    async fn call_mcp_with_retry_inner(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.available_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
@@ -989,6 +1055,7 @@ impl KiroProvider {
                     &machine_id,
                     config,
                     request_body,
+                    deadline,
                 )
                 .await
             {
@@ -1260,6 +1327,49 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
+        let started = Instant::now();
+        let config = self.token_manager.config();
+        let deadline = (config.upstream_request_timeout_secs > 0)
+            .then(|| started + Duration::from_secs(config.upstream_request_timeout_secs));
+        let budget = deadline.map(|end| end.duration_since(started)).map_or(
+            Duration::from_secs(config.upstream_first_response_timeout_secs),
+            |total| {
+                total.min(Duration::from_secs(
+                    config.upstream_first_response_timeout_secs,
+                ))
+            },
+        );
+        match tokio::time::timeout(
+            budget,
+            self.call_api_with_retry_inner(request_body, is_stream, sink, group, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                Self::emit_attempt(
+                    sink,
+                    0,
+                    0,
+                    "",
+                    None,
+                    outcome::NETWORK_ERROR,
+                    Some("upstream response deadline exceeded"),
+                    started,
+                );
+                Err(UpstreamTimeoutError.into())
+            }
+        }
+    }
+
+    async fn call_api_with_retry_inner(
+        &self,
+        request_body: &str,
+        is_stream: bool,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的「可用」账号数计算（排除 disabled/throttled），
         // 避免删除/禁用凭据后仍按历史峰值获得过多无效重试（首字延迟阶梯增长的一环）。
         let total_credentials = self.token_manager.available_count_in_group(group).max(1);
@@ -1357,6 +1467,7 @@ impl KiroProvider {
                     &machine_id,
                     config,
                     request_body,
+                    deadline,
                 )
                 .await
             {
@@ -1676,6 +1787,7 @@ impl KiroProvider {
                             config,
                             request_body,
                             selected_proxy.clone(),
+                            deadline,
                         )
                         .await
                     {

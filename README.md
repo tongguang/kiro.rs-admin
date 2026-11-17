@@ -291,6 +291,10 @@ Admin API 鉴权同样支持：
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
+| `upstreamConnectTimeoutSecs` | `15` | Kiro API / MCP 建连（含 TLS 握手）超时，秒 |
+| `upstreamFirstResponseTimeoutSecs` | `120` | 响应头前整条调用链预算，包含凭据获取、代理/端点切换与重试退避，秒 |
+| `upstreamReadTimeoutSecs` | `120` | 等待响应头及相邻上游读取的静默超时，秒；本地 SSE ping 不会重置，原生 thinking 等上游字节会重置 |
+| `upstreamRequestTimeoutSecs` | `0` | 单次 API / MCP 调用从开始重试到读完正文的总时限，秒；`0` 关闭，持续输出不再受旧的 720 秒硬截止限制 |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority`、`balanced` 或 `least_conn` |
@@ -307,6 +311,10 @@ Admin API 鉴权同样支持：
 | `countTokensApiUrl` | 无 | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | 无 | 外部 count_tokens API Key |
 | `countTokensAuthType` | `x-api-key` | `x-api-key` 或 `bearer` |
+
+`/v1/messages` 和 `/cc/v1/messages` 均实时输出。`message_start` 的输入用量是估算值，最终 `message_delta` 优先使用上游 `metadataEvent.tokenUsage`。无需参数改写的工具增量转发 JSON 分片；内置映射工具、Responses custom 工具的 JSON envelope 仍在完整校验后还原输出。网页搜索混合工具路径也会增量输出客户端工具参数，但整轮被接受前不会关闭工具块。
+
+显式 `thinking.type=disabled` 或 OpenAI `reasoning.effort=none` 时，不输出原生或旧标签形式的推理正文，模型名的 `-thinking` 后缀不会覆盖显式关闭。隐藏推理仍计入用量。
 
 <a id="credentials"></a>
 ## 🔐 凭据

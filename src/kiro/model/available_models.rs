@@ -2,8 +2,8 @@
 //!
 //! 包含 ListAvailableModels API 的响应类型定义。
 //!
-//! 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
-//! 返回该凭据（按订阅等级）当前真实可用的模型列表。
+//! 上游接口：管理域名下的 `GET /ListAvailableModels?origin=AI_EDITOR`。
+//! 返回该凭据当前真实可用的模型列表。
 
 use serde::Deserialize;
 
@@ -12,7 +12,7 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 pub struct ListAvailableModelsResponse {
     /// 可用模型列表
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_vec")]
     pub models: Vec<UpstreamModel>,
 }
 

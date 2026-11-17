@@ -10,7 +10,7 @@
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
 //!
 //! ## Claude Code 兼容端点 (/cc/v1)
-//! - `POST /cc/v1/messages` - 创建消息（流式响应会等待 contextUsageEvent 后再发送 message_start，确保 input_tokens 准确）
+//! - `POST /cc/v1/messages` - 创建消息（实时输出，最终用量优先采用上游精确快照）
 //! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
 //!
 //! # 使用示例
@@ -28,6 +28,8 @@ pub(crate) mod handlers;
 pub(crate) mod middleware;
 mod router;
 pub mod stream;
+#[cfg(test)]
+mod test_support;
 pub mod types;
 mod websearch;
 mod websearch_loop;

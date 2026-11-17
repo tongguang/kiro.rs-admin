@@ -68,6 +68,20 @@ impl TokenUsage {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Refusal {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StopDetails {
+    #[serde(default)]
+    pub refusal: Option<Refusal>,
+}
+
 /// `metadataEvent` payload。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +89,86 @@ pub struct MetadataEvent {
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub stop_details: Option<StopDetails>,
+}
+
+impl MetadataEvent {
+    pub fn content_filter_refusal(&self) -> Option<String> {
+        if !self
+            .stop_reason
+            .as_deref()?
+            .eq_ignore_ascii_case("CONTENT_FILTERED")
+        {
+            return None;
+        }
+        let refusal = self
+            .stop_details
+            .as_ref()
+            .and_then(|details| details.refusal.as_ref());
+        Some(
+            match (
+                refusal.and_then(|r| r.category.as_deref()),
+                refusal.and_then(|r| r.explanation.as_deref()),
+            ) {
+                (Some(category), Some(explanation)) => format!("{category}: {explanation}"),
+                (Some(category), None) => category.to_string(),
+                (None, Some(explanation)) => explanation.to_string(),
+                (None, None) => "CONTENT_FILTERED".to_string(),
+            },
+        )
+    }
+}
+
+/// 原生结束原因优先于本地推断；拒答一经观察到就不能被后续事件覆盖。
+#[derive(Debug, Default)]
+pub struct StopReason {
+    value: Option<String>,
+    native: bool,
+}
+
+impl StopReason {
+    pub fn observe_metadata(&mut self, metadata: &MetadataEvent) {
+        if self.get() == Some("refusal") {
+            return;
+        }
+        let reason = match metadata
+            .stop_reason
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            Some("CONTENT_FILTERED" | "REFUSAL") => "refusal",
+            Some("MAX_TOKENS") => "max_tokens",
+            Some("END_TURN") => "end_turn",
+            Some("STOP_SEQUENCE") => "stop_sequence",
+            Some("TOOL_USE") => "tool_use",
+            _ => return,
+        };
+        if metadata.content_filter_refusal().is_some() {
+            // 不把上游说明（可能包含用户内容）写入日志。
+            tracing::warn!("上游内容过滤拒答");
+        }
+        self.value = Some(reason.to_string());
+        self.native = true;
+    }
+
+    pub fn set_fallback(&mut self, reason: impl Into<String>) {
+        if !self.native && self.get() != Some("refusal") {
+            self.value = Some(reason.into());
+        }
+    }
+
+    pub fn get(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    pub fn resolve(&self, has_tool_use: bool) -> &str {
+        self.get()
+            .unwrap_or(if has_tool_use { "tool_use" } else { "end_turn" })
+    }
 }
 
 impl EventPayload for MetadataEvent {
@@ -86,6 +180,30 @@ impl EventPayload for MetadataEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_filter_details_and_stop_priority() {
+        let metadata: MetadataEvent = serde_json::from_str(r#"{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"cannot continue"}}}"#).unwrap();
+        assert_eq!(
+            metadata.content_filter_refusal().as_deref(),
+            Some("CYBER: cannot continue")
+        );
+        let mut reason = StopReason::default();
+        reason.set_fallback("model_context_window_exceeded");
+        reason.observe_metadata(&MetadataEvent {
+            stop_reason: Some("end_turn".into()),
+            ..Default::default()
+        });
+        reason.set_fallback("max_tokens");
+        assert_eq!(reason.resolve(false), "end_turn");
+        reason.observe_metadata(&metadata);
+        reason.observe_metadata(&MetadataEvent {
+            stop_reason: Some("MAX_TOKENS".into()),
+            ..Default::default()
+        });
+        reason.set_fallback("model_context_window_exceeded");
+        assert_eq!(reason.resolve(true), "refusal");
+    }
 
     #[test]
     fn parses_official_token_usage_shape() {

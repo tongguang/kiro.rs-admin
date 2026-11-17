@@ -110,7 +110,25 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, None)
+    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, None, None, None)
+}
+
+/// 数据面客户端：总时限可关闭，连接和每次读取分别限时。
+pub fn build_client_with_timeouts(
+    proxy: Option<&ProxyConfig>,
+    total_secs: u64,
+    tls_backend: TlsBackend,
+    connect_secs: u64,
+    read_secs: u64,
+) -> anyhow::Result<Client> {
+    build_client_with_redirect_policy(
+        proxy,
+        total_secs,
+        tls_backend,
+        None,
+        Some(Duration::from_secs(connect_secs)),
+        Some(Duration::from_secs(read_secs)),
+    )
 }
 
 pub fn build_client_no_redirect(
@@ -118,7 +136,14 @@ pub fn build_client_no_redirect(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    build_client_with_redirect_policy(proxy, timeout_secs, tls_backend, Some(Policy::none()))
+    build_client_with_redirect_policy(
+        proxy,
+        timeout_secs,
+        tls_backend,
+        Some(Policy::none()),
+        None,
+        None,
+    )
 }
 
 fn build_client_with_redirect_policy(
@@ -126,8 +151,19 @@ fn build_client_with_redirect_policy(
     timeout_secs: u64,
     tls_backend: TlsBackend,
     redirect_policy: Option<Policy>,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder();
+    if timeout_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    }
+    if let Some(timeout) = connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    if let Some(timeout) = read_timeout {
+        builder = builder.read_timeout(timeout);
+    }
     if let Some(policy) = redirect_policy {
         builder = builder.redirect(policy);
     }
@@ -169,6 +205,136 @@ fn build_client_with_redirect_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn split_timeouts_cover_tls_handshake_and_response_headers() {
+        for tls_stall in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "{}://{}/",
+                if tls_stall { "https" } else { "http" },
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                futures::future::pending::<()>().await;
+                drop(socket);
+            });
+            let short = Duration::from_millis(100);
+            let long = Duration::from_secs(5);
+            let client = build_client_with_redirect_policy(
+                None,
+                0,
+                TlsBackend::Rustls,
+                None,
+                Some(if tls_stall { short } else { long }),
+                Some(if tls_stall { long } else { short }),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let error = tokio::time::timeout(Duration::from_secs(2), client.get(url).send())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.is_timeout(), "{error}");
+            assert!(started.elapsed() < Duration::from_millis(800));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn active_upstream_bytes_reset_idle_timeout_with_total_disabled() {
+        use axum::{Router, body::Body, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(futures::stream::unfold(0, |i| async move {
+                    if i == 15 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"x")),
+                        i + 1,
+                    ))
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = build_client_with_redirect_policy(
+            None,
+            0,
+            TlsBackend::Rustls,
+            None,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let bytes = client.get(url).send().await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.len(), 15);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "active body must outlive the idle threshold"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_ticks_do_not_reset_upstream_read_timeout() {
+        use axum::{Router, body::Body, routing::get};
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Body::from_stream(
+                    futures::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"x"))
+                    })
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = build_client_with_redirect_policy(
+            None,
+            0,
+            TlsBackend::Rustls,
+            None,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let mut body = client.get(url).send().await.unwrap().bytes_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), "x");
+        let mut ticks = tokio::time::interval(Duration::from_millis(10));
+        let mut count = 0;
+        let error = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = ticks.tick() => { count += 1; }
+                    chunk = body.next() => { break chunk.unwrap().unwrap_err(); }
+                }
+            }
+        })
+        .await
+        .expect("local keepalives must not prolong the upstream read");
+        assert!(error.is_timeout());
+        assert!(
+            count >= 5,
+            "several local keepalives must fire during the same read"
+        );
+        server.abort();
+    }
 
     #[test]
     fn test_proxy_config_new() {

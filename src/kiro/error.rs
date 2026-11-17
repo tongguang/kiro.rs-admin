@@ -1,5 +1,9 @@
 //! Shared typed errors for Kiro upstream calls.
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Upstream response timed out")]
+pub struct UpstreamTimeoutError;
+
 /// The upstream still returned HTTP 429 after any applicable failover/retry.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("upstream rate limited")]

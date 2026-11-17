@@ -31,12 +31,18 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+#[cfg(test)]
+use super::stream::BufferedStreamContext;
+use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
 };
 use super::websearch;
+
+#[cfg(test)]
+#[path = "handler_regression_tests.rs"]
+mod round_two_tests;
 
 /// 请求结束时记录用量的钩子
 ///
@@ -102,7 +108,7 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
+        if status == "success" {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,
@@ -410,6 +416,24 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if err
+        .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
+        .is_some()
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        })
+    {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorResponse::new(
+                "timeout_error",
+                "Upstream response timed out.",
+            )),
+        )
+            .into_response();
+    }
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
@@ -885,6 +909,7 @@ pub async fn post_messages(
     // 在把 payload 移入延迟计量闭包之前，先取出后续仍需的标量字段。
     let is_stream = payload.stream;
     let model = payload.model.clone();
+    let suppress_thinking = payload.thinking_explicitly_disabled();
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -940,6 +965,7 @@ pub async fn post_messages(
             &model,
             compute_metering,
             thinking_enabled,
+            suppress_thinking,
             tool_name_map,
             known_tool_names,
             hook,
@@ -956,6 +982,7 @@ pub async fn post_messages(
             &model,
             compute_metering,
             extract_thinking,
+            suppress_thinking,
             tool_name_map,
             known_tool_names,
             hook,
@@ -975,6 +1002,7 @@ async fn handle_stream_request(
     // token 估算 + CacheMeter 查写坐在首字关键路径上。
     compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
     thinking_enabled: bool,
+    suppress_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
@@ -1019,6 +1047,9 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
+    if suppress_thinking {
+        ctx.suppress_thinking();
+    }
     ctx.cache_usage = cache_usage;
     // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
     ctx.context_window_size = provider
@@ -1251,7 +1282,7 @@ fn create_sse_stream(
                             // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并补发
                             // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
                             let final_events = ctx.generate_error_events(
-                                "upstream_error",
+                                if e.is_timeout() { "timeout_error" } else { "upstream_error" },
                                 "Upstream response stream was interrupted",
                             );
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
@@ -1273,7 +1304,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if let Some(message) = ctx.tool_json_error_message().or_else(|| ctx.tool_stream_refusal_message().map(str::to_owned)) {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 settlement.finish_from_ctx(
@@ -1335,6 +1366,7 @@ async fn handle_non_stream_request(
     // 延迟计量：上游返回后才求值，不阻塞响应（见 handle_stream_request 同款说明）。
     compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
     thinking_enabled: bool,
+    suppress_thinking: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
@@ -1385,14 +1417,7 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
+            return map_provider_error(e.into());
         }
     };
 
@@ -1408,7 +1433,7 @@ async fn handle_non_stream_request(
     let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
-    let mut stop_reason = "end_turn".to_string();
+    let mut stop_reason = crate::kiro::model::events::StopReason::default();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
@@ -1475,7 +1500,7 @@ async fn handle_non_stream_request(
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
+                                stop_reason.set_fallback("model_context_window_exceeded");
                             }
                             tracing::debug!(
                                 "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
@@ -1488,6 +1513,7 @@ async fn handle_non_stream_request(
                             if let Some(usage) = metadata.token_usage {
                                 provider_token_usage = Some(usage);
                             }
+                            stop_reason.observe_metadata(&metadata);
                         }
                         Event::Metering(metering) => {
                             // 上游只下发 credit；token / cache 字段不存在
@@ -1497,7 +1523,7 @@ async fn handle_non_stream_request(
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
+                                stop_reason.set_fallback("max_tokens");
                             }
                         }
                         _ => {}
@@ -1510,13 +1536,23 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
-    // finish() 返回 IncompleteJson。已有错误则保持不变。
-    if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    // 恢复缺失 stop 的空参数调用；已有 JSON 错误优先。
+    if stop_reason.get() == Some("refusal") {
+        tool_json_error = None;
+        tool_uses.clear();
+    } else if tool_json_error.is_none() {
+        match tool_accumulator.finish(&tool_name_map) {
+            Ok(recovered) => {
+                for completed in recovered {
+                    has_tool_use = true;
+                    tool_uses.push(completed.to_anthropic_block());
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}", e);
+                tool_json_error = Some(e);
+            }
+        }
     }
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
@@ -1573,16 +1609,14 @@ async fn handle_non_stream_request(
     }
 
     // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
-    }
+    let stop_reason = stop_reason.resolve(has_tool_use);
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
     // 构建响应内容
     let mut content = build_non_stream_content(
-        thinking_enabled,
+        thinking_enabled || suppress_thinking,
         text_content,
         native_thinking,
         native_thinking_signature,
@@ -1592,6 +1626,24 @@ async fn handle_non_stream_request(
 
     // 估算输出 tokens（metadataEvent 缺失时的兜底口径）
     let estimated_output_tokens = token::estimate_output_tokens(&content);
+    if suppress_thinking {
+        content.retain_mut(|block| {
+            if matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            ) {
+                return false;
+            }
+            if let Some(text) = block["text"].as_str() {
+                let text = super::stream::strip_thinking_from_text(text);
+                if text.is_empty() {
+                    return false;
+                }
+                block["text"] = json!(text);
+            }
+            true
+        });
+    }
 
     // 精确 provider 快照（metadataEvent.tokenUsage）优先；缺失时才用
     // contextUsage/输入估算 + 本地 CacheMeter 分摊（与流式 resolved_usage 同语义）
@@ -1736,6 +1788,9 @@ fn build_non_stream_content(
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+    if payload.thinking_explicitly_disabled() {
+        return;
+    }
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
@@ -1791,9 +1846,8 @@ pub async fn count_tokens(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// Claude Code 兼容端点，流式请求与 /v1/messages 共用实时输出路径。
+/// message_start 使用估算用量；最终 message_delta 优先采用上游精确快照。
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
@@ -1945,6 +1999,7 @@ pub async fn post_messages_cc(
     // 在把 payload 移入延迟计量闭包之前，先取出后续仍需的标量字段。
     let is_stream = payload.stream;
     let model = payload.model.clone();
+    let suppress_thinking = payload.thinking_explicitly_disabled();
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1988,16 +2043,17 @@ pub async fn post_messages_cc(
     tracer.mark_stage("serialize", stage_serialize_ms);
 
     if is_stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
+        // CC 同样实时输出；message_start 使用估算用量，最终 message_delta 保留精确快照。
+        handle_stream_request(
             provider,
             &request_body,
             &model,
+            compute_metering,
             thinking_enabled,
+            suppress_thinking,
             tool_name_map,
             known_tool_names,
             hook,
-            compute_metering,
             tracer,
             key_ctx.group.clone(),
         )
@@ -2011,6 +2067,7 @@ pub async fn post_messages_cc(
             &model,
             compute_metering,
             extract_thinking,
+            suppress_thinking,
             tool_name_map,
             known_tool_names,
             hook,
@@ -2021,79 +2078,6 @@ pub async fn post_messages_cc(
     }
 }
 
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
-    // 延迟计量：上游返回后才求值，不阻塞首字（详见 handle_stream_request 说明）。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
-    tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let (fallback_input_tokens, _) = compute_metering();
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 上游已返回：此刻求值计量，不阻塞首字。
-    let stage_metering_start = Instant::now();
-    let (fallback_input_tokens, cache_usage) = compute_metering();
-    tracer.mark_stage("metering", stage_metering_start.elapsed());
-
-    // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(
-        model,
-        fallback_input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
-    ctx.set_cache_usage(cache_usage);
-    // 上下文窗口优先取本次命中凭据的上游模型列表缓存（按订阅等级），未命中回落硬编码表
-    ctx.set_context_window_size(
-        provider
-            .token_manager()
-            .context_window_for_credential(credential_id, model),
-    );
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
 /// 创建缓冲 SSE 事件流
 ///
 /// 工作流程：
@@ -2101,6 +2085,7 @@ async fn handle_stream_request_buffered(
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
+#[cfg(test)]
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
@@ -2543,6 +2528,29 @@ mod tests {
     }
 
     #[test]
+    fn personal_use_regression_system_key_usage() {
+        let manager = std::sync::Arc::new(crate::admin::ClientKeyManager::new());
+        manager.ensure_system_key("default".into(), None, "test-key".into());
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: Some(manager.clone()),
+            key_id: 0,
+            model: "test-model".into(),
+            started_at: Instant::now(),
+        };
+        hook.record(1, 10, 20, 30, 40, 0.5, "success");
+        hook.record(1, 100, 200, 300, 400, 5.0, "error");
+        let key = manager.list().into_iter().find(|key| key.id == 0).unwrap();
+        assert_eq!((key.total_input_tokens, key.total_output_tokens), (10, 20));
+        assert_eq!(
+            (key.total_cache_creation_tokens, key.total_cache_read_tokens),
+            (30, 40)
+        );
+        assert_eq!(key.total_credits, 0.5);
+    }
+
+    #[test]
     fn non_stream_usage_prefers_sanitized_provider_snapshot() {
         let fallback_cache = super::super::cache_metering::CacheUsage {
             cache_read: 25,
@@ -2707,6 +2715,179 @@ mod tests {
         let message_crc = crc32(&buf);
         buf.extend_from_slice(&message_crc.to_be_bytes());
         Bytes::from(buf)
+    }
+
+    #[tokio::test]
+    async fn non_stream_native_stops_and_noarg_tools_keep_precise_usage() {
+        use super::super::test_support::{event_stream, loopback_provider};
+        let metadata_usage = json!({"uncachedInputTokens":3,"outputTokens":11,"cacheReadInputTokens":7,"cacheWriteInputTokens":4});
+        for (reason, input, stop, expected, has_tool) in [
+            (None, "", false, "tool_use", true),
+            (Some("MAX_TOKENS"), "", false, "max_tokens", true),
+            (Some("END_TURN"), "", false, "end_turn", true),
+            (Some("STOP_SEQUENCE"), "", false, "stop_sequence", true),
+            (Some("CONTENT_FILTERED"), "", false, "refusal", false),
+            (
+                Some("CONTENT_FILTERED"),
+                "{\"broken\":",
+                false,
+                "refusal",
+                false,
+            ),
+            (Some("CONTENT_FILTERED"), "{bad", true, "refusal", false),
+            (Some("CONTENT_FILTERED"), "{}", true, "refusal", false),
+        ] {
+            let body = event_stream(&[
+                (
+                    "toolUseEvent",
+                    json!({"toolUseId":"t1","name":"short_tool","input":input,"stop":stop}),
+                ),
+                (
+                    "metadataEvent",
+                    json!({"stopReason":reason,"tokenUsage":metadata_usage}),
+                ),
+                ("metadataEvent", json!({})),
+                (
+                    "contextUsageEvent",
+                    json!({"contextUsagePercentage": if reason.is_some() {100.0} else {1.0}}),
+                ),
+            ]);
+            let (provider, server) = loopback_provider(body).await;
+            let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+            let response = handle_non_stream_request(
+                provider, r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"claude-sonnet-4.5"}}}}"#,
+                "claude-sonnet-4.5", || (100, Default::default()), false, false,
+                std::collections::HashMap::from([("short_tool".into(), "original_tool".into())]),
+                Default::default(), test_hook(&aggregator),
+                std::sync::Arc::new(RequestTracer::noop("test-model")), None,
+            ).await;
+            server.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{expected}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["stop_reason"], expected);
+            let tools: Vec<_> = response["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect();
+            assert_eq!(tools.len(), usize::from(has_tool));
+            if has_tool {
+                assert_eq!(tools[0]["name"], "original_tool");
+                assert_eq!(tools[0]["input"], json!({}));
+            }
+            assert_eq!(response["usage"]["input_tokens"], 3);
+            assert_eq!(response["usage"]["output_tokens"], 11);
+            assert_eq!(response["usage"]["cache_read_input_tokens"], 7);
+            assert_eq!(response["usage"]["cache_creation_input_tokens"], 4);
+            let usage = aggregator.overview();
+            assert_eq!(
+                (
+                    usage.today_calls,
+                    usage.today_errors,
+                    usage.today_input_tokens,
+                    usage.today_output_tokens
+                ),
+                (1, 0, 3, 11)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn message_streams_recover_noarg_and_propagate_refusal() {
+        use super::super::test_support::event_stream;
+        for buffered in [false, true] {
+            for refused in [false, true] {
+                let body = event_stream(&[
+                    (
+                        "toolUseEvent",
+                        json!({"toolUseId":"t1","name":"read_file","input": if refused {"{\"x\":"} else {""}, "stop":false}),
+                    ),
+                    (
+                        "metadataEvent",
+                        json!({"stopReason": if refused {Some("CONTENT_FILTERED")} else {None}, "tokenUsage":{"uncachedInputTokens":3,"outputTokens":11,"cacheReadInputTokens":7,"cacheWriteInputTokens":4}}),
+                    ),
+                    (
+                        "contextUsageEvent",
+                        json!({"contextUsagePercentage": if refused {100.0} else {1.0}}),
+                    ),
+                ]);
+                let chunks: Vec<_> = body
+                    .chunks(13)
+                    .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                let response: reqwest::Response =
+                    http::Response::new(reqwest::Body::wrap_stream(stream::iter(chunks))).into();
+                let aggregator =
+                    std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+                let tracer = std::sync::Arc::new(RequestTracer::noop("test-model"));
+                let sse: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> =
+                    if buffered {
+                        let ctx = BufferedStreamContext::new(
+                            "test-model",
+                            100,
+                            true,
+                            std::collections::HashMap::from([("read_file".into(), "Read".into())]),
+                            Default::default(),
+                        );
+                        Box::pin(create_buffered_sse_stream(
+                            response,
+                            ctx,
+                            test_hook(&aggregator),
+                            7,
+                            tracer,
+                        ))
+                    } else {
+                        let mut ctx = StreamContext::new_with_thinking(
+                            "test-model",
+                            100,
+                            true,
+                            std::collections::HashMap::from([("read_file".into(), "Read".into())]),
+                            Default::default(),
+                        );
+                        let initial = ctx.generate_initial_events();
+                        Box::pin(create_sse_stream(
+                            response,
+                            ctx,
+                            initial,
+                            test_hook(&aggregator),
+                            7,
+                            tracer,
+                        ))
+                    };
+                let output = tokio::time::timeout(Duration::from_secs(5), sse.collect::<Vec<_>>())
+                    .await
+                    .unwrap();
+                let output: String = output
+                    .into_iter()
+                    .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+                    .collect();
+                assert!(output.contains("event: message_stop"));
+                assert!(!output.contains("event: error"), "{output}");
+                assert!(
+                    output.contains(if refused {
+                        r#""stop_reason":"refusal""#
+                    } else {
+                        r#""stop_reason":"tool_use""#
+                    }),
+                    "{output}"
+                );
+                assert_eq!(output.contains(r#""name":"Read""#), !refused);
+                let usage = aggregator.overview();
+                assert_eq!(
+                    (
+                        usage.today_calls,
+                        usage.today_errors,
+                        usage.today_input_tokens,
+                        usage.today_output_tokens
+                    ),
+                    (1, 0, 3, 11)
+                );
+            }
+        }
     }
 
     fn test_hook(

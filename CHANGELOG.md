@@ -8,6 +8,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 > 本阶段包含上游 v0.8.0 分阶段合并（阶段一~三）及 review 修复：动态模型发现与 profileArn 回退、Responses API 全量移植、web_search loop 与 stream.rs 换上游、RPM 原子预留与受控自愈、断流 error 终态、Responses 协议契约对齐等。以下为用户可感知的行为变更。
 
+### 修复 — 个人使用场景的上游兼容
+
+- `runtime` / `runtime_cli` 的模型列表、用量、Profile 与偏好请求改用 `management.{region}.kiro.dev`；其他端点保留 AWS 管理地址，区域、ARN、代理回退规则不变。管理接口的 `null` 数组按空列表解析。
+- 默认系统 Key 正常累计成功请求的 token、缓存与 credit 用量，不再排除 ID 0。
+- Opus 权限以账号实际模型列表为准，不再按 FREE 订阅名称拦截；分组、禁用、限流和 RPM 约束仍有效。
+- Claude Code `Read.pages` 历史回放时丢弃不支持的分页字段。缺少结束标记的空参数工具恢复为 `{}`，非空截断参数仍报错，工具指纹与入参还原规则不变。
+- 保留上游原生结束原因；仅有 thinking 不再伪造 token 耗尽或补空格。内容过滤拒答优先于后续上下文推断，并传播为 Anthropic `refusal`、Chat `content_filter`、Responses `incomplete/content_filter`；拒答后不恢复待执行工具或继续搜索。
+
+### 改进 — 工具增量、上游超时与显式关闭推理
+
+- 无需字段改写的工具参数通过 Anthropic、CC、Chat、Responses function 入口增量输出；网页搜索混合工具也支持。需要完整对象才能还原的内置映射工具与 Responses custom 工具仍缓冲校验，不更改默认兼容模式或 schema 指纹。
+- 工具参数非法、截断或被拒答中断时，保留异常终态且不关闭未验证工具块，避免客户端误执行；参数分片估算不随拆分粒度放大，Responses 并行工具的最终输出按分配索引排列。
+- CC 不再等待整段响应完成，初始用量采用估算值，最终精确 metadata 用量与断连恰好一次记账保留。
+- API / MCP 启用 HTTP 连接复用。默认连接 15 秒、响应头前整条重试链 120 秒、读取静默 120 秒；可选总时限覆盖重试与正文，默认 `0` 关闭旧的 720 秒硬截止。本地 ping 不影响上游静默计时，开始输出后不会重放请求。
+- 显式关闭 thinking（含 OpenAI effort=none）时，不再将推理正文降级成普通文本，也不透传搜索路径的推理扩展；`-thinking` 后缀不再覆盖关闭设置。精确用量与隐藏推理估算仍保留。
+
 ### 🔧 修复 — ClaudeCode 模式内置工具 schema 指纹
 
 - **全部 8 个内置工具按 schema 指纹再劫持**：除已有的 Edit（`old_string`/`new_string` 与 `old_str`/`new_str`）外，Write / Bash / Read / Glob / Grep / LS / WebSearch 也必须带 Claude Code 规范键才映射为 Kiro 内置；指纹不匹配则原样透传并打 warn。历史 `tool_use` 跟随同一次请求的劫持决策。

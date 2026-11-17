@@ -759,6 +759,20 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     }
 }
 
+/// 显式关闭时丢弃推理标签正文，未闭合的推理也不能降级成普通文本。
+pub(crate) fn strip_thinking_from_text(text: &str) -> String {
+    let mut remaining = text.to_string();
+    while let Some(start) = find_real_thinking_start_tag(&remaining) {
+        let (_, stripped) = extract_thinking_from_complete_text(&remaining);
+        if stripped == remaining {
+            remaining.truncate(start);
+            break;
+        }
+        remaining = stripped;
+    }
+    remaining
+}
+
 /// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列，
 /// 把混在文本里的字面 `<invoke name="...">...</invoke>` 工具调用捞回成结构化 `tool_use`。
 ///
@@ -936,7 +950,7 @@ impl ToolJsonAccumulatorError {
                 name,
                 bytes,
             } => format!(
-                "Upstream ended before completing tool_use {} ({}) JSON input; buffered {} bytes. The tool call was not forwarded to the client.",
+                "Upstream ended before completing tool_use {} ({}) JSON input; received {} bytes. Discard any streamed arguments; the tool call must not be executed.",
                 tool_use_id, name, bytes
             ),
         }
@@ -954,9 +968,8 @@ impl std::error::Error for ToolJsonAccumulatorError {}
 /// 工具调用参数（JSON）累积器。
 ///
 /// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
-/// 带 `stop=true`。分片可能切在 JSON 的任意字节位置（甚至 token 中间），因此
-/// **不能**逐片当作 `input_json_delta` 直接转发——必须按 `tool_use_id` 累积，
-/// 只在收到 `stop=true` 时整体解析，成功后一次性发出完整的工具调用。
+/// 带 `stop=true`。按 tool_use_id 累积以校验完整 JSON；不需改写参数的工具
+/// 同时增量输出原始分片，只有校验成功后才关闭工具块。
 #[derive(Debug, Default)]
 pub struct ToolJsonAccumulator {
     /// tool_use_id -> (工具名, 已累积的 JSON 分片)
@@ -972,7 +985,7 @@ impl ToolJsonAccumulator {
 
     /// 累积一个 `toolUseEvent` 分片。
     ///
-    /// - 未收到 `stop` 时返回 `Ok(None)`（继续缓冲，不发出任何事件）。
+    /// - 未收到 `stop` 时返回 `Ok(None)`，调用方可同时转发原始分片。
     /// - 收到 `stop` 时把累积的 JSON 整体解析：成功返回 `Ok(Some(CompletedToolUse))`，
     ///   失败返回 `Err(InvalidJson)`。空参数按 `{}` 处理。
     /// - 工具名按 `tool_name_map` 还原为客户端原始名（短名 → 原名）。
@@ -1019,23 +1032,31 @@ impl ToolJsonAccumulator {
         )))
     }
 
-    /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
-    /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
-    pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
-        if let Some((tool_use_id, (name, input))) = self
-            .buffers
-            .iter()
+    /// 仅恢复缺失 stop 的空参数调用；非空参数仍视为截断，不能猜测为完整调用。
+    pub fn finish(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Result<Vec<CompletedToolUse>, ToolJsonAccumulatorError> {
+        let (mut empty, incomplete): (Vec<_>, Vec<_>) = std::mem::take(&mut self.buffers)
+            .into_iter()
+            .partition(|(_, (_, input))| input.trim().is_empty());
+        if let Some((tool_use_id, (name, input))) = incomplete
+            .into_iter()
             .max_by_key(|(_, (_, input))| input.len())
-            .map(|(id, (name, input))| (id.clone(), (name.clone(), input.clone())))
         {
-            self.buffers.remove(&tool_use_id);
             return Err(ToolJsonAccumulatorError::IncompleteJson {
                 tool_use_id,
                 name,
                 bytes: input.len(),
             });
         }
-        Ok(())
+        empty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Ok(empty
+            .into_iter()
+            .map(|(id, (name, _))| {
+                CompletedToolUse::from_kiro(id, &name, serde_json::json!({}), tool_name_map)
+            })
+            .collect())
     }
 }
 
@@ -1102,7 +1123,7 @@ pub struct SseStateManager {
     /// 下一个块索引
     next_block_index: i32,
     /// 当前 stop_reason
-    stop_reason: Option<String>,
+    stop_reason: crate::kiro::model::events::StopReason,
     /// 是否有工具调用
     has_tool_use: bool,
 }
@@ -1121,7 +1142,7 @@ impl SseStateManager {
             active_blocks: HashMap::new(),
             message_ended: false,
             next_block_index: 0,
-            stop_reason: None,
+            stop_reason: Default::default(),
             has_tool_use: false,
         }
     }
@@ -1147,25 +1168,12 @@ impl SseStateManager {
 
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
-    }
-
-    /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
-    fn has_non_thinking_blocks(&self) -> bool {
-        self.active_blocks
-            .values()
-            .any(|b| b.block_type != "thinking")
+        self.stop_reason.set_fallback(reason);
     }
 
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
-        if let Some(ref reason) = self.stop_reason {
-            reason.clone()
-        } else if self.has_tool_use {
-            "tool_use".to_string()
-        } else {
-            "end_turn".to_string()
-        }
+        self.stop_reason.resolve(self.has_tool_use).to_string()
     }
 
     /// 处理 message_start 事件
@@ -1342,7 +1350,8 @@ impl SseStateManager {
         let mut events = Vec::new();
 
         for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
+            // 未校验通过的工具块不能关闭，否则客户端可能执行半截参数。
+            if block.started && !block.stopped && block.block_type != "tool_use" {
                 events.push(SseEvent::new(
                     "content_block_stop",
                     json!({
@@ -1390,6 +1399,7 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    tool_input_character_counts: HashMap<i32, (i32, i32)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// 本次请求声明的所有工具名（原始 client 名）。`<invoke>` 文本容错的灾难兜底：
@@ -1404,6 +1414,7 @@ pub struct StreamContext {
     pub fence_scan_partial: String,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    thinking_suppressed: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// invoke 文本嗅探缓冲区（用于从明文流里嗅探字面 `<invoke>` 工具调用块）
@@ -1445,6 +1456,7 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    tool_stream_refused: bool,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
     /// 上游 Kiro 错误帧 (error_code, error_message)。一旦收到，收尾必须以 error
@@ -1453,6 +1465,31 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
+    pub fn suppress_thinking(&mut self) {
+        // 仍走同一解析器并计量，只在 SSE 出口隐藏推理块。
+        self.thinking_enabled = true;
+        self.thinking_suppressed = true;
+    }
+
+    fn visible_events(&self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        if !self.thinking_suppressed {
+            return events;
+        }
+        events
+            .into_iter()
+            .filter(|event| {
+                !event.data["index"].as_i64().is_some_and(|index| {
+                    self.state_manager
+                        .active_blocks
+                        .get(&(index as i32))
+                        .is_some_and(|block| {
+                            matches!(block.block_type.as_str(), "thinking" | "redacted_thinking")
+                        })
+                })
+            })
+            .collect()
+    }
+
     /// 解析 Anthropic 口径的 `(uncached_input, cache_write, cache_read)`。
     ///
     /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
@@ -1483,6 +1520,12 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    pub fn tool_stream_refusal_message(&self) -> Option<&'static str> {
+        self.tool_stream_refused.then_some(
+            "Upstream refusal interrupted an incomplete tool call; discard its streamed arguments.",
+        )
     }
 
     /// 是否收到过上游 Kiro 错误帧。收到后收尾走 error 终态，记账记 error。
@@ -1516,11 +1559,13 @@ impl StreamContext {
             provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_character_counts: HashMap::new(),
             tool_name_map,
             known_tool_names,
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
+            thinking_suppressed: false,
             thinking_buffer: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
@@ -1537,6 +1582,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            tool_stream_refused: false,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             upstream_error: None,
         }
@@ -1605,7 +1651,7 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
-        match event {
+        let events = match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
@@ -1623,6 +1669,7 @@ impl StreamContext {
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
                 }
+                self.state_manager.stop_reason.observe_metadata(metadata);
                 Vec::new()
             }
             Event::ContextUsage(context_usage) => {
@@ -1679,7 +1726,8 @@ impl StreamContext {
                 Vec::new()
             }
             _ => Vec::new(),
-        }
+        };
+        self.visible_events(events)
     }
 
     /// 处理助手响应事件
@@ -1721,7 +1769,7 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block && !self.thinking_extracted {
+            if !self.in_thinking_block && (!self.thinking_extracted || self.thinking_suppressed) {
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
                 if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
                     // 发送 <thinking> 之前的内容作为 text_delta
@@ -2325,18 +2373,24 @@ impl StreamContext {
     /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
     fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        self.state_manager.set_has_tool_use(true);
+        if self.state_manager.get_stop_reason() == "refusal" {
+            return Vec::new();
+        }
+        let (block_index, mut events) = self.start_tool_use(&completed.id, &completed.name);
+        events.extend(self.emit_tool_input_fragment(block_index, &completed.input.to_string()));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+        events
+    }
 
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices.insert(completed.id.clone(), idx);
-            idx
-        };
-
-        events.extend(self.state_manager.handle_content_block_start(
+    fn start_tool_use(&mut self, id: &str, name: &str) -> (i32, Vec<SseEvent>) {
+        if let Some(&index) = self.tool_block_indices.get(id) {
+            return (index, Vec::new());
+        }
+        let block_index = self.state_manager.next_block_index();
+        self.tool_block_indices.insert(id.to_string(), block_index);
+        let events = self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
             json!({
@@ -2344,34 +2398,46 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": completed.id,
-                    "name": completed.name,
+                    "id": id,
+                    "name": name,
                     "input": {}
                 }
             }),
-        ));
+        );
+        (block_index, events)
+    }
 
-        // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
-        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-            block_index,
-            json!({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": serde_json::to_string(&completed.input).unwrap_or_else(|_| "{}".to_string())
-                }
-            }),
-        ) {
-            events.push(delta_event);
+    fn emit_tool_input_fragment(&mut self, block_index: i32, input: &str) -> Vec<SseEvent> {
+        if input.is_empty() {
+            return Vec::new();
         }
-
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-            events.push(stop_event);
-        }
-
-        events
+        let counts = self
+            .tool_input_character_counts
+            .entry(block_index)
+            .or_default();
+        let previous = if *counts == (0, 0) {
+            0
+        } else {
+            estimate_character_tokens(counts.0, counts.1)
+        };
+        let (chinese, other) = count_token_characters(input);
+        counts.0 += chinese;
+        counts.1 += other;
+        self.output_tokens += estimate_character_tokens(counts.0, counts.1) - previous;
+        self.state_manager
+            .handle_content_block_delta(
+                block_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": input
+                    }
+                }),
+            )
+            .into_iter()
+            .collect()
     }
 
     /// 处理工具使用事件
@@ -2380,6 +2446,9 @@ impl StreamContext {
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if self.state_manager.get_stop_reason() == "refusal" || self.tool_json_error.is_some() {
+            return events;
+        }
 
         self.state_manager.set_has_tool_use(true);
 
@@ -2441,15 +2510,30 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
-        // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
-        // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
+        let pending = self
+            .tool_json_accumulator
+            .buffers
+            .get(&tool_use.tool_use_id);
+        let kiro_name = pending
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&tool_use.name)
+            .to_string();
+        let stream_input = !kiro_name.is_empty()
+            && !super::converter::tool_input_needs_rewrite(&kiro_name, &self.tool_name_map);
+        let empty_input = pending.is_none_or(|(_, input)| input.trim().is_empty())
+            && tool_use.input.trim().is_empty();
+        let buffered_prefix =
+            if stream_input && !self.tool_block_indices.contains_key(&tool_use.tool_use_id) {
+                pending.map(|(_, input)| input.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
         let completed = match self
             .tool_json_accumulator
             .push(tool_use, &self.tool_name_map)
         {
-            Ok(Some(completed)) => completed,
-            Ok(None) => return events,
+            Ok(completed) => completed,
             Err(e) => {
                 tracing::error!("{}", e);
                 self.tool_json_error = Some(e);
@@ -2458,8 +2542,27 @@ impl StreamContext {
             }
         };
 
-        // 统一发出（与 <invoke> 文本捞回路径共用同一发出口）。
-        events.extend(self.emit_completed_tool_use(completed));
+        if stream_input && (!empty_input || completed.is_some()) {
+            let client_name = self
+                .tool_name_map
+                .get(&kiro_name)
+                .unwrap_or(&kiro_name)
+                .clone();
+            let (index, start_events) = self.start_tool_use(&tool_use.tool_use_id, &client_name);
+            events.extend(start_events);
+            events.extend(self.emit_tool_input_fragment(index, &buffered_prefix));
+            events.extend(self.emit_tool_input_fragment(index, &tool_use.input));
+            if completed.is_some() {
+                if empty_input {
+                    events.extend(self.emit_tool_input_fragment(index, "{}"));
+                }
+                if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
+                    events.push(stop);
+                }
+            }
+        } else if let Some(completed) = completed {
+            events.extend(self.emit_completed_tool_use(completed));
+        }
         events
     }
 
@@ -2554,31 +2657,41 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
-        }
-
         // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
         // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
         if !self.invoke_sniff_buffer.is_empty() {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
-        // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
-        // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none()
-            && let Err(e) = self.tool_json_accumulator.finish()
-        {
-            tracing::error!("{}", e);
-            self.tool_json_error = Some(e);
-            self.state_manager.set_stop_reason("error");
+        if self.state_manager.get_stop_reason() == "refusal" {
+            // 拒答可能截断工具参数；不能恢复为可执行调用，也不能伪装成 JSON 错误。
+            self.tool_json_error = None;
+            self.tool_json_accumulator = ToolJsonAccumulator::new();
+            if self
+                .tool_block_indices
+                .values()
+                .any(|index| self.state_manager.is_block_open_of_type(*index, "tool_use"))
+            {
+                self.tool_stream_refused = true;
+                events.extend(self.generate_error_events(
+                    "permission_error",
+                    self.tool_stream_refusal_message().unwrap(),
+                ));
+                return self.visible_events(events);
+            }
+        } else if self.tool_json_error.is_none() {
+            match self.tool_json_accumulator.finish(&self.tool_name_map) {
+                Ok(recovered) => {
+                    for completed in recovered {
+                        events.extend(self.emit_completed_tool_use(completed));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("{}", e);
+                    self.tool_json_error = Some(e);
+                    self.state_manager.set_stop_reason("error");
+                }
+            }
         }
 
         // 工具调用 JSON 错误必须直接以异常终态结束，不能先发送正常的
@@ -2587,7 +2700,7 @@ impl StreamContext {
             let error_type = err.error_type();
             let message = err.message();
             events.extend(self.generate_error_events(error_type, &message));
-            return events;
+            return self.visible_events(events);
         }
 
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
@@ -2603,7 +2716,7 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
-        events
+        self.visible_events(events)
     }
 
     /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
@@ -2616,7 +2729,7 @@ impl StreamContext {
             self.state_manager
                 .generate_error_events(error_type, message),
         );
-        events
+        self.visible_events(events)
     }
 }
 
@@ -2630,6 +2743,7 @@ impl StreamContext {
 /// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
 /// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
 /// 4. 一次性返回所有事件
+#[cfg(test)]
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
     inner: StreamContext,
@@ -2639,6 +2753,7 @@ pub struct BufferedStreamContext {
     initial_events_generated: bool,
 }
 
+#[cfg(test)]
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
     pub fn new(
@@ -2660,16 +2775,6 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             initial_events_generated: false,
         }
-    }
-
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
-    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
-        self.inner.cache_usage = cache_usage;
-    }
-
-    /// 覆盖上下文窗口大小（handler 用 manager 解析出的上游缓存值注入）。
-    pub fn set_context_window_size(&mut self, size: i32) {
-        self.inner.context_window_size = size;
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -2776,19 +2881,26 @@ impl BufferedStreamContext {
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
+    let (chinese, other) = count_token_characters(text);
+    estimate_character_tokens(chinese, other)
+}
+
+fn count_token_characters(text: &str) -> (i32, i32) {
     let mut chinese_count = 0;
     let mut other_count = 0;
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
             chinese_count += 1;
         } else {
             other_count += 1;
         }
     }
 
-    // 中文约 1.5 字符/token，英文约 4 字符/token
+    (chinese_count, other_count)
+}
+
+fn estimate_character_tokens(chinese_count: i32, other_count: i32) -> i32 {
     let chinese_tokens = (chinese_count * 2 + 2) / 3;
     let other_tokens = (other_count + 3) / 4;
 
@@ -2841,6 +2953,71 @@ mod tests {
     }
 
     #[test]
+    fn personal_use_regression_noarg_tool_without_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false)));
+        let events = ctx.generate_final_events();
+        assert!(!events.iter().any(|event| event.event == "error"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "content_block_start"
+                    && event.data["content_block"]["name"] == "list_apps")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["partial_json"] == "{}")
+        );
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn thinking_suppression_hides_truncated_and_repeated_legacy_blocks_but_keeps_literals_and_usage()
+     {
+        for text in [
+            "<thinking>SECRET_TRUNCATED",
+            "<thinking>SECRET_ONE</thinking>\n\nanswer<thinking>SECRET_TWO</thinking>\n\nend",
+            "literal `<thinking>` is documentation",
+        ] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test",
+                1,
+                false,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            ctx.suppress_thinking();
+            let mut events = ctx.generate_initial_events();
+            for character in text.chars() {
+                events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                    serde_json::from_value(json!({"content":character.to_string()})).unwrap(),
+                )));
+            }
+            events.extend(ctx.generate_final_events());
+            let output: String = events.iter().map(SseEvent::to_sse_string).collect();
+            assert!(!output.contains("SECRET_"), "{output}");
+            assert!(!output.contains("thinking_delta") && !output.contains("signature_delta"));
+            assert!(ctx.output_tokens > 0);
+            if text.starts_with("literal") {
+                assert_eq!(collect_text_content(&events), text);
+            }
+        }
+        assert_eq!(strip_thinking_from_text("<thinking>SECRET"), "");
+        assert_eq!(
+            strip_thinking_from_text("literal `<thinking>`"),
+            "literal `<thinking>`"
+        );
+    }
+
+    #[test]
     fn tool_json_accumulator_empty_input_is_empty_object() {
         let mut acc = ToolJsonAccumulator::new();
         let completed = acc
@@ -2848,6 +3025,131 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(completed.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn noarg_recovery_is_sorted_restored_and_atomic_on_truncation() {
+        let map = HashMap::from([("short_tool".into(), "original_tool".into())]);
+        let mut accumulator = ToolJsonAccumulator::new();
+        for id in ["z", "a"] {
+            accumulator
+                .push(&tool_evt(id, "short_tool", " \n", false), &map)
+                .unwrap();
+        }
+        let recovered = accumulator.finish(&map).unwrap();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "z"]
+        );
+        assert!(
+            recovered
+                .iter()
+                .all(|tool| tool.name == "original_tool" && tool.input == json!({}))
+        );
+        assert!(accumulator.finish(&map).unwrap().is_empty());
+        accumulator
+            .push(&tool_evt("empty", "short_tool", "", false), &map)
+            .unwrap();
+        accumulator
+            .push(&tool_evt("partial", "short_tool", "{\"x\":", false), &map)
+            .unwrap();
+        assert!(
+            matches!(accumulator.finish(&map), Err(ToolJsonAccumulatorError::IncompleteJson { tool_use_id, .. }) if tool_use_id == "partial")
+        );
+        assert!(
+            accumulator.finish(&map).unwrap().is_empty(),
+            "failure must drain all pending calls"
+        );
+    }
+
+    #[test]
+    fn native_stop_reasons_beat_inference_in_either_order() {
+        use crate::kiro::model::events::{ContextUsageEvent, MetadataEvent};
+        for (native, expected) in [
+            ("MAX_TOKENS", "max_tokens"),
+            ("END_TURN", "end_turn"),
+            ("STOP_SEQUENCE", "stop_sequence"),
+            ("CONTENT_FILTERED", "refusal"),
+        ] {
+            for context_first in [false, true] {
+                let mut ctx = StreamContext::new_with_thinking(
+                    "test-model",
+                    1,
+                    true,
+                    HashMap::new(),
+                    test_known_tools(),
+                );
+                let mut events = ctx.generate_initial_events();
+                events
+                    .extend(ctx.process_assistant_response("<thinking>reasoning only</thinking>"));
+                let context = Event::ContextUsage(ContextUsageEvent {
+                    context_usage_percentage: 100.0,
+                });
+                if context_first {
+                    events.extend(ctx.process_kiro_event(&context));
+                }
+                let metadata: MetadataEvent = serde_json::from_value(json!({"stopReason": native, "tokenUsage":{"uncachedInputTokens":3,"outputTokens":11,"cacheReadInputTokens":7,"cacheWriteInputTokens":4}})).unwrap();
+                events.extend(ctx.process_kiro_event(&Event::Metadata(metadata)));
+                if !context_first {
+                    events.extend(ctx.process_kiro_event(&context));
+                }
+                events.extend(ctx.process_kiro_event(&Event::Exception {
+                    exception_type: "ContentLengthExceededException".into(),
+                    message: "limit".into(),
+                }));
+                events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent::default())));
+                events.extend(ctx.generate_final_events());
+                let delta = events
+                    .iter()
+                    .find(|event| event.event == "message_delta")
+                    .unwrap();
+                assert_eq!(delta.data["delta"]["stop_reason"], expected);
+                assert_eq!(delta.data["usage"]["output_tokens"], 11);
+                assert_eq!(ctx.resolved_usage(), (3, 4, 7));
+                assert_eq!(collect_text_content(&events), "");
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_is_sticky_and_discards_pending_tools() {
+        use crate::kiro::model::events::MetadataEvent;
+        for (input, stop) in [("", false), ("{\"x\":", false), ("{bad", true)] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test-model",
+                1,
+                false,
+                HashMap::from([("read_file".into(), "Read".into())]),
+                test_known_tools(),
+            );
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+                "t1",
+                "read_file",
+                input,
+                stop,
+            ))));
+            let refusal = serde_json::from_value(json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"cannot continue"}}})).unwrap();
+            events.extend(ctx.process_kiro_event(&Event::Metadata(refusal)));
+            events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+                stop_reason: Some("END_TURN".into()),
+                ..Default::default()
+            })));
+            events.extend(
+                ctx.process_kiro_event(&Event::ToolUse(tool_evt("t2", "tool_b", "{}", true))),
+            );
+            events.extend(ctx.generate_final_events());
+            assert!(!events.iter().any(|event| event.event == "error"));
+            assert!(collect_tool_uses(&events).is_empty());
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.data["delta"]["stop_reason"] == "refusal")
+            );
+        }
     }
 
     #[test]
@@ -2875,13 +3177,13 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let err = acc.finish().unwrap_err();
+        let err = acc.finish(&HashMap::new()).unwrap_err();
         assert!(matches!(
             err,
             ToolJsonAccumulatorError::IncompleteJson { .. }
         ));
         // 已取出残留后再 finish() 应成功。
-        assert!(acc.finish().is_ok());
+        assert!(acc.finish(&HashMap::new()).unwrap().is_empty());
     }
 
     #[test]
@@ -2900,7 +3202,22 @@ mod tests {
             "{\"path\":\"/a",
             false,
         )));
-        assert!(emitted.is_empty(), "partial tool JSON must remain buffered");
+        let index = emitted
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "tool_use")
+            .unwrap()
+            .data["index"]
+            .clone();
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event.data["delta"]["partial_json"] == "{\"path\":\"/a")
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| event.event == "content_block_stop" && event.data["index"] == index)
+        );
 
         let final_events = ctx.generate_final_events();
         assert_eq!(final_events.last().unwrap().event, "error");
@@ -2913,6 +3230,149 @@ mod tests {
                 .iter()
                 .all(|event| event.event != "message_delta" && event.event != "message_stop")
         );
+        assert!(
+            !final_events
+                .iter()
+                .any(|event| event.event == "content_block_stop" && event.data["index"] == index)
+        );
+    }
+
+    #[test]
+    fn raw_tool_fragments_preserve_bytes_names_parallelism_and_token_estimate() {
+        let input = "{\"text\":\"你好\\nworld\", \"x\": 123}";
+        for fragments in [
+            vec![input.to_string()],
+            input.chars().map(|c| c.to_string()).collect(),
+        ] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test",
+                1,
+                false,
+                HashMap::from([("short".into(), "original_long_tool_name".into())]),
+                test_known_tools(),
+            );
+            let _ = ctx.generate_initial_events();
+            let mut events = Vec::new();
+            for (i, fragment) in fragments.iter().enumerate() {
+                let batch = ctx.process_tool_use(&tool_evt(
+                    "a",
+                    if i == 0 { "short" } else { "" },
+                    fragment,
+                    false,
+                ));
+                assert!(
+                    batch
+                        .iter()
+                        .any(|event| event.data["delta"]["partial_json"] == *fragment),
+                    "each fragment must be live"
+                );
+                events.extend(batch);
+                if i == 0 {
+                    events.extend(ctx.process_tool_use(&tool_evt("b", "other_tool", "{}", true)));
+                }
+            }
+            events.extend(ctx.process_tool_use(&tool_evt("a", "", "", true)));
+            let index = events
+                .iter()
+                .find(|event| event.data["content_block"]["id"] == "a")
+                .unwrap()
+                .data["index"]
+                .clone();
+            let joined: String = events
+                .iter()
+                .filter(|event| event.data["index"] == index)
+                .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+                .collect();
+            assert_eq!(joined, input);
+            assert_eq!(events.iter().filter(|event| event.data["content_block"]["name"] == "original_long_tool_name").count(), 1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |event| event.event == "content_block_stop" && event.data["index"] == index
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(
+                ctx.output_tokens,
+                estimate_tokens(input) + estimate_tokens("{}")
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_tools_wait_for_restoration_and_late_names_replay_prefix_once() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test",
+            1,
+            false,
+            HashMap::from([("read_file".into(), "Read".into())]),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        assert!(
+            ctx.process_tool_use(&tool_evt("a", "read_file", "{\"path\":\"a\",", false))
+                .is_empty()
+        );
+        let events =
+            ctx.process_tool_use(&tool_evt("a", "", "\"start_line\":3,\"end_line\":5}", true));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["content_block"]["name"] == "Read")
+        );
+        let input = events
+            .iter()
+            .find_map(|event| event.data["delta"]["partial_json"].as_str())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(input).unwrap(),
+            json!({"file_path":"a","offset":3,"limit":3})
+        );
+        assert!(
+            ctx.process_tool_use(&tool_evt("b", "", "{\"x\":", false))
+                .is_empty()
+        );
+        let events = ctx.process_tool_use(&tool_evt("b", "custom", "1}", true));
+        let input: String = events
+            .iter()
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(input, "{\"x\":1}");
+    }
+
+    #[test]
+    fn partial_tool_refusal_or_invalid_completion_never_closes_tool_block() {
+        for refused in [false, true] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test",
+                1,
+                false,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            let _ = ctx.generate_initial_events();
+            let mut events = ctx.process_tool_use(&tool_evt("a", "custom", "{\"x\":", false));
+            let index = events
+                .iter()
+                .find(|event| event.data["content_block"]["type"] == "tool_use")
+                .unwrap()
+                .data["index"]
+                .clone();
+            if refused {
+                ctx.process_kiro_event(&Event::Metadata(
+                    serde_json::from_value(json!({"stopReason":"CONTENT_FILTERED"})).unwrap(),
+                ));
+            } else {
+                events.extend(ctx.process_tool_use(&tool_evt("a", "", "bad}", true)));
+            }
+            events.extend(ctx.generate_final_events());
+            assert_eq!(events.last().unwrap().event, "error");
+            assert!(!events.iter().any(|event| event.event == "message_stop"
+                || (event.event == "content_block_stop" && event.data["index"] == index)));
+            assert_eq!(ctx.tool_stream_refusal_message().is_some(), refused);
+        }
     }
 
     #[test]
@@ -4592,8 +5052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+    fn test_thinking_only_ends_without_fabricated_text_or_token_limit() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4613,43 +5072,10 @@ mod tests {
             .expect("should have message_delta event");
 
         assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
+            message_delta.data["delta"]["stop_reason"], "end_turn",
+            "thinking alone does not prove token exhaustion"
         );
-
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
-            }),
-            "should emit text content_block_start"
-        );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
-            .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
-            })
-            .expect("text block should exist");
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
-        );
+        assert_eq!(collect_text_content(&all_events), "");
     }
 
     #[test]
@@ -5490,8 +5916,9 @@ mod tests {
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
             }),
+            ..Default::default()
         }));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent::default()));
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         assert_eq!(ctx.resolved_output_tokens(), 11);
 
@@ -5502,6 +5929,7 @@ mod tests {
                 cache_read_input_tokens: 23,
                 cache_write_input_tokens: 24,
             }),
+            ..Default::default()
         }));
         assert_eq!(ctx.resolved_usage(), (0, 24, 23));
         assert_eq!(ctx.resolved_output_tokens(), 22);
@@ -5549,6 +5977,7 @@ mod tests {
         );
         ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
+            ..Default::default()
         }));
         let events = ctx.finish_and_get_all_events();
 
@@ -5588,6 +6017,7 @@ mod tests {
         );
         ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
+            ..Default::default()
         }));
         // 上游中途断流：必须以 error 终态收尾，不能回放 message_stop
         // 让客户端把截断内容误判为 completed

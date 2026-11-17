@@ -241,9 +241,6 @@ where
 }
 
 struct ToolStreamAcc {
-    id: String,
-    name: String,
-    args: String,
     index: usize,
 }
 
@@ -329,22 +326,23 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
                     self.tools.insert(
                         block_index,
                         ToolStreamAcc {
-                            id: data
-                                .pointer("/content_block/id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: data
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            args: String::new(),
                             index: self.next_tool_index,
                         },
                     );
                     self.next_tool_index += 1;
                     self.saw_tool_calls = true;
+                    let mut out = self.ensure_role();
+                    out.push(self.chunk(
+                        json!({"tool_calls":[{
+                            "index": self.next_tool_index - 1,
+                            "id": data["content_block"]["id"],
+                            "type":"function",
+                            "function":{"name":data["content_block"]["name"],"arguments":""}
+                        }]}),
+                        None,
+                        None,
+                    ));
+                    return out;
                 }
                 Vec::new()
             }
@@ -367,11 +365,17 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
                     }
                     Some("input_json_delta") => {
                         let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                        if let Some(tool) = self.tools.get_mut(&index)
+                        if let Some(tool) = self.tools.get(&index)
                             && let Some(delta) =
                                 data.pointer("/delta/partial_json").and_then(Value::as_str)
                         {
-                            tool.args.push_str(delta);
+                            out.push(self.chunk(
+                                json!({"tool_calls":[{
+                                    "index":tool.index,"function":{"arguments":delta}
+                                }]}),
+                                None,
+                                None,
+                            ));
                         }
                     }
                     _ => {}
@@ -380,26 +384,8 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
             }
             "content_block_stop" => {
                 let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                let Some(tool) = self.tools.remove(&index) else {
-                    return Vec::new();
-                };
-                let mut out = self.ensure_role();
-                out.push(self.chunk(
-                    json!({
-                        "tool_calls": [{
-                            "index": tool.index,
-                            "id": tool.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "arguments": tool.args,
-                            }
-                        }]
-                    }),
-                    None,
-                    None,
-                ));
-                out
+                self.tools.remove(&index);
+                Vec::new()
             }
             "message_delta" => {
                 self.stop_reason = data
@@ -418,6 +404,11 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
     fn finish(&mut self) -> Vec<Bytes> {
         if self.done {
             return Vec::new();
+        }
+        if !self.tools.is_empty() {
+            return self.abort(
+                "upstream ended before completing tool arguments; discard the partial calls",
+            );
         }
         self.done = true;
         let mut out = self.ensure_role();
@@ -550,6 +541,30 @@ mod tests {
             }
         }
         chunks
+    }
+
+    #[test]
+    fn chat_stream_refusal_is_content_filter_even_after_tool_call() {
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"noop\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":11}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let chunks = run_chat_translator(sse, true);
+        let finish = chunks
+            .iter()
+            .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+            .unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "content_filter");
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk["usage"]["completion_tokens"] == 11)
+        );
+        assert_eq!(chunks.last(), Some(&Value::Null));
     }
 
     #[test]
@@ -777,8 +792,7 @@ mod tests {
         assert!(chunks.iter().all(|c| c["usage"].is_null()));
     }
 
-    /// chat completions 流式：tool_use。验证 content_block_stop 时一次性发出
-    /// 完整 tool_calls delta（index/id/function.name/arguments），
+    /// chat completions 流式：工具头与参数分片分别输出，
     /// finish_reason=tool_calls，且 include_usage 时末尾 chunk 带 OpenAI 口径 usage。
     #[test]
     fn chat_stream_emits_tool_calls_and_usage() {
@@ -793,7 +807,7 @@ mod tests {
 
         let chunks = run_chat_translator(upstream, true);
 
-        // tool_calls delta：一次性带全量 id/name/arguments
+        // 第一帧只含工具头，后续 arguments 分片按 index 拼接。
         let tool_delta = chunks
             .iter()
             .find(|c| c["choices"][0]["delta"].get("tool_calls").is_some())
@@ -802,7 +816,14 @@ mod tests {
         assert_eq!(call["index"], json!(0));
         assert_eq!(call["id"], "toolu_1");
         assert_eq!(call["function"]["name"], "get_weather");
-        assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(call["function"]["arguments"], "");
+        let arguments: String = chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(arguments, "{\"city\":\"Paris\"}");
 
         // finish_reason 映射为 tool_calls
         let finish = chunks

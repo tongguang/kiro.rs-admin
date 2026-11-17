@@ -136,6 +136,18 @@ pub struct MessagesRequest {
     pub force_web_search_loop: bool,
 }
 
+impl MessagesRequest {
+    pub(crate) fn thinking_explicitly_disabled(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "disabled")
+            || self
+                .output_config
+                .as_ref()
+                .is_some_and(|config| config.effort.eq_ignore_ascii_case("none"))
+    }
+}
+
 /// 反序列化 system 字段，支持字符串或数组格式
 fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessage>>, D::Error>
 where

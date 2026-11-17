@@ -614,6 +614,17 @@ fn profile_arn_query(profile_arn: Option<&str>) -> String {
     }
 }
 
+fn management_api_host(credentials: &KiroCredentials, config: &Config, region: &str) -> String {
+    match credentials
+        .endpoint
+        .as_deref()
+        .unwrap_or(&config.default_endpoint)
+    {
+        "runtime" | "runtime_cli" => format!("management.{region}.kiro.dev"),
+        _ => format!("q.{region}.amazonaws.com"),
+    }
+}
+
 /// 用量类 REST 请求是否回退到下一候选（形态/区域）。
 ///
 /// 403 恒回退（Enterprise / IdC 账号强制 profileArn 的已知拒绝形态）；带 ARN 的
@@ -684,8 +695,8 @@ pub(crate) async fn get_usage_limits(
 
 /// 获取该凭据当前可用的模型列表
 ///
-/// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
-/// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
+/// 上游接口：管理域名下的 `GET /ListAvailableModels?origin=AI_EDITOR`。
+/// 模型权限以该凭据返回的实际列表为准，不从订阅名称推断。
 /// 请求头与构造方式与 [`get_usage_limits`] 完全一致，共用 [`q_rest_get_with_region_fallback`]。
 pub(crate) async fn get_available_models(
     credentials: &KiroCredentials,
@@ -744,7 +755,7 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
     let attempts = usage_api_attempts(credentials, &candidates);
 
     for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = management_api_host(credentials, config, region);
         let url = build_url(&host, *profile_arn);
 
         let mut request = client
@@ -821,7 +832,7 @@ async fn q_rest_get_with_region_fallback<T: serde::de::DeserializeOwned>(
 /// 该 ARN 既不是 BuilderID 占位符，也不在 OIDC 刷新响应里返回，只能通过本接口获取。
 ///
 /// 上游接口（AWS JSON 1.0，**与用量类的 REST GET 不同**）：
-/// `POST https://q.{region}.amazonaws.com/`，请求头
+/// 管理域名下的 `POST /`，请求头
 /// `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`，
 /// `Content-Type: application/x-amz-json-1.0`，Body `{"maxResults":N}`。
 ///
@@ -853,7 +864,7 @@ pub(crate) async fn list_available_profiles(
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
     for region in candidates.iter() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = management_api_host(credentials, config, region);
         let url = format!("https://{}/", host);
 
         let mut request = client
@@ -919,7 +930,7 @@ pub(crate) async fn list_available_profiles(
 
 /// 设置用户偏好（开启/关闭超额）
 ///
-/// 上游接口：`POST https://q.{region}.amazonaws.com/setUserPreference`
+/// 上游接口：管理域名下的 `POST /setUserPreference`
 /// Body: `{ "overageConfiguration": { "overageStatus": "ENABLED" | "DISABLED" }, "profileArn": "..." }`
 pub(crate) async fn set_user_preference(
     credentials: &KiroCredentials,
@@ -961,7 +972,7 @@ pub(crate) async fn set_user_preference(
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = management_api_host(credentials, config, region);
         let url = format!("https://{}/setUserPreference", host);
 
         let mut request = client
@@ -1379,22 +1390,6 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
         None => true,
         Some(g) => cred_groups.iter().any(|cg| cg == g),
     }
-}
-
-fn credential_matches_request(
-    credentials: &KiroCredentials,
-    model: Option<&str>,
-    group: Option<&str>,
-) -> bool {
-    let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
-    }
-
-    group_matches(&credentials.groups, group)
 }
 
 fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
@@ -2181,7 +2176,7 @@ impl MultiTokenManager {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
-                if !credential_matches_request(&e.credentials, model, group) {
+                if !group_matches(&e.credentials.groups, group) {
                     return false;
                 }
                 if self.cached_model_support(e.id, model) == CachedModelSupport::Unsupported {
@@ -2242,7 +2237,7 @@ impl MultiTokenManager {
                 && !e.disabled
                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                 && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
-                && credential_matches_request(&e.credentials, model, group)
+                && group_matches(&e.credentials.groups, group)
                 && self.cached_model_support(e.id, model) != CachedModelSupport::Unsupported
                 && !is_rpm_exceeded(e, now)
         })
@@ -2906,7 +2901,7 @@ impl MultiTokenManager {
         let mut earliest: Option<u64> = None;
         for e in entries {
             if e.disabled
-                || !credential_matches_request(&e.credentials, model, group)
+                || !group_matches(&e.credentials.groups, group)
                 || self.cached_model_support(e.id, model) == CachedModelSupport::Unsupported
             {
                 continue;
@@ -3136,7 +3131,9 @@ impl MultiTokenManager {
                     !entry.disabled
                         && !entry.throttled_until.map(|t| t > now).unwrap_or(false)
                         && !entry.rate_limited_until.map(|t| t > now).unwrap_or(false)
-                        && credential_matches_request(&entry.credentials, model, group)
+                        && group_matches(&entry.credentials.groups, group)
+                        && self.cached_model_support(entry.id, model)
+                            != CachedModelSupport::Unsupported
                         && !is_rpm_exceeded(entry, now)
                 })
                 .min_by_key(|e| (e.credentials.priority, e.id))
@@ -3151,7 +3148,9 @@ impl MultiTokenManager {
             // 返回值与 report_failure 同口径：只要还有启用且匹配的号就让
             // 调用方 continue，RPM/冷却由下一轮 acquire 给出类型化 429。
             let has_remaining = entries.iter().any(|entry| {
-                !entry.disabled && credential_matches_request(&entry.credentials, model, group)
+                !entry.disabled
+                    && group_matches(&entry.credentials.groups, group)
+                    && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
             });
             if !has_remaining {
                 tracing::error!("所有凭据均已禁用！");
@@ -3177,7 +3176,7 @@ impl MultiTokenManager {
     fn all_matching_credentials_disabled(&self, model: Option<&str>, group: Option<&str>) -> bool {
         !self.entries.lock().iter().any(|entry| {
             !entry.disabled
-                && credential_matches_request(&entry.credentials, model, group)
+                && group_matches(&entry.credentials.groups, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         })
     }
@@ -3192,7 +3191,7 @@ impl MultiTokenManager {
     ) -> bool {
         let mut saw_unsupported = false;
         for entry in entries {
-            if entry.disabled || !credential_matches_request(&entry.credentials, model, group) {
+            if entry.disabled || !group_matches(&entry.credentials.groups, group) {
                 continue;
             }
             match self.cached_model_support(entry.id, model) {
@@ -3235,7 +3234,7 @@ impl MultiTokenManager {
             for entry in entries.iter_mut() {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
-                    || !credential_matches_request(&entry.credentials, model, group)
+                    || !group_matches(&entry.credentials.groups, group)
                     || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
@@ -3715,7 +3714,8 @@ impl MultiTokenManager {
                             .rate_limited_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && group_matches(&e.credentials.groups, group)
+                        && self.cached_model_support(e.id, model) != CachedModelSupport::Unsupported
                 })
                 .count()
         }
@@ -5607,6 +5607,123 @@ mod tests {
         assert_eq!(manager.available_count(), 0, "预期全部凭据已禁用");
     }
 
+    #[tokio::test]
+    async fn management_requests_use_selected_endpoint_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (default_endpoint, endpoint, auth_region, expected) in [
+            ("ide", None, "us-east-1", "q.us-east-1.amazonaws.com"),
+            (
+                "runtime",
+                None,
+                "us-east-1",
+                "management.us-east-1.kiro.dev",
+            ),
+            (
+                "runtime_cli",
+                None,
+                "us-east-1",
+                "management.us-east-1.kiro.dev",
+            ),
+            (
+                "ide",
+                Some("runtime"),
+                "us-east-1",
+                "management.us-east-1.kiro.dev",
+            ),
+            (
+                "runtime",
+                Some("cli"),
+                "us-east-1",
+                "q.us-east-1.amazonaws.com",
+            ),
+            (
+                "runtime",
+                Some("codewhisperer"),
+                "us-east-1",
+                "q.us-east-1.amazonaws.com",
+            ),
+            (
+                "runtime",
+                Some("amazonq"),
+                "us-east-1",
+                "q.us-east-1.amazonaws.com",
+            ),
+            (
+                "runtime_cli",
+                None,
+                "eu-west-1",
+                "management.eu-central-1.kiro.dev",
+            ),
+            (
+                "runtime",
+                Some("ide"),
+                "eu-west-1",
+                "q.eu-central-1.amazonaws.com",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.default_endpoint = default_endpoint.into();
+            let credentials = KiroCredentials {
+                endpoint: endpoint.map(str::to_string),
+                auth_region: Some(auth_region.into()),
+                ..Default::default()
+            };
+            for api in 0..4 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy = ProxyConfig::new(format!("http://{}", listener.local_addr().unwrap()));
+                let capture = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = Vec::new();
+                    loop {
+                        let mut chunk = [0; 1024];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0);
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8(buffer).unwrap();
+                    assert!(
+                        request.starts_with(&format!("CONNECT {expected}:443 ")),
+                        "{request}"
+                    );
+                    // 只观察 CONNECT 目的地址，拒绝隧道，不连接外网。
+                    socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                };
+                let call = async {
+                    match api {
+                        0 => get_available_models(&credentials, &config, "test", Some(&proxy))
+                            .await
+                            .map(|_| ()),
+                        1 => get_usage_limits(&credentials, &config, "test", Some(&proxy))
+                            .await
+                            .map(|_| ()),
+                        2 => list_available_profiles(&credentials, &config, "test", Some(&proxy))
+                            .await
+                            .map(|_| ()),
+                        _ => {
+                            set_user_preference(
+                                &credentials,
+                                &config,
+                                "test",
+                                Some(&proxy),
+                                "DISABLED",
+                            )
+                            .await
+                        }
+                    }
+                };
+                let (_, result) = tokio::time::timeout(StdDuration::from_secs(5), async {
+                    tokio::join!(capture, call)
+                })
+                .await
+                .unwrap();
+                assert!(result.is_err());
+            }
+        }
+    }
+
     fn model_response(ids: &[&str]) -> ListAvailableModelsResponse {
         ListAvailableModelsResponse {
             models: ids
@@ -5629,6 +5746,66 @@ mod tests {
                 refreshed_at: Instant::now(),
             },
         );
+    }
+
+    #[test]
+    fn free_opus_still_respects_disabled_cooldown_and_rpm() {
+        let mut credential = grouped_cred("free", &[]);
+        credential.subscription_title = Some("KIRO FREE".into());
+        credential.rpm_limit = 1;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        seed_model_cache(&manager, 1, &["claude-opus-4.8"]);
+        let model = Some("claude-opus-4.8");
+        assert!(manager.select_next_credential(model, None).is_some());
+        manager.set_disabled(1, true).unwrap();
+        assert!(manager.select_next_credential(model, None).is_none());
+        manager.set_disabled(1, false).unwrap();
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        assert!(manager.select_next_credential(model, None).is_none());
+        manager.entries.lock()[0].rate_limited_until = None;
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(60), model, None);
+        assert!(manager.select_next_credential(model, None).is_none());
+        manager.entries.lock()[0].throttled_until = None;
+        assert!(manager.record_request(1));
+        assert!(manager.select_next_credential(model, None).is_none());
+    }
+
+    #[test]
+    fn personal_use_regression_free_opus_uses_model_cache() {
+        for mode in ["priority", "balanced", "least_conn"] {
+            for supported in [None, Some(true), Some(false)] {
+                let mut credential = grouped_cred("free", &["personal"]);
+                credential.subscription_title = Some("KIRO FREE".into());
+                let mut config = Config::default();
+                config.load_balancing_mode = mode.into();
+                let manager =
+                    MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+                if let Some(supported) = supported {
+                    seed_model_cache(
+                        &manager,
+                        1,
+                        &[if supported {
+                            "claude-opus-4.8"
+                        } else {
+                            "claude-sonnet-4.8"
+                        }],
+                    );
+                }
+                assert_eq!(
+                    manager
+                        .select_next_credential(Some("claude-opus-4.8"), Some("personal"))
+                        .is_some(),
+                    supported != Some(false),
+                    "mode={mode}, supported={supported:?}",
+                );
+                assert!(
+                    manager
+                        .select_next_credential(Some("claude-opus-4.8"), Some("other"))
+                        .is_none()
+                );
+            }
+        }
     }
 
     fn seed_model_cache_with_limits(

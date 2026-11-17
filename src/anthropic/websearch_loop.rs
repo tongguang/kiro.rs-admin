@@ -38,7 +38,7 @@ use super::converter::{ConversionError, convert_request_with_mode};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent, ToolJsonAccumulator};
+use super::stream::{CompletedToolUse, SseEvent, StreamContext, ToolJsonAccumulator};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
@@ -301,9 +301,12 @@ fn accumulate_tool_usages(
             }
         }
     }
-    if let Err(e) = acc.finish() {
-        tracing::warn!("tool input JSON incomplete at stream end: {}", e);
-        return (out, Some(e.message()));
+    match acc.finish(tool_name_map) {
+        Ok(recovered) => out.extend(recovered),
+        Err(e) => {
+            tracing::warn!("tool input JSON incomplete at stream end: {}", e);
+            return (out, Some(e.message()));
+        }
     }
     (out, None)
 }
@@ -318,6 +321,7 @@ async fn decode_round(
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
     settlement: &mut WebSearchUsageSettlement,
+    mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -330,10 +334,14 @@ async fn decode_round(
     let mut provider_token_usage: Option<TokenUsage> = None;
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
-    let mut stop_reason_override: Option<String> = None;
+    let mut stop_reason = crate::kiro::model::events::StopReason::default();
     let mut stream_error = None;
+    let mut client_stream =
+        StreamContext::new_with_thinking("", 0, false, tool_name_map.clone(), Default::default());
+    let mut client_indices = std::collections::HashMap::new();
+    let mut search_ids = std::collections::HashSet::new();
 
-    while let Some(chunk) = body_stream.next().await {
+    'body: while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
             Ok(c) => {
                 tracer.mark_first_token();
@@ -360,6 +368,46 @@ async fn decode_round(
                 Ok(ev) => ev,
                 Err(_) => continue,
             };
+            if let Some(emitter) = emitter.as_deref_mut() {
+                match &event {
+                    Event::ToolUse(tool) => {
+                        if tool.name == "web_search" {
+                            search_ids.insert(tool.tool_use_id.clone());
+                        }
+                        if !search_ids.contains(&tool.tool_use_id) {
+                            // 参数增量沿用 messages 的映射与 JSON 校验。工具块只在
+                            // 整轮被接受后关闭，拒答/中断不能让客户端执行半截调用。
+                            for mut event in client_stream.process_kiro_event(&event) {
+                                if event.event == "content_block_stop" {
+                                    continue;
+                                }
+                                let Some(local) = event.data["index"].as_i64() else {
+                                    continue;
+                                };
+                                let index = if event.event == "content_block_start" {
+                                    let index = emitter.next_block_index;
+                                    emitter.next_block_index += 1;
+                                    client_indices.insert(local, index);
+                                    let id = event.data["content_block"]["id"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_string();
+                                    emitter.client_tool_blocks.insert(id, index);
+                                    index
+                                } else {
+                                    *client_indices.get(&local).unwrap()
+                                };
+                                event.data["index"] = json!(index);
+                                emitter.send(event).await;
+                            }
+                        }
+                    }
+                    Event::Metadata(_) => {
+                        client_stream.process_kiro_event(&event);
+                    }
+                    _ => {}
+                }
+            }
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
                 Event::ReasoningContent(r) => {
@@ -375,6 +423,7 @@ async fn decode_round(
                         settlement.capture_in_flight_usage(usage);
                         provider_token_usage = Some(usage);
                     }
+                    stop_reason.observe_metadata(&metadata);
                 }
                 Event::ContextUsage(cu) => {
                     let window = context_window_size;
@@ -382,7 +431,7 @@ async fn decode_round(
                     settlement.capture_in_flight_context_input(actual);
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
-                        stop_reason_override = Some("model_context_window_exceeded".to_string());
+                        stop_reason.set_fallback("model_context_window_exceeded");
                     }
                 }
                 Event::Metering(m) => {
@@ -392,8 +441,15 @@ async fn decode_round(
                 }
                 Event::Exception { exception_type, .. } => {
                     if exception_type == "ContentLengthExceededException" {
-                        stop_reason_override = Some("max_tokens".to_string());
+                        stop_reason.set_fallback("max_tokens");
                     }
+                }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    stream_error = Some(format!("{error_code}: {error_message}"));
+                    break 'body;
                 }
                 _ => {}
             }
@@ -402,7 +458,21 @@ async fn decode_round(
 
     // 非法 / 半截 JSON 不作为成功工具调用：记 stream_error，由 run_round 按
     // upstream_error 收尾（与 messages 路径 ToolJsonAccumulator 同口径，不再 fallback {}）。
-    let (tool_uses, tool_json_error) = accumulate_tool_usages(&tool_use_events, tool_name_map);
+    let stop_reason_override = stop_reason.get().map(str::to_string);
+    if stop_reason_override.as_deref() == Some("refusal")
+        && emitter
+            .as_ref()
+            .is_some_and(|emitter| !emitter.client_tool_blocks.is_empty())
+    {
+        stream_error = Some(
+            "Upstream refusal interrupted a streamed tool call; discard its arguments.".into(),
+        );
+    }
+    let (tool_uses, tool_json_error) = if stop_reason_override.as_deref() == Some("refusal") {
+        (Vec::new(), None)
+    } else {
+        accumulate_tool_usages(&tool_use_events, tool_name_map)
+    };
     if stream_error.is_none() {
         stream_error = tool_json_error;
     }
@@ -543,6 +613,7 @@ async fn finish_round(
     context_window_size: i32,
     tracer: &RequestTracer,
     settlement: &mut WebSearchUsageSettlement,
+    emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let StartedRound {
         tool_name_map,
@@ -557,9 +628,13 @@ async fn finish_round(
         &tool_name_map,
         tracer,
         settlement,
+        emitter,
     )
     .await;
     outcome.known_tool_names = known_tool_names;
+    if outcome.stop_reason_override.as_deref() == Some("refusal") {
+        outcome.known_tool_names.clear();
+    }
     outcome.tool_name_map = tool_name_map;
     if let Some(error_message) = outcome.stream_error.take() {
         let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
@@ -591,6 +666,7 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
     settlement: &mut WebSearchUsageSettlement,
+    emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let started = start_round(
         provider,
@@ -611,6 +687,7 @@ async fn run_round(
         context_window_size,
         tracer,
         settlement,
+        emitter,
     )
     .await
 }
@@ -1129,6 +1206,7 @@ struct WebSearchSseEmitter {
     sender: mpsc::Sender<Bytes>,
     next_block_index: i32,
     active_blocks: BTreeSet<i32>,
+    client_tool_blocks: std::collections::HashMap<String, i32>,
     terminal: bool,
 }
 
@@ -1138,6 +1216,7 @@ impl WebSearchSseEmitter {
             sender,
             next_block_index: 0,
             active_blocks: BTreeSet::new(),
+            client_tool_blocks: std::collections::HashMap::new(),
             terminal: false,
         }
     }
@@ -1238,7 +1317,26 @@ impl WebSearchSseEmitter {
         thinking: &str,
         metering: Option<&MeteringEvent>,
     ) {
-        let content = without_web_search_presentation(content);
+        let mut remaining = Vec::new();
+        for block in without_web_search_presentation(content) {
+            let streamed = if block["type"] == "tool_use" {
+                block["id"]
+                    .as_str()
+                    .and_then(|id| self.client_tool_blocks.remove(id))
+            } else {
+                None
+            };
+            if let Some(index) = streamed {
+                self.send(SseEvent::new(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                ))
+                .await;
+            } else {
+                remaining.push(block);
+            }
+        }
+        let content = remaining;
         let (mut events, next_index) = build_sse_content_events(&content, self.next_block_index);
         self.next_block_index = next_index;
         // Keep the extension on a standard Anthropic event so ordinary Messages
@@ -1646,6 +1744,7 @@ async fn run_web_search_loop_inner(
     let mut presentation: Vec<Value> = Vec::new();
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
+    let suppress_thinking = payload.thinking_explicitly_disabled();
     // 搜索次数预算：客户端声明的 max_uses（默认 5），硬上限 10
     let search_budget = web_search_budget(payload.tools.as_deref());
     let mut search_uses = 0usize;
@@ -1676,6 +1775,7 @@ async fn run_web_search_loop_inner(
                     context_window_size,
                     tracer.as_ref(),
                     &mut settlement,
+                    emitter.as_deref_mut(),
                 )
                 .await
             } else {
@@ -1687,6 +1787,7 @@ async fn run_web_search_loop_inner(
                     group.as_deref(),
                     tool_compatibility_mode,
                     &mut settlement,
+                    emitter.as_deref_mut(),
                 )
                 .await
             } {
@@ -1757,13 +1858,18 @@ async fn run_web_search_loop_inner(
             // Only surface reasoning from the accepted attempt. An empty attempt is
             // discarded and retried, so replaying its hidden reasoning would duplicate
             // or contradict the successful attempt's summary.
-            if !round.thinking.is_empty() {
+            if !suppress_thinking && !round.thinking.is_empty() {
                 if !all_thinking.is_empty() {
                     all_thinking.push_str("\n\n");
                 }
                 all_thinking.push_str(&round.thinking);
             }
 
+            let mut round = round;
+            if suppress_thinking {
+                round.text = super::stream::strip_thinking_from_text(&round.text);
+                round.thinking.clear();
+            }
             break round;
         };
 
@@ -2152,6 +2258,169 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].input, json!({}));
+    }
+
+    #[test]
+    fn accumulate_tool_usages_recovers_unstopped_noarg_calls() {
+        let events = [tool_use_event("t1", "short", "", false)];
+        let map = std::collections::HashMap::from([("short".into(), "get_time".into())]);
+        let (uses, error) = accumulate_tool_usages(&events, &map);
+        assert!(error.is_none());
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].name, "get_time");
+        assert_eq!(uses[0].input, json!({}));
+    }
+
+    #[tokio::test]
+    async fn websearch_refusal_ends_without_mcp_or_tool_recovery() {
+        use super::super::test_support::{event_stream, loopback_provider};
+        for streaming in [false, true] {
+            for refused in [false, true] {
+                let mut events = vec![(
+                    "toolUseEvent",
+                    json!({"toolUseId":"client","name":"get_time","input":"","stop":false}),
+                )];
+                if refused {
+                    events.push(("toolUseEvent", json!({"toolUseId":"search","name":"web_search","input":"{\"query\":\"rust\"}","stop":true})));
+                    events.push(("toolUseEvent", json!({"toolUseId":"partial","name":"get_time","input":"{\"x\":","stop":false})));
+                    events.push((
+                        "assistantResponseEvent",
+                        json!({"content":"<invoke name=\"get_time\"></invoke>"}),
+                    ));
+                }
+                events.push(("metadataEvent", json!({"stopReason":if refused {Some("CONTENT_FILTERED")} else {None}, "tokenUsage":{"uncachedInputTokens":3,"outputTokens":11}})));
+                events.push((
+                    "contextUsageEvent",
+                    json!({"contextUsagePercentage":if refused {100.0} else {1.0}}),
+                ));
+                let (provider, server) = loopback_provider(event_stream(&events)).await;
+                let payload: MessagesRequest = serde_json::from_value(json!({
+                    "model":"claude-sonnet-4.5","max_tokens":64,
+                    "messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"web_search_20250305","name":"web_search"}, {"name":"get_time","description":"time","input_schema":{"type":"object","properties":{}}}]
+                })).unwrap();
+                let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+                let hook = UsageRecordHook {
+                    recorder: None,
+                    aggregator: Some(aggregator.clone()),
+                    client_keys: None,
+                    key_id: 0,
+                    model: payload.model.clone(),
+                    started_at: std::time::Instant::now(),
+                };
+                let response = run_web_search_loop(
+                    provider,
+                    payload,
+                    hook,
+                    Arc::new(RequestTracer::noop("test-model")),
+                    streaming,
+                    None,
+                    ToolCompatibilityMode::Raw,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    axum::body::to_bytes(response.into_body(), usize::MAX),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                server.await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                let expected = if refused { "refusal" } else { "tool_use" };
+                let interrupted = refused && streaming;
+                if interrupted {
+                    assert!(body.contains("event: error"), "{body}");
+                    assert!(
+                        !body.contains("event: content_block_stop")
+                            && !body.contains("message_stop"),
+                        "{body}"
+                    );
+                } else {
+                    assert!(
+                        body.contains(&format!("\"stop_reason\":\"{expected}\"")),
+                        "{body}"
+                    );
+                    assert!(
+                        !body.contains("\"type\":\"tool_use\"") || !refused,
+                        "{body}"
+                    );
+                    assert!(!body.contains("event: error"), "{body}");
+                }
+                let usage = aggregator.overview();
+                assert_eq!(
+                    (
+                        usage.today_calls,
+                        usage.today_errors,
+                        usage.today_input_tokens,
+                        usage.today_output_tokens
+                    ),
+                    (1, u64::from(interrupted), 3, 11)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_thinking_is_not_exposed_by_websearch_loop_but_still_counted() {
+        use super::super::test_support::{event_stream, loopback_provider};
+        for streaming in [false, true] {
+            let (provider, server) = loopback_provider(event_stream(&[
+                (
+                    "reasoningContentEvent",
+                    json!({"text":"SECRET_NATIVE_REASONING"}),
+                ),
+                (
+                    "assistantResponseEvent",
+                    json!({"content":"<thinking>SECRET_LEGACY</thinking>\n\nanswer"}),
+                ),
+            ]))
+            .await;
+            let payload: MessagesRequest = serde_json::from_value(json!({
+                "model":"claude-sonnet-4.5","max_tokens":64,"thinking":{"type":"disabled"},
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"custom_tool","description":"test","input_schema":{"type":"object","properties":{}}}]
+            })).unwrap();
+            let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+            let hook = UsageRecordHook {
+                recorder: None,
+                aggregator: Some(aggregator.clone()),
+                client_keys: None,
+                key_id: 0,
+                model: payload.model.clone(),
+                started_at: std::time::Instant::now(),
+            };
+            let response = run_web_search_loop(
+                provider,
+                payload,
+                hook,
+                Arc::new(RequestTracer::noop("test-model")),
+                streaming,
+                None,
+                ToolCompatibilityMode::Raw,
+            )
+            .await;
+            let body = tokio::time::timeout(
+                Duration::from_secs(3),
+                axum::body::to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            server.await.unwrap();
+            let output = String::from_utf8(body.to_vec()).unwrap();
+            assert!(output.contains("answer"));
+            assert!(
+                !output.contains("SECRET") && !output.contains("kiro_thinking"),
+                "{output}"
+            );
+            assert!(
+                aggregator.overview().today_output_tokens > 5,
+                "hidden reasoning still counts toward output estimates"
+            );
+            assert_eq!(aggregator.overview().today_errors, 0);
+        }
     }
 
     #[test]

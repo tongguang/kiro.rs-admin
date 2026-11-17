@@ -1448,11 +1448,7 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
-            }
+            // 历史 Read 调用可能带 PDF pages；Kiro 没有对应字段，回放时丢弃。
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
@@ -1631,6 +1627,24 @@ pub fn restore_tool_use_for_client(
         ),
         None => (kiro_name.to_string(), input),
     }
+}
+
+pub(super) fn tool_input_needs_rewrite(
+    kiro_name: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> bool {
+    tool_name_map.contains_key(kiro_name)
+        && matches!(
+            kiro_name,
+            "fs_write"
+                | "str_replace"
+                | "execute_bash"
+                | "read_file"
+                | "file_search"
+                | "grep_search"
+                | "list_directory"
+                | "web_search"
+        )
 }
 
 fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
@@ -3176,14 +3190,70 @@ mod tests {
     }
 
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
-            "Read",
-            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
-            ToolCompatibilityMode::ClaudeCode,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+    fn personal_use_regression_read_pages_history() {
+        let input = serde_json::json!({"file_path": "/a.pdf", "pages": "1-3", "offset": 3});
+        let mapped =
+            map_tool_input_to_kiro("Read", input, ToolCompatibilityMode::ClaudeCode).unwrap();
+        assert_eq!(mapped["path"], "/a.pdf");
+        assert_eq!(mapped["start_line"], 3);
+        assert!(mapped.get("pages").is_none());
+    }
+
+    #[test]
+    fn read_pages_history_keeps_schema_mapping_decision() {
+        for mapped in [false, true] {
+            let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"claude-sonnet-4.5", "max_tokens":64,
+                "messages":[
+                    {"role":"user","content":"read"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"read1","name":"Read","input":{"file_path":"/a.pdf","pages":"1-3","offset":2,"limit":4}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read1","content":"done"}]}
+                ]
+            })).unwrap();
+            request.tools = Some(vec![if mapped {
+                cc_tool("Read")
+            } else {
+                cc_tool_with_properties("Read", serde_json::json!({"custom":{"type":"string"}}))
+            }]);
+            let result =
+                convert_request_with_mode(&request, ToolCompatibilityMode::ClaudeCode).unwrap();
+            let tool = result
+                .conversation_state
+                .history
+                .iter()
+                .find_map(|message| {
+                    if let Message::Assistant(message) = message {
+                        message
+                            .assistant_response_message
+                            .tool_uses
+                            .as_ref()?
+                            .iter()
+                            .find(|tool| tool.tool_use_id == "read1")
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            if mapped {
+                assert_eq!(tool.name, "read_file");
+                assert_eq!(tool.input["path"], "/a.pdf");
+                assert_eq!(tool.input["start_line"], 2);
+                assert_eq!(tool.input["end_line"], 5);
+                assert!(tool.input.get("pages").is_none());
+            } else {
+                assert_eq!(tool.name, "Read");
+                assert_eq!(tool.input["pages"], "1-3");
+                assert_eq!(tool.input["file_path"], "/a.pdf");
+            }
+        }
+    }
+
+    #[test]
+    fn cc_read_pages_raw_mode_passthrough() {
+        let input = serde_json::json!({"file_path": "/a", "pages": "1-3"});
+        let mapped =
+            map_tool_input_to_kiro("Read", input.clone(), ToolCompatibilityMode::Raw).unwrap();
+        assert_eq!(mapped, input);
     }
 
     #[test]
@@ -3864,8 +3934,7 @@ mod tests {
                 serde_json::json!({"path": "/a", "text": "hi", "mode": "append"}),
             ),
         ] {
-            let (restored_name, restored) =
-                restore_tool_use_for_client(name, input.clone(), &map);
+            let (restored_name, restored) = restore_tool_use_for_client(name, input.clone(), &map);
             assert_eq!(restored_name, name);
             assert_eq!(restored, input, "{} 未劫持时入参不得改写", name);
         }

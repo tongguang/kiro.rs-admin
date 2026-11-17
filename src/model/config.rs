@@ -224,6 +224,19 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// 上游连接超时（秒）。
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+    /// 响应头之前的整条重试链预算，包含凭据、代理、端点切换和退避（秒）。
+    #[serde(default = "default_upstream_first_response_timeout_secs")]
+    pub upstream_first_response_timeout_secs: u64,
+    /// 等待响应头及相邻上游读取之间的静默超时（秒）。
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+    /// 整条请求（包括重试及响应体）的总时限；0 表示关闭。
+    #[serde(default)]
+    pub upstream_request_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -395,6 +408,16 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+fn default_upstream_first_response_timeout_secs() -> u64 {
+    120
+}
+fn default_upstream_read_timeout_secs() -> u64 {
+    120
+}
+
 fn default_load_balancing_mode() -> String {
     // 默认最少负载：把请求优先分给当前在途请求数最少的凭据，避免高优先级凭据被打爆。
     "least_conn".to_string()
@@ -474,6 +497,10 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_first_response_timeout_secs: default_upstream_first_response_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_request_timeout_secs: 0,
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -589,6 +616,39 @@ fn config_file_write_lock() -> &'static parking_lot::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_timeout_defaults_and_explicit_settings() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        let default = Config::default();
+        assert_eq!(
+            (
+                config.upstream_connect_timeout_secs,
+                config.upstream_first_response_timeout_secs,
+                config.upstream_read_timeout_secs,
+                config.upstream_request_timeout_secs
+            ),
+            (15, 120, 120, 0)
+        );
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&default).unwrap()
+        );
+        let explicit: Config = serde_json::from_value(serde_json::json!({
+            "upstreamConnectTimeoutSecs":3, "upstreamFirstResponseTimeoutSecs":8,
+            "upstreamReadTimeoutSecs":5, "upstreamRequestTimeoutSecs":20
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                explicit.upstream_connect_timeout_secs,
+                explicit.upstream_first_response_timeout_secs,
+                explicit.upstream_read_timeout_secs,
+                explicit.upstream_request_timeout_secs
+            ),
+            (3, 8, 5, 20)
+        );
+    }
 
     #[test]
     fn self_heal_config_defaults_for_existing_configs() {
